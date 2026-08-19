@@ -1,3 +1,5 @@
+import sys
+
 import torch
 from torch import nn
 from torch.optim import Optimizer
@@ -129,6 +131,7 @@ def main(config_path: str = "independent.yaml") -> None:
             optimizer,
             x_data,
             coupling=coupling,
+            num_regions=config.get("num_regions"),
         )
 
         if step == 1 or step % training_config["log_every"] == 0:
@@ -138,4 +141,4 @@ def main(config_path: str = "independent.yaml") -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(*sys.argv[1:])
