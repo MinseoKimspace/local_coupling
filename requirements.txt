@@ -3,3 +3,4 @@
 torch==2.5.1+cu121
 scipy==1.15.2
 PyYAML==6.0.2
+matplotlib==3.7.4

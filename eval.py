@@ -1,4 +1,10 @@
+import sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
+import yaml
 
 from data import sample_checkerboard
 from model import PointSetTransformer
@@ -15,27 +21,52 @@ def chamfer_distance(
     return (prediction_to_target + target_to_prediction).mean()
 
 
-def main() -> None:
-    torch.manual_seed(1)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float32
+def render_points(
+    x_noise: torch.Tensor,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    output_path: str,
+) -> None:
+    point_sets = [x_noise[0], prediction[0], target[0]]
+    titles = ["Noise", "Generated", "Target"]
+    limits = [3.0, 1.2, 1.2]
+    figure, axes = plt.subplots(1, 3, figsize=(9, 3))
 
-    coupling = "independent"
-    batch_size = 32
-    n_points = 256
+    for axis, points, title, limit in zip(axes, point_sets, titles, limits):
+        points = points.detach().cpu()
+        axis.scatter(points[:, 0], points[:, 1], s=5)
+        axis.set_title(title)
+        axis.set_xlim(-limit, limit)
+        axis.set_ylim(-limit, limit)
+        axis.set_aspect("equal")
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=200)
+    plt.close(figure)
+
+
+def main(config_path: str = "independent.yaml") -> None:
+    with open(config_path, encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+
+    torch.manual_seed(1)
+    device = torch.device(config["device"])
+    dtype = getattr(torch, config["dtype"])
+    data_config = config["data"]
+    coupling = config["coupling"]
     integration_steps = 100
 
-    model = PointSetTransformer().to(device=device, dtype=dtype)
+    model = PointSetTransformer(**config["model"]).to(device=device, dtype=dtype)
     state_dict = torch.load(
-        f"model_{coupling}.pt",
+        config["checkpoint"],
         map_location=device,
         weights_only=True,
     )
     model.load_state_dict(state_dict)
 
     x_noise = torch.randn(
-        batch_size,
-        n_points,
+        data_config["batch_size"],
+        data_config["n_points"],
         2,
         device=device,
         dtype=dtype,
@@ -46,15 +77,19 @@ def main() -> None:
         num_steps=integration_steps,
     )
     target = sample_checkerboard(
-        batch_size,
-        n_points,
+        data_config["batch_size"],
+        data_config["n_points"],
         device=device,
         dtype=dtype,
+        grid_size=data_config["grid_size"],
     )
 
     score = chamfer_distance(prediction, target)
+    output_path = f"samples_{coupling}.png"
+    render_points(x_noise, prediction, target, output_path)
     print(f"chamfer={score.item():.6f}")
+    print(f"saved={output_path}")
 
 
 if __name__ == "__main__":
-    main()
+    main(*sys.argv[1:])
