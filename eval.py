@@ -3,12 +3,13 @@ import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy.ndimage import gaussian_filter
 import torch
 import yaml
 
 from data import sample_checkerboard
 from model import PointSetTransformer
-from sample import integrate_velocity
 
 
 def chamfer_distance(
@@ -21,27 +22,75 @@ def chamfer_distance(
     return (prediction_to_target + target_to_prediction).mean()
 
 
-def render_points(
+def sample_snapshots(
+    model: torch.nn.Module,
     x_noise: torch.Tensor,
-    prediction: torch.Tensor,
-    target: torch.Tensor,
+    num_steps: int,
+    snapshot_steps: tuple[int, ...],
+) -> dict[int, torch.Tensor]:
+    x = x_noise
+    dt = 1.0 / num_steps
+    snapshots = {}
+    was_training = model.training
+    model.eval()
+
+    with torch.no_grad():
+        for step in range(1, num_steps + 1):
+            t = torch.full(
+                (x.shape[0], 1, 1),
+                (step - 1) * dt,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            x = x + dt * model(x, t)
+
+            if step in snapshot_steps:
+                snapshots[step] = x.cpu()
+
+    model.train(was_training)
+    return snapshots
+
+
+def render_density(
+    snapshots: list[torch.Tensor],
+    times: tuple[float, ...],
     output_path: str,
 ) -> None:
-    point_sets = [x_noise[0], prediction[0], target[0]]
-    titles = ["Noise", "Generated", "Target"]
-    limits = [3.0, 1.2, 1.2]
-    figure, axes = plt.subplots(1, 3, figsize=(9, 3))
+    limit = 1.2
+    densities = []
 
-    for axis, points, title, limit in zip(axes, point_sets, titles, limits):
-        points = points.detach().cpu()
-        axis.scatter(points[:, 0], points[:, 1], s=5)
-        axis.set_title(title)
+    for points in snapshots:
+        points = points.reshape(-1, 2).numpy()
+        density, _, _ = np.histogram2d(
+            points[:, 0],
+            points[:, 1],
+            bins=192,
+            range=[[-limit, limit], [-limit, limit]],
+        )
+        density = gaussian_filter(density.T, sigma=1.2)
+        density /= density.sum()
+        densities.append(density)
+
+    vmax = max(density.max() for density in densities)
+    figure, axes = plt.subplots(1, len(times), figsize=(9, 3))
+
+    for axis, density, time in zip(axes, densities, times):
+        axis.imshow(
+            density,
+            origin="lower",
+            extent=(-limit, limit, -limit, limit),
+            cmap="viridis",
+            vmin=0.0,
+            vmax=vmax,
+            interpolation="bilinear",
+        )
+        axis.set_title(f"t = {time:.2f}", fontsize=18)
         axis.set_xlim(-limit, limit)
         axis.set_ylim(-limit, limit)
-        axis.set_aspect("equal")
+        axis.set_axis_off()
 
-    figure.tight_layout()
-    figure.savefig(output_path, dpi=200)
+    figure.tight_layout(pad=0.6)
+    figure.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(figure)
 
 
@@ -55,6 +104,9 @@ def main(config_path: str = "independent.yaml") -> None:
     data_config = config["data"]
     coupling = config["coupling"]
     integration_steps = 100
+    snapshot_times = (0.78, 0.89, 1.00)
+    snapshot_steps = tuple(round(time * integration_steps) for time in snapshot_times)
+    evaluation_batch_size = data_config["batch_size"] * 4
 
     model = PointSetTransformer(**config["model"]).to(device=device, dtype=dtype)
     state_dict = torch.load(
@@ -65,28 +117,34 @@ def main(config_path: str = "independent.yaml") -> None:
     model.load_state_dict(state_dict)
 
     x_noise = torch.randn(
-        data_config["batch_size"],
+        evaluation_batch_size,
         data_config["n_points"],
         2,
         device=device,
         dtype=dtype,
     )
-    prediction = integrate_velocity(
+    snapshots = sample_snapshots(
         model,
         x_noise,
-        num_steps=integration_steps,
+        integration_steps,
+        snapshot_steps,
     )
     target = sample_checkerboard(
-        data_config["batch_size"],
+        evaluation_batch_size,
         data_config["n_points"],
         device=device,
         dtype=dtype,
         grid_size=data_config["grid_size"],
     )
 
+    prediction = snapshots[integration_steps].to(device)
     score = chamfer_distance(prediction, target)
-    output_path = f"samples_{coupling}.png"
-    render_points(x_noise, prediction, target, output_path)
+    output_path = f"density_{coupling}.png"
+    render_density(
+        [snapshots[step] for step in snapshot_steps],
+        snapshot_times,
+        output_path,
+    )
     print(f"chamfer={score.item():.6f}")
     print(f"saved={output_path}")
 
