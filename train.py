@@ -6,7 +6,7 @@ from torch.optim import Optimizer
 import torch.nn.functional as F
 import yaml
 
-from coupling import regional_permutation
+from coupling import regional_permutation, target_guided_permutation
 from data import sample_checkerboard
 from model import PointSetTransformer
 
@@ -59,13 +59,12 @@ def train_step(
     *,
     coupling: str,
     num_regions: int | None = None,
-    generator: torch.Generator | None = None,
+    coupling_generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     x_noise = torch.randn(
         x_data.shape,
         device=x_data.device,
         dtype=x_data.dtype,
-        generator=generator,
     )
 
     if coupling == "regional":
@@ -76,18 +75,29 @@ def train_step(
             x_noise,
             x_data,
             num_regions=num_regions,
-            generator=generator,
+            generator=coupling_generator,
+        )
+        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
+        x_data = torch.gather(x_data, dim=1, index=permutation)
+    elif coupling == "target_guided":
+        if num_regions is None:
+            raise ValueError("num_regions is required for target-guided coupling")
+
+        permutation = target_guided_permutation(
+            x_noise,
+            x_data,
+            num_regions=num_regions,
+            generator=coupling_generator,
         )
         permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
         x_data = torch.gather(x_data, dim=1, index=permutation)
     elif coupling != "independent":
-        raise ValueError("coupling must be 'independent' or 'regional'")
+        raise ValueError("unknown coupling")
 
     t = sample_time(
         x_data.shape[0],
         device=x_data.device,
         dtype=x_data.dtype,
-        generator=generator,
     )
 
     optimizer.zero_grad(set_to_none=True)
@@ -109,6 +119,8 @@ def main(config_path: str = "independent.yaml") -> None:
     model_config = config["model"]
     training_config = config["training"]
     coupling = config["coupling"]
+    coupling_generator = torch.Generator(device=device)
+    coupling_generator.manual_seed(config["seed"] + 1)
 
     model = PointSetTransformer(**model_config).to(device=device, dtype=dtype)
     optimizer = torch.optim.AdamW(
@@ -132,6 +144,7 @@ def main(config_path: str = "independent.yaml") -> None:
             x_data,
             coupling=coupling,
             num_regions=config.get("num_regions"),
+            coupling_generator=coupling_generator,
         )
 
         if step == 1 or step % training_config["log_every"] == 0:

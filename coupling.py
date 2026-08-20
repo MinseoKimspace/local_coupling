@@ -145,3 +145,41 @@ def regional_permutation(
             permutation[batch_index, source_indices] = target_indices[order]
 
     return permutation
+
+
+@torch.no_grad()
+def target_guided_permutation(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    num_regions: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    batch_size, num_points, _ = source.shape
+    batch_indices = torch.arange(batch_size, device=source.device).unsqueeze(1)
+
+    target_anchor_indices = farthest_point_sample(target, num_regions)
+    target_anchors = target[batch_indices, target_anchor_indices]
+    target_regions = balanced_partition(target, target_anchors)
+    target_centroids = _region_centroids(target, target_regions, num_regions)
+    source_regions = balanced_partition(source, target_centroids)
+
+    permutation = torch.empty(
+        batch_size,
+        num_points,
+        dtype=torch.long,
+        device=source.device,
+    )
+
+    for batch_index in range(batch_size):
+        for region in range(num_regions):
+            source_indices = torch.where(source_regions[batch_index] == region)[0]
+            target_indices = torch.where(target_regions[batch_index] == region)[0]
+            order = torch.randperm(
+                target_indices.numel(),
+                device=source.device,
+                generator=generator,
+            )
+            permutation[batch_index, source_indices] = target_indices[order]
+
+    return permutation
