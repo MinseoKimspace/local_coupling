@@ -6,8 +6,12 @@ from torch.optim import Optimizer
 import torch.nn.functional as F
 import yaml
 
-from coupling import regional_permutation, target_guided_permutation
-from data import sample_checkerboard
+from coupling import (
+    regional_permutation,
+    strict_target_guided_permutation,
+    target_guided_permutation,
+)
+from data import checkerboard_centers, sample_checkerboard
 from model import PointSetTransformer
 
 
@@ -59,6 +63,7 @@ def train_step(
     *,
     coupling: str,
     num_regions: int | None = None,
+    target_centers: torch.Tensor | None = None,
     coupling_generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     x_noise = torch.randn(
@@ -87,6 +92,18 @@ def train_step(
             x_noise,
             x_data,
             num_regions=num_regions,
+            generator=coupling_generator,
+        )
+        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
+        x_data = torch.gather(x_data, dim=1, index=permutation)
+    elif coupling == "target_guided_strict":
+        if target_centers is None:
+            raise ValueError("target_centers is required for strict target-guided coupling")
+
+        permutation = strict_target_guided_permutation(
+            x_noise,
+            x_data,
+            target_centers,
             generator=coupling_generator,
         )
         permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
@@ -121,6 +138,11 @@ def main(config_path: str = "independent.yaml") -> None:
     coupling = config["coupling"]
     coupling_generator = torch.Generator(device=device)
     coupling_generator.manual_seed(config["seed"] + 1)
+    target_centers = checkerboard_centers(
+        data_config["grid_size"],
+        device,
+        dtype,
+    )
 
     model = PointSetTransformer(**model_config).to(device=device, dtype=dtype)
     optimizer = torch.optim.AdamW(
@@ -144,6 +166,7 @@ def main(config_path: str = "independent.yaml") -> None:
             x_data,
             coupling=coupling,
             num_regions=config.get("num_regions"),
+            target_centers=target_centers,
             coupling_generator=coupling_generator,
         )
 

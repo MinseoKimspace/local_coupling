@@ -183,3 +183,41 @@ def target_guided_permutation(
             permutation[batch_index, source_indices] = target_indices[order]
 
     return permutation
+
+
+@torch.no_grad()
+def strict_target_guided_permutation(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    target_centers: torch.Tensor,
+    *,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    batch_size, num_points, _ = source.shape
+    target_regions = torch.cdist(target, target_centers.unsqueeze(0)).argmin(dim=-1)
+    target_orders = torch.stack(
+        [
+            torch.randperm(
+                num_points,
+                device=target.device,
+                generator=generator,
+            )
+            for _ in range(batch_size)
+        ]
+    )
+    ordered_regions = torch.gather(target_regions, dim=1, index=target_orders)
+    region_slots = target_centers[ordered_regions]
+    costs = torch.cdist(source, region_slots).square().cpu().numpy()
+    permutation = torch.empty(
+        batch_size,
+        num_points,
+        dtype=torch.long,
+        device=source.device,
+    )
+
+    for batch_index in range(batch_size):
+        _, slot_indices = linear_sum_assignment(costs[batch_index])
+        slot_indices = torch.as_tensor(slot_indices, device=source.device)
+        permutation[batch_index] = target_orders[batch_index, slot_indices]
+
+    return permutation
