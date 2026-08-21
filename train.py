@@ -7,7 +7,10 @@ import torch.nn.functional as F
 import yaml
 
 from coupling import (
+    global_hungarian_permutation,
     regional_permutation,
+    strict_target_guided_balanced_permutation,
+    strict_target_guided_local_permutation,
     strict_target_guided_permutation,
     target_guided_permutation,
 )
@@ -106,6 +109,32 @@ def train_step(
             target_centers,
             generator=coupling_generator,
         )
+        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
+        x_data = torch.gather(x_data, dim=1, index=permutation)
+    elif coupling == "target_guided_strict_local":
+        if target_centers is None:
+            raise ValueError("target_centers is required for strict local coupling")
+
+        permutation = strict_target_guided_local_permutation(
+            x_noise,
+            x_data,
+            target_centers,
+        )
+        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
+        x_data = torch.gather(x_data, dim=1, index=permutation)
+    elif coupling == "target_guided_strict_balanced":
+        if target_centers is None:
+            raise ValueError("target_centers is required for strict balanced coupling")
+
+        permutation = strict_target_guided_balanced_permutation(
+            x_noise,
+            x_data,
+            target_centers,
+        )
+        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
+        x_data = torch.gather(x_data, dim=1, index=permutation)
+    elif coupling == "global_hungarian":
+        permutation = global_hungarian_permutation(x_noise, x_data)
         permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
         x_data = torch.gather(x_data, dim=1, index=permutation)
     elif coupling != "independent":

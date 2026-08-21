@@ -221,3 +221,143 @@ def strict_target_guided_permutation(
         permutation[batch_index] = target_orders[batch_index, slot_indices]
 
     return permutation
+
+
+@torch.no_grad()
+def strict_target_guided_local_permutation(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    target_centers: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, num_points, _ = source.shape
+    num_regions = target_centers.shape[0]
+    target_regions = torch.cdist(target, target_centers.unsqueeze(0)).argmin(dim=-1)
+    region_slots = target_centers[target_regions]
+    region_costs = torch.cdist(source, region_slots).square().cpu().numpy()
+    source_regions = torch.empty_like(target_regions)
+
+    for batch_index in range(batch_size):
+        _, slot_indices = linear_sum_assignment(region_costs[batch_index])
+        slot_indices = torch.as_tensor(slot_indices, device=source.device)
+        source_regions[batch_index] = target_regions[batch_index, slot_indices]
+
+    return _local_hungarian_permutation(
+        source,
+        target,
+        source_regions,
+        target_regions,
+        num_regions,
+    )
+
+
+def _local_hungarian_permutation(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    source_regions: torch.Tensor,
+    target_regions: torch.Tensor,
+    num_regions: int,
+) -> torch.Tensor:
+    batch_size, num_points, _ = source.shape
+    permutation = torch.empty(
+        batch_size,
+        num_points,
+        dtype=torch.long,
+        device=source.device,
+    )
+
+    for batch_index in range(batch_size):
+        for region in range(num_regions):
+            source_indices = torch.where(source_regions[batch_index] == region)[0]
+            target_indices = torch.where(target_regions[batch_index] == region)[0]
+            costs = torch.cdist(
+                source[batch_index, source_indices],
+                target[batch_index, target_indices],
+            ).square().cpu().numpy()
+            _, target_order = linear_sum_assignment(costs)
+            target_order = torch.as_tensor(target_order, device=source.device)
+            permutation[batch_index, source_indices] = target_indices[target_order]
+
+    return permutation
+
+
+def greedy_balanced_assignment(
+    points: torch.Tensor,
+    centers: torch.Tensor,
+    capacities: torch.Tensor,
+) -> torch.Tensor:
+    costs = torch.cdist(points, centers.unsqueeze(0)).square()
+    assignments = torch.empty(
+        points.shape[0],
+        points.shape[1],
+        dtype=torch.long,
+        device=points.device,
+    )
+
+    for batch_index in range(points.shape[0]):
+        sorted_costs, preferences = costs[batch_index].sort(dim=1)
+        margins = sorted_costs[:, 1] - sorted_costs[:, 0]
+        point_order = margins.argsort(descending=True).cpu().tolist()
+        preferences = preferences.cpu().tolist()
+        remaining = capacities[batch_index].cpu().tolist()
+        assignment = [-1] * points.shape[1]
+
+        for point_index in point_order:
+            for region in preferences[point_index]:
+                if remaining[region] > 0:
+                    assignment[point_index] = region
+                    remaining[region] -= 1
+                    break
+
+        assignments[batch_index] = torch.tensor(
+            assignment,
+            device=points.device,
+        )
+
+    return assignments
+
+
+@torch.no_grad()
+def strict_target_guided_balanced_permutation(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    target_centers: torch.Tensor,
+) -> torch.Tensor:
+    num_regions = target_centers.shape[0]
+    target_regions = torch.cdist(target, target_centers.unsqueeze(0)).argmin(dim=-1)
+    capacities = F.one_hot(target_regions, num_regions).sum(dim=1)
+    source_regions = greedy_balanced_assignment(
+        source,
+        target_centers,
+        capacities,
+    )
+
+    return _local_hungarian_permutation(
+        source,
+        target,
+        source_regions,
+        target_regions,
+        num_regions,
+    )
+
+
+@torch.no_grad()
+def global_hungarian_permutation(
+    source: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    costs = torch.cdist(source, target).square().cpu().numpy()
+    permutation = torch.empty(
+        source.shape[0],
+        source.shape[1],
+        dtype=torch.long,
+        device=source.device,
+    )
+
+    for batch_index in range(source.shape[0]):
+        _, target_indices = linear_sum_assignment(costs[batch_index])
+        permutation[batch_index] = torch.as_tensor(
+            target_indices,
+            device=source.device,
+        )
+
+    return permutation
