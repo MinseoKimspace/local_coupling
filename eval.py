@@ -76,8 +76,15 @@ def render_density(
     values = np.concatenate([density.ravel() for density in densities])
     vmax = np.percentile(values[values > 0], 99.5)
     norm = PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax)
-    figure, axes = plt.subplots(1, len(times), figsize=(9, 3))
-    figure.suptitle(f"coupling: {title}", fontsize=16)
+    figure, axes = plt.subplots(1, len(times), figsize=(9, 3.4))
+    figure.text(
+        0.5,
+        0.97,
+        f"coupling: {title}",
+        ha="center",
+        va="top",
+        fontsize=16,
+    )
 
     for axis, density, time in zip(axes, densities, times):
         axis.imshow(
@@ -93,8 +100,14 @@ def render_density(
         axis.set_ylim(-limit, limit)
         axis.set_axis_off()
 
-    figure.tight_layout(rect=(0, 0, 1, 0.92), pad=0.6)
-    figure.savefig(output_path, dpi=200, bbox_inches="tight")
+    figure.subplots_adjust(
+        left=0.02,
+        right=0.98,
+        bottom=0.04,
+        top=0.78,
+        wspace=0.12,
+    )
+    figure.savefig(output_path, dpi=200)
     plt.close(figure)
 
 
