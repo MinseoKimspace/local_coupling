@@ -3,6 +3,7 @@ import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import PowerNorm
 import numpy as np
 from scipy.ndimage import gaussian_filter
 import torch
@@ -54,6 +55,7 @@ def sample_snapshots(
 def render_density(
     snapshots: list[torch.Tensor],
     times: tuple[float, ...],
+    title: str,
     output_path: str,
 ) -> None:
     limit = 1.2
@@ -71,8 +73,11 @@ def render_density(
         density /= density.sum()
         densities.append(density)
 
-    vmax = max(density.max() for density in densities)
+    values = np.concatenate([density.ravel() for density in densities])
+    vmax = np.percentile(values[values > 0], 99.5)
+    norm = PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax)
     figure, axes = plt.subplots(1, len(times), figsize=(9, 3))
+    figure.suptitle(f"coupling: {title}", fontsize=16)
 
     for axis, density, time in zip(axes, densities, times):
         axis.imshow(
@@ -80,8 +85,7 @@ def render_density(
             origin="lower",
             extent=(-limit, limit, -limit, limit),
             cmap="viridis",
-            vmin=0.0,
-            vmax=vmax,
+            norm=norm,
             interpolation="bilinear",
         )
         axis.set_title(f"t = {time:.2f}", fontsize=18)
@@ -89,7 +93,7 @@ def render_density(
         axis.set_ylim(-limit, limit)
         axis.set_axis_off()
 
-    figure.tight_layout(pad=0.6)
+    figure.tight_layout(rect=(0, 0, 1, 0.92), pad=0.6)
     figure.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(figure)
 
@@ -143,6 +147,7 @@ def main(config_path: str = "independent.yaml") -> None:
     render_density(
         [snapshots[step] for step in snapshot_steps],
         snapshot_times,
+        coupling,
         output_path,
     )
     print(f"chamfer={score.item():.6f}")
