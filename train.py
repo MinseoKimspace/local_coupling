@@ -6,17 +6,7 @@ from torch.optim import Optimizer
 import torch.nn.functional as F
 import yaml
 
-from coupling import (
-    geometry_aware_hungarian_permutation,
-    geometry_aware_sinkhorn_permutation,
-    global_hungarian_permutation,
-    regional_permutation,
-    strict_target_guided_balanced_permutation,
-    strict_target_guided_local_permutation,
-    strict_target_guided_permutation,
-    target_guided_permutation,
-    target_guided_sinkhorn_permutation,
-)
+from coupling import apply_coupling
 from data import checkerboard_centers, sample_checkerboard
 from model import PointSetTransformer
 
@@ -80,110 +70,16 @@ def train_step(
         dtype=x_data.dtype,
     )
 
-    if coupling == "regional":
-        if num_regions is None:
-            raise ValueError("num_regions is required for regional coupling")
-
-        permutation = regional_permutation(
-            x_noise,
-            x_data,
-            num_regions=num_regions,
-            generator=coupling_generator,
-        )
-        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
-        x_data = torch.gather(x_data, dim=1, index=permutation)
-    elif coupling == "target_guided":
-        if num_regions is None:
-            raise ValueError("num_regions is required for target-guided coupling")
-
-        permutation = target_guided_permutation(
-            x_noise,
-            x_data,
-            num_regions=num_regions,
-            generator=coupling_generator,
-        )
-        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
-        x_data = torch.gather(x_data, dim=1, index=permutation)
-    elif coupling == "target_guided_sinkhorn":
-        if num_regions is None:
-            raise ValueError("num_regions is required for Sinkhorn coupling")
-
-        permutation = target_guided_sinkhorn_permutation(
-            x_noise,
-            x_data,
-            num_regions=num_regions,
-            epsilon=sinkhorn_epsilon,
-            num_iterations=sinkhorn_iterations,
-            generator=coupling_generator,
-        )
-        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
-        x_data = torch.gather(x_data, dim=1, index=permutation)
-    elif coupling == "geometry_aware_sinkhorn":
-        if num_regions is None:
-            raise ValueError("num_regions is required for geometry-aware Sinkhorn")
-
-        permutation = geometry_aware_sinkhorn_permutation(
-            x_noise,
-            x_data,
-            num_regions=num_regions,
-            epsilon=sinkhorn_epsilon,
-            num_iterations=sinkhorn_iterations,
-            generator=coupling_generator,
-        )
-        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
-        x_data = torch.gather(x_data, dim=1, index=permutation)
-    elif coupling == "geometry_aware_hungarian":
-        if num_regions is None:
-            raise ValueError("num_regions is required for geometry-aware Hungarian")
-
-        permutation = geometry_aware_hungarian_permutation(
-            x_noise,
-            x_data,
-            num_regions=num_regions,
-            generator=coupling_generator,
-        )
-        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
-        x_data = torch.gather(x_data, dim=1, index=permutation)
-    elif coupling == "target_guided_strict":
-        if target_centers is None:
-            raise ValueError("target_centers is required for strict target-guided coupling")
-
-        permutation = strict_target_guided_permutation(
-            x_noise,
-            x_data,
-            target_centers,
-            generator=coupling_generator,
-        )
-        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
-        x_data = torch.gather(x_data, dim=1, index=permutation)
-    elif coupling == "target_guided_strict_local":
-        if target_centers is None:
-            raise ValueError("target_centers is required for strict local coupling")
-
-        permutation = strict_target_guided_local_permutation(
-            x_noise,
-            x_data,
-            target_centers,
-        )
-        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
-        x_data = torch.gather(x_data, dim=1, index=permutation)
-    elif coupling == "target_guided_strict_balanced":
-        if target_centers is None:
-            raise ValueError("target_centers is required for strict balanced coupling")
-
-        permutation = strict_target_guided_balanced_permutation(
-            x_noise,
-            x_data,
-            target_centers,
-        )
-        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
-        x_data = torch.gather(x_data, dim=1, index=permutation)
-    elif coupling == "global_hungarian":
-        permutation = global_hungarian_permutation(x_noise, x_data)
-        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
-        x_data = torch.gather(x_data, dim=1, index=permutation)
-    elif coupling != "independent":
-        raise ValueError("unknown coupling")
+    x_data = apply_coupling(
+        x_noise,
+        x_data,
+        method=coupling,
+        num_regions=num_regions,
+        target_centers=target_centers,
+        sinkhorn_epsilon=sinkhorn_epsilon,
+        sinkhorn_iterations=sinkhorn_iterations,
+        generator=coupling_generator,
+    )
 
     t = sample_time(
         x_data.shape[0],

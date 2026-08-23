@@ -566,3 +566,100 @@ def global_hungarian_permutation(
         )
 
     return permutation
+
+
+def apply_coupling(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    method: str,
+    num_regions: int | None = None,
+    target_centers: torch.Tensor | None = None,
+    sinkhorn_epsilon: float = 0.1,
+    sinkhorn_iterations: int = 100,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    if method == "independent":
+        return target
+
+    if method == "regional":
+        if num_regions is None:
+            raise ValueError("num_regions is required for regional coupling")
+        permutation = regional_permutation(
+            source,
+            target,
+            num_regions=num_regions,
+            generator=generator,
+        )
+    elif method == "target_guided":
+        if num_regions is None:
+            raise ValueError("num_regions is required for target-guided coupling")
+        permutation = target_guided_permutation(
+            source,
+            target,
+            num_regions=num_regions,
+            generator=generator,
+        )
+    elif method == "target_guided_sinkhorn":
+        if num_regions is None:
+            raise ValueError("num_regions is required for Sinkhorn coupling")
+        permutation = target_guided_sinkhorn_permutation(
+            source,
+            target,
+            num_regions=num_regions,
+            epsilon=sinkhorn_epsilon,
+            num_iterations=sinkhorn_iterations,
+            generator=generator,
+        )
+    elif method == "geometry_aware_sinkhorn":
+        if num_regions is None:
+            raise ValueError("num_regions is required for geometry-aware Sinkhorn")
+        permutation = geometry_aware_sinkhorn_permutation(
+            source,
+            target,
+            num_regions=num_regions,
+            epsilon=sinkhorn_epsilon,
+            num_iterations=sinkhorn_iterations,
+            generator=generator,
+        )
+    elif method == "geometry_aware_hungarian":
+        if num_regions is None:
+            raise ValueError("num_regions is required for geometry-aware Hungarian")
+        permutation = geometry_aware_hungarian_permutation(
+            source,
+            target,
+            num_regions=num_regions,
+            generator=generator,
+        )
+    elif method == "target_guided_strict":
+        if target_centers is None:
+            raise ValueError("target_centers is required for strict target-guided coupling")
+        permutation = strict_target_guided_permutation(
+            source,
+            target,
+            target_centers,
+            generator=generator,
+        )
+    elif method == "target_guided_strict_local":
+        if target_centers is None:
+            raise ValueError("target_centers is required for strict local coupling")
+        permutation = strict_target_guided_local_permutation(
+            source,
+            target,
+            target_centers,
+        )
+    elif method == "target_guided_strict_balanced":
+        if target_centers is None:
+            raise ValueError("target_centers is required for strict balanced coupling")
+        permutation = strict_target_guided_balanced_permutation(
+            source,
+            target,
+            target_centers,
+        )
+    elif method == "global_hungarian":
+        permutation = global_hungarian_permutation(source, target)
+    else:
+        raise ValueError("unknown coupling")
+
+    permutation = permutation.unsqueeze(-1).expand(-1, -1, target.shape[-1])
+    return torch.gather(target, dim=1, index=permutation)
