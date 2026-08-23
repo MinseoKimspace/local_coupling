@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import yaml
 
 from coupling import (
+    geometry_aware_hungarian_permutation,
     geometry_aware_sinkhorn_permutation,
     global_hungarian_permutation,
     regional_permutation,
@@ -127,6 +128,18 @@ def train_step(
             num_regions=num_regions,
             epsilon=sinkhorn_epsilon,
             num_iterations=sinkhorn_iterations,
+            generator=coupling_generator,
+        )
+        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
+        x_data = torch.gather(x_data, dim=1, index=permutation)
+    elif coupling == "geometry_aware_hungarian":
+        if num_regions is None:
+            raise ValueError("num_regions is required for geometry-aware Hungarian")
+
+        permutation = geometry_aware_hungarian_permutation(
+            x_noise,
+            x_data,
+            num_regions=num_regions,
             generator=coupling_generator,
         )
         permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
