@@ -9,8 +9,7 @@ from scipy.ndimage import gaussian_filter
 import torch
 import yaml
 
-from coupling import apply_coupling
-from data import checkerboard_centers, sample_checkerboard
+from data import sample_checkerboard
 from model import PointSetTransformer
 
 
@@ -51,33 +50,6 @@ def sample_snapshots(
 
     model.train(was_training)
     return snapshots
-
-
-def conditional_velocity_variance_proxy(
-    model: torch.nn.Module,
-    x_data: torch.Tensor,
-    x_noise: torch.Tensor,
-    times: tuple[float, ...],
-) -> dict[float, float]:
-    velocity = x_data - x_noise
-    values = {}
-    was_training = model.training
-    model.eval()
-
-    with torch.no_grad():
-        for time in times:
-            t = torch.full(
-                (x_data.shape[0], 1, 1),
-                time,
-                device=x_data.device,
-                dtype=x_data.dtype,
-            )
-            x_t = (1.0 - t) * x_noise + t * x_data
-            prediction = model(x_t, t)
-            values[time] = (prediction - velocity).square().mean().item()
-
-    model.train(was_training)
-    return values
 
 
 def render_density(
@@ -192,45 +164,7 @@ def main(config_path: str = "independent.yaml") -> None:
         output_path,
     )
 
-    torch.manual_seed(config["seed"] + 1000)
-    variance_target = sample_checkerboard(
-        evaluation_batch_size,
-        data_config["n_points"],
-        device=device,
-        dtype=dtype,
-        grid_size=data_config["grid_size"],
-    )
-    variance_noise = torch.randn_like(variance_target)
-    target_centers = checkerboard_centers(
-        data_config["grid_size"],
-        device,
-        dtype,
-    )
-    coupling_generator = torch.Generator(device=device)
-    coupling_generator.manual_seed(config["seed"] + 1001)
-    variance_target = apply_coupling(
-        variance_noise,
-        variance_target,
-        method=coupling,
-        num_regions=config.get("num_regions"),
-        target_centers=target_centers,
-        sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
-        sinkhorn_iterations=config.get("sinkhorn_iterations", 100),
-        generator=coupling_generator,
-    )
-    variance_times = (0.1, 0.3, 0.5, 0.7, 0.9)
-    variance_values = conditional_velocity_variance_proxy(
-        model,
-        variance_target,
-        variance_noise,
-        variance_times,
-    )
-
     print(f"chamfer={score.item():.6f}")
-    for time, value in variance_values.items():
-        print(f"velocity_variance_proxy_t={time:.1f} value={value:.6f}")
-    mean_variance = sum(variance_values.values()) / len(variance_values)
-    print(f"velocity_variance_proxy_mean={mean_variance:.6f}")
     print(f"saved={output_path}")
 
 
