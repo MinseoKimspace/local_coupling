@@ -185,6 +185,168 @@ def target_guided_permutation(
     return permutation
 
 
+def sinkhorn_balanced_plan(
+    points: torch.Tensor,
+    centers: torch.Tensor,
+    capacities: torch.Tensor,
+    *,
+    epsilon: float,
+    num_iterations: int,
+) -> torch.Tensor:
+    log_kernel = -torch.cdist(points, centers).square() / epsilon
+    log_capacities = capacities.to(points.dtype).log()
+    log_v = torch.zeros_like(log_capacities)
+
+    for _ in range(num_iterations):
+        log_u = -torch.logsumexp(log_kernel + log_v.unsqueeze(1), dim=2)
+        log_v = log_capacities - torch.logsumexp(
+            log_kernel + log_u.unsqueeze(2),
+            dim=1,
+        )
+
+    return torch.exp(log_kernel + log_u.unsqueeze(2) + log_v.unsqueeze(1))
+
+
+def round_balanced_plan(
+    plan: torch.Tensor,
+    capacities: torch.Tensor,
+) -> torch.Tensor:
+    assignments = torch.empty(
+        plan.shape[0],
+        plan.shape[1],
+        dtype=torch.long,
+        device=plan.device,
+    )
+
+    for batch_index in range(plan.shape[0]):
+        sorted_scores, preferences = plan[batch_index].sort(dim=1, descending=True)
+        margins = sorted_scores[:, 0] - sorted_scores[:, 1]
+        point_order = margins.argsort(descending=True).cpu().tolist()
+        preferences = preferences.cpu().tolist()
+        remaining = capacities[batch_index].cpu().tolist()
+        assignment = [-1] * plan.shape[1]
+
+        for point_index in point_order:
+            for region in preferences[point_index]:
+                if remaining[region] > 0:
+                    assignment[point_index] = region
+                    remaining[region] -= 1
+                    break
+
+        assignments[batch_index] = torch.tensor(
+            assignment,
+            device=plan.device,
+        )
+
+    return assignments
+
+
+@torch.no_grad()
+def target_guided_sinkhorn_permutation(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    num_regions: int,
+    epsilon: float,
+    num_iterations: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    batch_size, num_points, _ = source.shape
+    batch_indices = torch.arange(batch_size, device=source.device).unsqueeze(1)
+    capacities = torch.full(
+        (batch_size, num_regions),
+        num_points // num_regions,
+        dtype=torch.long,
+        device=source.device,
+    )
+
+    target_anchor_indices = farthest_point_sample(target, num_regions)
+    target_anchors = target[batch_indices, target_anchor_indices]
+    target_plan = sinkhorn_balanced_plan(
+        target,
+        target_anchors,
+        capacities,
+        epsilon=epsilon,
+        num_iterations=num_iterations,
+    )
+    target_regions = round_balanced_plan(target_plan, capacities)
+    target_centroids = _region_centroids(target, target_regions, num_regions)
+    source_plan = sinkhorn_balanced_plan(
+        source,
+        target_centroids,
+        capacities,
+        epsilon=epsilon,
+        num_iterations=num_iterations,
+    )
+    source_regions = round_balanced_plan(source_plan, capacities)
+    permutation = torch.empty(
+        batch_size,
+        num_points,
+        dtype=torch.long,
+        device=source.device,
+    )
+
+    for batch_index in range(batch_size):
+        for region in range(num_regions):
+            source_indices = torch.where(source_regions[batch_index] == region)[0]
+            target_indices = torch.where(target_regions[batch_index] == region)[0]
+            order = torch.randperm(
+                target_indices.numel(),
+                device=source.device,
+                generator=generator,
+            )
+            permutation[batch_index, source_indices] = target_indices[order]
+
+    return permutation
+
+
+@torch.no_grad()
+def geometry_aware_sinkhorn_permutation(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    num_regions: int,
+    epsilon: float,
+    num_iterations: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    batch_size, num_points, _ = source.shape
+    batch_indices = torch.arange(batch_size, device=source.device).unsqueeze(1)
+
+    target_anchor_indices = farthest_point_sample(target, num_regions)
+    target_anchors = target[batch_indices, target_anchor_indices]
+    target_regions = torch.cdist(target, target_anchors).square().argmin(dim=-1)
+    capacities = F.one_hot(target_regions, num_regions).sum(dim=1)
+    target_centroids = _region_centroids(target, target_regions, num_regions)
+    source_plan = sinkhorn_balanced_plan(
+        source,
+        target_centroids,
+        capacities,
+        epsilon=epsilon,
+        num_iterations=num_iterations,
+    )
+    source_regions = round_balanced_plan(source_plan, capacities)
+    permutation = torch.empty(
+        batch_size,
+        num_points,
+        dtype=torch.long,
+        device=source.device,
+    )
+
+    for batch_index in range(batch_size):
+        for region in range(num_regions):
+            source_indices = torch.where(source_regions[batch_index] == region)[0]
+            target_indices = torch.where(target_regions[batch_index] == region)[0]
+            order = torch.randperm(
+                target_indices.numel(),
+                device=source.device,
+                generator=generator,
+            )
+            permutation[batch_index, source_indices] = target_indices[order]
+
+    return permutation
+
+
 @torch.no_grad()
 def strict_target_guided_permutation(
     source: torch.Tensor,

@@ -7,12 +7,14 @@ import torch.nn.functional as F
 import yaml
 
 from coupling import (
+    geometry_aware_sinkhorn_permutation,
     global_hungarian_permutation,
     regional_permutation,
     strict_target_guided_balanced_permutation,
     strict_target_guided_local_permutation,
     strict_target_guided_permutation,
     target_guided_permutation,
+    target_guided_sinkhorn_permutation,
 )
 from data import checkerboard_centers, sample_checkerboard
 from model import PointSetTransformer
@@ -67,6 +69,8 @@ def train_step(
     coupling: str,
     num_regions: int | None = None,
     target_centers: torch.Tensor | None = None,
+    sinkhorn_epsilon: float = 0.1,
+    sinkhorn_iterations: int = 100,
     coupling_generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     x_noise = torch.randn(
@@ -95,6 +99,34 @@ def train_step(
             x_noise,
             x_data,
             num_regions=num_regions,
+            generator=coupling_generator,
+        )
+        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
+        x_data = torch.gather(x_data, dim=1, index=permutation)
+    elif coupling == "target_guided_sinkhorn":
+        if num_regions is None:
+            raise ValueError("num_regions is required for Sinkhorn coupling")
+
+        permutation = target_guided_sinkhorn_permutation(
+            x_noise,
+            x_data,
+            num_regions=num_regions,
+            epsilon=sinkhorn_epsilon,
+            num_iterations=sinkhorn_iterations,
+            generator=coupling_generator,
+        )
+        permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
+        x_data = torch.gather(x_data, dim=1, index=permutation)
+    elif coupling == "geometry_aware_sinkhorn":
+        if num_regions is None:
+            raise ValueError("num_regions is required for geometry-aware Sinkhorn")
+
+        permutation = geometry_aware_sinkhorn_permutation(
+            x_noise,
+            x_data,
+            num_regions=num_regions,
+            epsilon=sinkhorn_epsilon,
+            num_iterations=sinkhorn_iterations,
             generator=coupling_generator,
         )
         permutation = permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1])
@@ -196,6 +228,8 @@ def main(config_path: str = "independent.yaml") -> None:
             coupling=coupling,
             num_regions=config.get("num_regions"),
             target_centers=target_centers,
+            sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
+            sinkhorn_iterations=config.get("sinkhorn_iterations", 100),
             coupling_generator=coupling_generator,
         )
 
