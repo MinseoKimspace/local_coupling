@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
@@ -120,6 +121,7 @@ def main(config_path: str = "independent.yaml") -> None:
     dtype = getattr(torch, config["dtype"])
     data_config = config["data"]
     coupling = config["coupling"]
+    run_name = Path(config["checkpoint"]).stem
     integration_steps = 100
     snapshot_times = (0.78, 0.89, 1.00)
     snapshot_steps = tuple(round(time * integration_steps) for time in snapshot_times)
@@ -156,11 +158,11 @@ def main(config_path: str = "independent.yaml") -> None:
 
     prediction = snapshots[integration_steps].to(device)
     score = chamfer_distance(prediction, target)
-    output_path = f"density_{coupling}.png"
+    output_path = f"density_{run_name}.png"
     render_density(
         [snapshots[step] for step in snapshot_steps],
         snapshot_times,
-        coupling,
+        run_name,
         output_path,
     )
 
