@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from time import perf_counter
 
 import matplotlib
 matplotlib.use("Agg")
@@ -12,6 +13,7 @@ import yaml
 
 from data import sample_checkerboard
 from model import PointSetTransformer
+from sample import integrate_velocity
 
 
 def chamfer_distance(
@@ -142,6 +144,31 @@ def main(config_path: str = "independent.yaml") -> None:
         device=device,
         dtype=dtype,
     )
+
+    warmup_t = torch.zeros(
+        evaluation_batch_size,
+        1,
+        1,
+        device=device,
+        dtype=dtype,
+    )
+    model.eval()
+    with torch.no_grad():
+        for _ in range(10):
+            model(x_noise, warmup_t)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    inference_start = perf_counter()
+    integrate_velocity(
+        model,
+        x_noise,
+        num_steps=integration_steps,
+    )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    inference_seconds = perf_counter() - inference_start
+
     snapshots = sample_snapshots(
         model,
         x_noise,
@@ -167,6 +194,7 @@ def main(config_path: str = "independent.yaml") -> None:
     )
 
     print(f"chamfer={score.item():.6f}")
+    print(f"inference_seconds={inference_seconds:.6f}")
     print(f"saved={output_path}")
 
 

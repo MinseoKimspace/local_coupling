@@ -1,4 +1,5 @@
 import sys
+from time import perf_counter
 
 import torch
 from torch import nn
@@ -226,6 +227,10 @@ def main(config_path: str = "independent.yaml") -> None:
     )
     model.train()
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_start = perf_counter()
+
     for step in range(1, training_config["num_steps"] + 1):
         x_data = sample_checkerboard(
             data_config["batch_size"],
@@ -249,7 +254,11 @@ def main(config_path: str = "independent.yaml") -> None:
         if step == 1 or step % training_config["log_every"] == 0:
             print(f"step={step} loss={loss.item():.6f}")
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_seconds = perf_counter() - training_start
     torch.save(model.state_dict(), config["checkpoint"])
+    print(f"training_seconds={training_seconds:.3f}")
 
 
 if __name__ == "__main__":
