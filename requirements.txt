@@ -5,3 +5,4 @@ torchvision==0.20.1+cu121
 scipy==1.15.2
 PyYAML==6.0.2
 matplotlib==3.7.4
+scikit-image==0.25.2

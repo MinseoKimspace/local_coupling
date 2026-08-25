@@ -1,17 +1,16 @@
-import sys
 import math
+import sys
+from time import perf_counter
 
 import torch
+from skimage.data import horse
 from torch import nn
-from torch.utils.data import DataLoader
-from torchvision.datasets import MNIST
-from torchvision.transforms import ToTensor
 import yaml
 
 from train import train_step
 
 
-class MNISTPointSetTransformer(nn.Module):
+class HorsePointSetTransformer(nn.Module):
     def __init__(
         self,
         *,
@@ -58,30 +57,40 @@ class MNISTPointSetTransformer(nn.Module):
         return self.output_proj(h)
 
 
-def images_to_points(images: torch.Tensor, n_points: int) -> torch.Tensor:
-    batch_size, _, height, width = images.shape
-    weights = images.flatten(1)
-    pixel_indices = torch.multinomial(weights, n_points, replacement=True)
-    rows = torch.div(pixel_indices, width, rounding_mode="floor")
-    columns = pixel_indices % width
+def load_horse_mask(
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.as_tensor(~horse(), device=device, dtype=dtype)
+
+
+def sample_horse(
+    mask: torch.Tensor,
+    batch_size: int,
+    n_points: int,
+) -> torch.Tensor:
+    height, width = mask.shape
+    indices = torch.multinomial(
+        mask.flatten(),
+        batch_size * n_points,
+        replacement=True,
+    ).reshape(batch_size, n_points)
+    rows = torch.div(indices, width, rounding_mode="floor")
+    columns = indices % width
     jitter = torch.rand(
         batch_size,
         n_points,
         2,
-        device=images.device,
-        dtype=images.dtype,
+        device=mask.device,
+        dtype=mask.dtype,
     )
-    x = (columns.to(images.dtype) + jitter[..., 0]) / width * 2.0 - 1.0
-    y = 1.0 - (rows.to(images.dtype) + jitter[..., 1]) / height * 2.0
+    scale = float(max(height, width))
+    x = (columns.to(mask.dtype) + jitter[..., 0] - width / 2.0) * 2.0 / scale
+    y = (height / 2.0 - rows.to(mask.dtype) - jitter[..., 1]) * 2.0 / scale
     return torch.stack([x, y], dim=-1)
 
 
-def repeat(loader: DataLoader):
-    while True:
-        yield from loader
-
-
-def main(config_path: str = "mnist_independent.yaml") -> None:
+def main(config_path: str = "horse_independent.yaml") -> None:
     with open(config_path, encoding="utf-8") as file:
         config = yaml.safe_load(file)
 
@@ -90,24 +99,9 @@ def main(config_path: str = "mnist_independent.yaml") -> None:
     dtype = getattr(torch, config["dtype"])
     data_config = config["data"]
     training_config = config["training"]
+    mask = load_horse_mask(device, dtype)
 
-    dataset = MNIST(
-        root=data_config["root"],
-        train=True,
-        download=True,
-        transform=ToTensor(),
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=data_config["batch_size"],
-        shuffle=True,
-        drop_last=True,
-        num_workers=data_config["num_workers"],
-        pin_memory=device.type == "cuda",
-    )
-    batches = repeat(loader)
-
-    model = MNISTPointSetTransformer(**config["model"]).to(device=device, dtype=dtype)
+    model = HorsePointSetTransformer(**config["model"]).to(device=device, dtype=dtype)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=training_config["learning_rate"],
@@ -117,10 +111,16 @@ def main(config_path: str = "mnist_independent.yaml") -> None:
     coupling_generator.manual_seed(config["seed"] + 1)
     model.train()
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_start = perf_counter()
+
     for step in range(1, training_config["num_steps"] + 1):
-        images, _ = next(batches)
-        images = images.to(device=device, dtype=dtype, non_blocking=True)
-        x_data = images_to_points(images, data_config["n_points"])
+        x_data = sample_horse(
+            mask,
+            data_config["batch_size"],
+            data_config["n_points"],
+        )
         loss = train_step(
             model,
             optimizer,
@@ -133,7 +133,11 @@ def main(config_path: str = "mnist_independent.yaml") -> None:
         if step == 1 or step % training_config["log_every"] == 0:
             print(f"step={step} loss={loss.item():.6f}")
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_seconds = perf_counter() - training_start
     torch.save(model.state_dict(), config["checkpoint"])
+    print(f"training_seconds={training_seconds:.3f}")
 
 
 if __name__ == "__main__":

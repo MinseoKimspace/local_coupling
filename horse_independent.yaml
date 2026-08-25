@@ -4,10 +4,8 @@ dtype: float32
 coupling: independent
 
 data:
-  root: datasets
   batch_size: 16
   n_points: 256
-  num_workers: 0
 
 model:
   point_dim: 2
@@ -19,8 +17,8 @@ model:
 
 training:
   num_steps: 50000
-  learning_rate: 0.001
+  learning_rate: 0.0003
   weight_decay: 0.01
   log_every: 100
 
-checkpoint: model_mnist_independent_sinusoidal.pt
+checkpoint: model_horse_independent.pt
