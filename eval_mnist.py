@@ -12,20 +12,20 @@ from sample import integrate_velocity
 
 
 def render_samples(points: torch.Tensor, title: str, output_path: str) -> None:
-    figure, axes = plt.subplots(4, 4, figsize=(8, 8))
-    figure.suptitle(f"MNIST - {title}", fontsize=16)
+    figure, axes = plt.subplots(4, 4, figsize=(8, 8), facecolor="black")
+    figure.suptitle(f"MNIST - {title}", fontsize=16, color="white")
 
     for axis, sample in zip(axes.flat, points):
         sample = sample.numpy()
-        axis.set_facecolor("#440154")
-        axis.scatter(sample[:, 0], sample[:, 1], s=5, c="#FDE725", linewidths=0)
+        axis.set_facecolor("black")
+        axis.scatter(sample[:, 0], sample[:, 1], s=8, c="white", linewidths=0)
         axis.set_xlim(-1.2, 1.2)
         axis.set_ylim(-1.2, 1.2)
         axis.set_aspect("equal")
         axis.set_axis_off()
 
     figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
-    figure.savefig(output_path, dpi=200)
+    figure.savefig(output_path, dpi=200, facecolor="black")
     plt.close(figure)
 
 
