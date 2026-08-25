@@ -7,8 +7,8 @@ import matplotlib.pyplot as plt
 import torch
 import yaml
 
-from model import PointSetTransformer
 from sample import integrate_velocity
+from train_mnist import MNISTPointSetTransformer
 
 
 def render_samples(points: torch.Tensor, title: str, output_path: str) -> None:
@@ -38,7 +38,7 @@ def main(config_path: str = "mnist_independent.yaml") -> None:
     dtype = getattr(torch, config["dtype"])
     run_name = Path(config["checkpoint"]).stem
 
-    model = PointSetTransformer(**config["model"]).to(device=device, dtype=dtype)
+    model = MNISTPointSetTransformer(**config["model"]).to(device=device, dtype=dtype)
     state_dict = torch.load(
         config["checkpoint"],
         map_location=device,

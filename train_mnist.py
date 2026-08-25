@@ -1,13 +1,61 @@
 import sys
+import math
 
 import torch
+from torch import nn
 from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
 from torchvision.transforms import ToTensor
 import yaml
 
-from model import PointSetTransformer
 from train import train_step
+
+
+class MNISTPointSetTransformer(nn.Module):
+    def __init__(
+        self,
+        *,
+        point_dim: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.input_proj = nn.Linear(point_dim, d_model)
+        frequencies = 1000.0 * torch.exp(
+            -math.log(10000.0) * torch.linspace(0.0, 1.0, d_model // 2)
+        )
+        self.register_buffer("time_frequencies", frequencies)
+        self.time_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
+        self.output_proj = nn.Linear(d_model, point_dim)
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        angles = t[:, 0, 0].unsqueeze(-1) * self.time_frequencies.unsqueeze(0)
+        time_embedding = torch.cat([angles.sin(), angles.cos()], dim=-1)
+        time_embedding = self.time_proj(time_embedding).unsqueeze(1)
+        h = self.input_proj(x_t) + time_embedding
+        h = self.encoder(h)
+        return self.output_proj(h)
 
 
 def images_to_points(images: torch.Tensor, n_points: int) -> torch.Tensor:
@@ -59,7 +107,7 @@ def main(config_path: str = "mnist_independent.yaml") -> None:
     )
     batches = repeat(loader)
 
-    model = PointSetTransformer(**config["model"]).to(device=device, dtype=dtype)
+    model = MNISTPointSetTransformer(**config["model"]).to(device=device, dtype=dtype)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=training_config["learning_rate"],
