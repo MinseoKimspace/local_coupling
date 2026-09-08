@@ -115,7 +115,10 @@ def render_comparison(
     plt.close(figure)
 
 
-def main(config_path: str = "horse_independent.yaml") -> None:
+def main(config_path: str = "horse_independent.yaml", num_steps: int = 100) -> None:
+    num_steps = int(num_steps)
+    if num_steps <= 0:
+        raise ValueError("num_steps must be positive")
     with open(config_path, encoding="utf-8") as file:
         config = yaml.safe_load(file)
 
@@ -156,7 +159,7 @@ def main(config_path: str = "horse_independent.yaml") -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     inference_start = perf_counter()
-    prediction = integrate_velocity(model, x_noise, num_steps=100)
+    prediction = integrate_velocity(model, x_noise, num_steps=num_steps)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     inference_seconds = perf_counter() - inference_start
@@ -169,14 +172,15 @@ def main(config_path: str = "horse_independent.yaml") -> None:
     )
     score = chamfer_distance(prediction, target)
     leakage, histogram_js = horse_metrics(prediction, mask)
-    output_path = f"horse_{run_name}.png"
+    output_path = f"horse_{run_name}_euler{num_steps}.png"
     render_comparison(
         target.cpu(),
         prediction.cpu(),
-        run_name,
+        f"{run_name}\nEuler steps: {num_steps}",
         output_path,
     )
 
+    print(f"checkpoint={config['checkpoint']} euler_steps={num_steps}")
     print(f"chamfer={score.item():.6f}")
     print(f"leakage={leakage:.6f}")
     print(f"histogram_js={histogram_js:.6f}")
