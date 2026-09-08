@@ -1,4 +1,6 @@
+import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 
@@ -172,6 +174,33 @@ def main(config_path: str = "horse_independent.yaml", num_steps: int = 100) -> N
     )
     score = chamfer_distance(prediction, target)
     leakage, histogram_js = horse_metrics(prediction, mask)
+    evaluated_at = datetime.now(timezone.utc)
+    results = {
+        "dataset": "horse",
+        "evaluated_at": evaluated_at.isoformat(),
+        "config_path": str(Path(config_path).resolve()),
+        "checkpoint": str(Path(config["checkpoint"]).resolve()),
+        "config": config,
+        "coupling": config["coupling"],
+        "evaluation_seed": 1,
+        "evaluation_batch_size": evaluation_batch_size,
+        "n_points": data_config["n_points"],
+        "euler_steps": num_steps,
+        "histogram_bins": 64,
+        "chamfer": score.item(),
+        "leakage": leakage,
+        "histogram_js": histogram_js,
+        "inference_seconds": inference_seconds,
+    }
+    results_dir = Path("eval_results")
+    results_dir.mkdir(exist_ok=True)
+    results_path = results_dir / (
+        f"horse_{run_name}_euler{num_steps}_"
+        f"{evaluated_at:%Y%m%dT%H%M%S%fZ}.json"
+    )
+    with results_path.open("x", encoding="utf-8") as file:
+        json.dump(results, file, indent=2, ensure_ascii=False, allow_nan=False)
+    print(f"saved_json={results_path}")
     output_path = f"horse_{run_name}_euler{num_steps}.png"
     render_comparison(
         target.cpu(),

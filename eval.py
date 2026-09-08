@@ -1,4 +1,7 @@
+import json
+import math
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 
@@ -12,6 +15,7 @@ import torch
 import yaml
 
 from data import sample_checkerboard
+from checkerboard_metrics import checkerboard_metrics
 from model import PointSetTransformer
 from sample import integrate_velocity
 
@@ -185,6 +189,37 @@ def main(config_path: str = "independent.yaml") -> None:
 
     prediction = snapshots[integration_steps].to(device)
     score = chamfer_distance(prediction, target)
+    leakage, mass_error, histogram_js = checkerboard_metrics(
+        prediction, data_config["grid_size"],
+    )
+    evaluated_at = datetime.now(timezone.utc)
+    results = {
+        "dataset": "checkerboard",
+        "evaluated_at": evaluated_at.isoformat(),
+        "config_path": str(Path(config_path).resolve()),
+        "checkpoint": str(Path(config["checkpoint"]).resolve()),
+        "config": config,
+        "coupling": coupling,
+        "evaluation_seed": 1,
+        "evaluation_batch_size": evaluation_batch_size,
+        "n_points": data_config["n_points"],
+        "euler_steps": integration_steps,
+        "histogram_bins": 64,
+        "chamfer": score.item(),
+        "leakage": leakage,
+        "cell_mass_error": mass_error if math.isfinite(mass_error) else None,
+        "histogram_js": histogram_js,
+        "inference_seconds": inference_seconds,
+    }
+    results_dir = Path("eval_results")
+    results_dir.mkdir(exist_ok=True)
+    results_path = results_dir / (
+        f"checkerboard_{run_name}_euler{integration_steps}_"
+        f"{evaluated_at:%Y%m%dT%H%M%S%fZ}.json"
+    )
+    with results_path.open("x", encoding="utf-8") as file:
+        json.dump(results, file, indent=2, ensure_ascii=False, allow_nan=False)
+    print(f"saved_json={results_path}")
     output_path = f"density_{run_name}.png"
     render_density(
         [snapshots[step] for step in snapshot_steps],
@@ -194,6 +229,9 @@ def main(config_path: str = "independent.yaml") -> None:
     )
 
     print(f"chamfer={score.item():.6f}")
+    print(f"leakage={leakage:.6f}")
+    print(f"cell_mass_error={mass_error:.6f}")
+    print(f"histogram_js={histogram_js:.6f}")
     print(f"inference_seconds={inference_seconds:.6f}")
     print(f"saved={output_path}")
 
