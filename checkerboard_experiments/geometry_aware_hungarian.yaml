@@ -1,11 +1,11 @@
 seed: 0
 device: cuda
 dtype: float32
-coupling: target_guided
+coupling: geometry_aware_hungarian
 num_regions: 8
 
 data:
-  batch_size: 16
+  batch_size: 64
   n_points: 256
   grid_size: 4
 
@@ -23,4 +23,7 @@ training:
   weight_decay: 0.01
   log_every: 100
 
-checkpoint: model_target_guided.pt
+evaluation:
+  batch_size: 64
+
+checkpoint: geometry_aware_hungarian.pt

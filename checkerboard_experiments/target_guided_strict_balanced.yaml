@@ -4,7 +4,7 @@ dtype: float32
 coupling: target_guided_strict_balanced
 
 data:
-  batch_size: 16
+  batch_size: 64
   n_points: 256
   grid_size: 4
 
@@ -22,4 +22,7 @@ training:
   weight_decay: 0.01
   log_every: 100
 
-checkpoint: model_target_guided_strict_balanced.pt
+evaluation:
+  batch_size: 64
+
+checkpoint: target_guided_strict_balanced.pt

@@ -42,7 +42,7 @@ def sample_checkerboard(
         grid_size=grid_size,
         device=device,
         dtype=dtype,
-    )  # [K, 2]
+    )
 
     n_cells = base_centers.shape[0]
     cell_size = 2.0 / grid_size
@@ -52,7 +52,7 @@ def sample_checkerboard(
         high=n_cells,
         size=(batch_size, n_points),
         device=device,
-    )  # [B, N]
+    )
 
     selected_centers = base_centers[cell_index]
 

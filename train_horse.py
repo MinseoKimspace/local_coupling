@@ -1,13 +1,12 @@
 import math
 import sys
-from time import perf_counter
 
 import torch
 from skimage.data import horse
 from torch import nn
-import yaml
 
-from train import train_step
+from experiment import read_config
+from train import train_model
 
 
 class HorsePointSetTransformer(nn.Module):
@@ -90,54 +89,17 @@ def sample_horse(
     return torch.stack([x, y], dim=-1)
 
 
-def main(config_path: str = "horse_independent.yaml") -> None:
-    with open(config_path, encoding="utf-8") as file:
-        config = yaml.safe_load(file)
-
+def main(config_path: str = "horse_experiments/horse_independent_n256_seed0.yaml"):
+    config = read_config(config_path)
     torch.manual_seed(config["seed"])
-    device = torch.device(config["device"])
-    dtype = getattr(torch, config["dtype"])
-    data_config = config["data"]
-    training_config = config["training"]
+    device, dtype = torch.device(config["device"]), getattr(torch, config["dtype"])
+    data = config["data"]
     mask = load_horse_mask(device, dtype)
-
     model = HorsePointSetTransformer(**config["model"]).to(device=device, dtype=dtype)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=training_config["learning_rate"],
-        weight_decay=training_config["weight_decay"],
+    return train_model(
+        model, config, lambda: sample_horse(mask, data["batch_size"], data["n_points"]),
+        dataset="horse", config_path=config_path,
     )
-    coupling_generator = torch.Generator(device=device)
-    coupling_generator.manual_seed(config["seed"] + 1)
-    model.train()
-
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    training_start = perf_counter()
-
-    for step in range(1, training_config["num_steps"] + 1):
-        x_data = sample_horse(
-            mask,
-            data_config["batch_size"],
-            data_config["n_points"],
-        )
-        loss = train_step(
-            model,
-            optimizer,
-            x_data,
-            coupling=config["coupling"],
-            num_regions=config.get("num_regions"),
-            coupling_generator=coupling_generator,
-        )
-
-        if step == 1 or step % training_config["log_every"] == 0:
-            print(f"step={step} loss={loss.item():.6f}")
-
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    training_seconds = perf_counter() - training_start
-    torch.save(model.state_dict(), config["checkpoint"])
-    print(f"training_seconds={training_seconds:.3f}")
 
 
 if __name__ == "__main__":

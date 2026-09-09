@@ -4,7 +4,7 @@ dtype: float32
 coupling: independent
 
 data:
-  batch_size: 16
+  batch_size: 64
   n_points: 256
 
 model:
@@ -16,10 +16,12 @@ model:
   dropout: 0.0
 
 training:
-  num_steps: 50000
+  num_steps: 10000
   learning_rate: 0.0003
   weight_decay: 0.01
   log_every: 100
 
-checkpoint: model_horse_independent_n256_seed0.pt
+evaluation:
+  batch_size: 64
 
+checkpoint: horse_independent_n256_seed0.pt

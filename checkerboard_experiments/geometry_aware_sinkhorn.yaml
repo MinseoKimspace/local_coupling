@@ -7,7 +7,7 @@ sinkhorn_epsilon: 0.1
 sinkhorn_iterations: 100
 
 data:
-  batch_size: 16
+  batch_size: 64
   n_points: 256
   grid_size: 4
 
@@ -25,4 +25,7 @@ training:
   weight_decay: 0.01
   log_every: 100
 
-checkpoint: model_geometry_aware_sinkhorn.pt
+evaluation:
+  batch_size: 64
+
+checkpoint: geometry_aware_sinkhorn.pt

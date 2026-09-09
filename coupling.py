@@ -1,568 +1,208 @@
+import warnings
+
+import numpy as np
+import ot
 import torch
 import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
+
+# Flamary et al., JMLR 22(78), 2021: https://jmlr.org/papers/v22/20-451.html
+ALIASES = {"global_hungarian": "global_ot", "geometry_aware_hungarian": "geometry_aware_ot"}
+
+METHODS = {
+    "independent": ("none", "none", "none"),
+    "regional": ("balanced", "regional", "random"),
+    "target_guided": ("balanced", "exact", "random"),
+    "target_guided_sinkhorn": ("balanced", "sinkhorn", "random"),
+    "geometry_aware_sinkhorn": ("nearest", "sinkhorn", "random"),
+    "geometry_aware_ot": ("nearest", "exact", "random"),
+    "target_guided_strict": ("oracle", "exact", "random"),
+    "target_guided_strict_local": ("oracle", "exact", "exact"),
+    "target_guided_strict_balanced": ("oracle", "greedy", "exact"),
+    "global_ot": ("none", "global", "none"),
+}
 
 
-def farthest_point_sample(
-    points: torch.Tensor,
-    num_samples: int,
-) -> torch.Tensor:
-    batch_size, num_points, _ = points.shape
-    batch_indices = torch.arange(batch_size, device=points.device)
-    sample_indices = torch.empty(
-        batch_size,
-        num_samples,
-        dtype=torch.long,
-        device=points.device,
-    )
-    min_distances = torch.full(
-        (batch_size, num_points),
-        float("inf"),
-        dtype=points.dtype,
-        device=points.device,
-    )
-
-    center = points.mean(dim=1, keepdim=True)
-    farthest = ((points - center) ** 2).sum(dim=-1).argmax(dim=-1)
-
-    for index in range(num_samples):
-        sample_indices[:, index] = farthest
-        anchor = points[batch_indices, farthest].unsqueeze(1)
-        distances = ((points - anchor) ** 2).sum(dim=-1)
-        min_distances = torch.minimum(min_distances, distances)
-        farthest = min_distances.argmax(dim=-1)
-
-    return sample_indices
+def canonical_method(name: str) -> str:
+    name = ALIASES.get(name, name)
+    if name not in METHODS:
+        raise ValueError(f"Unknown coupling: {name}")
+    return name
 
 
-def balanced_partition(
-    points: torch.Tensor,
-    anchors: torch.Tensor,
-) -> torch.Tensor:
-    batch_size, num_points, _ = points.shape
-    num_regions = anchors.shape[1]
-    region_size = num_points // num_regions
-    costs = torch.cdist(points, anchors).square()
-    costs = costs.repeat_interleave(region_size, dim=-1).cpu().numpy()
-    regions = torch.empty(
-        batch_size,
-        num_points,
-        dtype=torch.long,
-        device=points.device,
-    )
-
-    for batch_index in range(batch_size):
-        _, anchor_slots = linear_sum_assignment(costs[batch_index])
-        regions[batch_index] = torch.as_tensor(
-            anchor_slots // region_size,
-            device=points.device,
-        )
-
-    return regions
+def coupling_info(name: str) -> dict:
+    name = canonical_method(name)
+    partition, assignment, local = METHODS[name]
+    exact = assignment in ("exact", "global", "regional") or local == "exact"
+    return {
+        "method": name,
+        "implementation": "pot_v1",
+        "target_partition": partition,
+        "source_assignment": assignment,
+        "local_pairing": local,
+        "cost": "squared_euclidean" if name != "independent" else None,
+        "fps_start": "farthest_from_set_mean" if partition in ("balanced", "nearest") else None,
+        "exact_solver": "POT/network_simplex" if exact else None,
+        "sinkhorn_solver": "POT/sinkhorn_log" if assignment == "sinkhorn" else None,
+        "rounding": "capacity_preserving_greedy" if assignment == "sinkhorn" else None,
+    }
 
 
-def _region_centroids(
-    points: torch.Tensor,
-    regions: torch.Tensor,
-    num_regions: int,
-) -> torch.Tensor:
-    membership = F.one_hot(regions, num_regions).to(points.dtype)
-    totals = membership.transpose(1, 2) @ points
-    return totals / membership.sum(dim=1).unsqueeze(-1)
+def farthest_point_sample(points: torch.Tensor, num_samples: int) -> torch.Tensor:
+    batch, n, _ = points.shape
+    if not 1 <= num_samples <= n:
+        raise ValueError("num_regions must satisfy 1 <= K <= N")
+    rows = torch.arange(batch, device=points.device)
+    indices = torch.empty(batch, num_samples, dtype=torch.long, device=points.device)
+    distances = points.new_full((batch, n), float("inf"))
+    farthest = ((points - points.mean(1, keepdim=True)) ** 2).sum(-1).argmax(-1)
+    for i in range(num_samples):
+        indices[:, i] = farthest
+        anchor = points[rows, farthest].unsqueeze(1)
+        distances = torch.minimum(distances, ((points - anchor) ** 2).sum(-1))
+        distances[rows, farthest] = -1
+        farthest = distances.argmax(-1)
+    return indices
 
 
-def match_regions(
-    source: torch.Tensor,
-    target: torch.Tensor,
-    source_regions: torch.Tensor,
-    target_regions: torch.Tensor,
-    *,
-    num_regions: int,
-) -> torch.Tensor:
-    source_centroids = _region_centroids(source, source_regions, num_regions)
-    target_centroids = _region_centroids(target, target_regions, num_regions)
-    costs = torch.cdist(source_centroids, target_centroids).square().cpu().numpy()
-    matches = torch.empty(
-        source.shape[0],
-        num_regions,
-        dtype=torch.long,
-        device=source.device,
-    )
-
-    for batch_index in range(source.shape[0]):
-        _, target_indices = linear_sum_assignment(costs[batch_index])
-        matches[batch_index] = torch.as_tensor(
-            target_indices,
-            device=source.device,
-        )
-
-    return matches
+def exact_assignment(cost: torch.Tensor, capacities: torch.Tensor | None = None) -> torch.Tensor:
+    n, k = cost.shape
+    if capacities is None:
+        capacities = torch.ones(k, dtype=torch.long, device=cost.device)
+    capacity = capacities.detach().cpu().double().numpy()
+    matrix = np.ascontiguousarray(cost.detach().cpu().double().numpy())
+    if (capacity.shape != (k,) or np.any(capacity < 0)
+            or not np.equal(capacity, np.rint(capacity)).all() or capacity.sum() != n):
+        raise ValueError("Integer nonnegative capacities must sum to the number of points")
+    if n == 0 or not np.isfinite(matrix).all():
+        raise ValueError("Expected nonempty, finite assignment costs")
+    plan, log = ot.emd(np.ones(n), capacity, matrix, log=True)
+    hard = np.rint(plan)
+    if (log.get("warning") or not np.allclose(plan, hard, atol=1e-7, rtol=0)
+            or not np.equal(hard.sum(1), 1).all()
+            or not np.equal(hard.sum(0), capacity).all()):
+        raise RuntimeError(f"POT did not return an optimal integral assignment: {log.get('warning')}")
+    return torch.as_tensor(hard.argmax(1), dtype=torch.long, device=cost.device)
 
 
-@torch.no_grad()
-def regional_permutation(
-    source: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    num_regions: int,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    batch_size, num_points, _ = source.shape
-    batch_indices = torch.arange(batch_size, device=source.device).unsqueeze(1)
+def round_balanced_plan(scores: torch.Tensor, capacities: torch.Tensor) -> torch.Tensor:
+    if not torch.isfinite(scores).all():
+        raise ValueError("Cannot round nonfinite assignment scores")
+    n, k = scores.shape
+    remaining = capacities.cpu().tolist()
+    if any(c < 0 or int(c) != c for c in remaining) or sum(remaining) != n:
+        raise ValueError("Integer nonnegative capacities must sum to N")
+    ranked, preferences = scores.sort(dim=1, descending=True)
+    margins = ranked[:, 0] - ranked[:, 1] if k > 1 else scores.new_zeros(n)
+    order = margins.argsort(descending=True).cpu().tolist()
+    preferences = preferences.cpu().tolist()
+    labels = [-1] * n
+    for i in order:
+        for region in preferences[i]:
+            if remaining[region] > 0:
+                labels[i] = region
+                remaining[region] -= 1
+                break
+    return torch.tensor(labels, dtype=torch.long, device=scores.device)
 
-    source_anchor_indices = farthest_point_sample(source, num_regions)
-    target_anchor_indices = farthest_point_sample(target, num_regions)
-    source_anchors = source[batch_indices, source_anchor_indices]
-    target_anchors = target[batch_indices, target_anchor_indices]
 
-    source_regions = balanced_partition(source, source_anchors)
-    target_regions = balanced_partition(target, target_anchors)
-    region_matches = match_regions(
-        source,
-        target,
-        source_regions,
-        target_regions,
-        num_regions=num_regions,
-    )
+def assign_regions(points, centers, capacities, *, solver="exact", epsilon=0.1, iterations=100):
+    if centers.ndim == 2:
+        centers = centers.unsqueeze(0).expand(points.shape[0], -1, -1)
+    costs = torch.cdist(points, centers).square()
+    labels = []
+    for cost, capacity in zip(costs, capacities):
+        if solver == "exact":
+            labels.append(exact_assignment(cost, capacity))
+            continue
+        live = (torch.arange(cost.shape[1], device=cost.device) if solver == "greedy"
+                else torch.where(capacity > 0)[0])
+        reduced, counts = cost[:, live], capacity[live]
+        if solver == "sinkhorn":
+            if epsilon <= 0 or iterations < 1:
+                raise ValueError("Sinkhorn epsilon and iterations must be positive")
+            n = cost.shape[0]
+            plan = ot.sinkhorn(
+                cost.new_full((n,), 1.0 / n), counts.to(cost.dtype) / n,
+                reduced, epsilon, method="sinkhorn_log", numItermax=iterations,
+                stopThr=1e-6, warn=False,
+            ) * n
+            residual = torch.maximum((plan.sum(1) - 1).abs().max(), (plan.sum(0) - counts).abs().max())
+            if residual.item() > 1e-3:
+                warnings.warn("Sinkhorn marginal tolerance not reached; applying capacity-preserving greedy rounding.", stacklevel=2)
+        elif solver == "greedy":
+            plan = -reduced
+        else:
+            raise ValueError(f"Unknown assignment solver: {solver}")
+        labels.append(live[round_balanced_plan(plan, counts)])
+    return torch.stack(labels)
 
-    permutation = torch.empty(
-        batch_size,
-        num_points,
-        dtype=torch.long,
-        device=source.device,
-    )
 
-    for batch_index in range(batch_size):
-        for source_region in range(num_regions):
-            target_region = region_matches[batch_index, source_region]
-            source_indices = torch.where(source_regions[batch_index] == source_region)[0]
-            target_indices = torch.where(target_regions[batch_index] == target_region)[0]
-            order = torch.randperm(
-                target_indices.numel(),
-                device=source.device,
-                generator=generator,
-            )
-            permutation[batch_index, source_indices] = target_indices[order]
+def region_centroids(points, labels, k):
+    membership = F.one_hot(labels, k).to(points.dtype)
+    counts = membership.sum(1)
+    centers = membership.transpose(1, 2) @ points / counts.clamp_min(1).unsqueeze(-1)
+    return centers, counts.long()
 
+
+def pair_within_regions(source, target, source_labels, target_labels, k, *, local="random", generator=None):
+    permutation = torch.empty(source.shape[:2], dtype=torch.long, device=source.device)
+    for b in range(source.shape[0]):
+        for region in range(k):
+            src = torch.where(source_labels[b] == region)[0]
+            dst = torch.where(target_labels[b] == region)[0]
+            if src.numel() != dst.numel():
+                raise RuntimeError("Source and target patch capacities differ")
+            if src.numel() == 0:
+                continue
+            order = (exact_assignment(torch.cdist(source[b, src], target[b, dst]).square())
+                     if local == "exact" else torch.randperm(dst.numel(), device=source.device, generator=generator))
+            permutation[b, src] = dst[order]
     return permutation
 
 
 @torch.no_grad()
-def target_guided_permutation(
-    source: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    num_regions: int,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    batch_size, num_points, _ = source.shape
-    batch_indices = torch.arange(batch_size, device=source.device).unsqueeze(1)
-
-    target_anchor_indices = farthest_point_sample(target, num_regions)
-    target_anchors = target[batch_indices, target_anchor_indices]
-    target_regions = balanced_partition(target, target_anchors)
-    target_centroids = _region_centroids(target, target_regions, num_regions)
-    source_regions = balanced_partition(source, target_centroids)
-
-    permutation = torch.empty(
-        batch_size,
-        num_points,
-        dtype=torch.long,
-        device=source.device,
-    )
-
-    for batch_index in range(batch_size):
-        for region in range(num_regions):
-            source_indices = torch.where(source_regions[batch_index] == region)[0]
-            target_indices = torch.where(target_regions[batch_index] == region)[0]
-            order = torch.randperm(
-                target_indices.numel(),
-                device=source.device,
-                generator=generator,
-            )
-            permutation[batch_index, source_indices] = target_indices[order]
-
-    return permutation
-
-
-def sinkhorn_balanced_plan(
-    points: torch.Tensor,
-    centers: torch.Tensor,
-    capacities: torch.Tensor,
-    *,
-    epsilon: float,
-    num_iterations: int,
-) -> torch.Tensor:
-    log_kernel = -torch.cdist(points, centers).square() / epsilon
-    log_capacities = capacities.to(points.dtype).log()
-    log_v = torch.zeros_like(log_capacities)
-
-    for _ in range(num_iterations):
-        log_u = -torch.logsumexp(log_kernel + log_v.unsqueeze(1), dim=2)
-        log_v = log_capacities - torch.logsumexp(
-            log_kernel + log_u.unsqueeze(2),
-            dim=1,
-        )
-
-    return torch.exp(log_kernel + log_u.unsqueeze(2) + log_v.unsqueeze(1))
-
-
-def round_balanced_plan(
-    plan: torch.Tensor,
-    capacities: torch.Tensor,
-) -> torch.Tensor:
-    assignments = torch.empty(
-        plan.shape[0],
-        plan.shape[1],
-        dtype=torch.long,
-        device=plan.device,
-    )
-
-    for batch_index in range(plan.shape[0]):
-        sorted_scores, preferences = plan[batch_index].sort(dim=1, descending=True)
-        margins = sorted_scores[:, 0] - sorted_scores[:, 1]
-        point_order = margins.argsort(descending=True).cpu().tolist()
-        preferences = preferences.cpu().tolist()
-        remaining = capacities[batch_index].cpu().tolist()
-        assignment = [-1] * plan.shape[1]
-
-        for point_index in point_order:
-            for region in preferences[point_index]:
-                if remaining[region] > 0:
-                    assignment[point_index] = region
-                    remaining[region] -= 1
-                    break
-
-        assignments[batch_index] = torch.tensor(
-            assignment,
-            device=plan.device,
-        )
-
-    return assignments
-
-
-@torch.no_grad()
-def target_guided_sinkhorn_permutation(
-    source: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    num_regions: int,
-    epsilon: float,
-    num_iterations: int,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    batch_size, num_points, _ = source.shape
-    batch_indices = torch.arange(batch_size, device=source.device).unsqueeze(1)
-    capacities = torch.full(
-        (batch_size, num_regions),
-        num_points // num_regions,
-        dtype=torch.long,
-        device=source.device,
-    )
-
-    target_anchor_indices = farthest_point_sample(target, num_regions)
-    target_anchors = target[batch_indices, target_anchor_indices]
-    target_plan = sinkhorn_balanced_plan(
-        target,
-        target_anchors,
-        capacities,
-        epsilon=epsilon,
-        num_iterations=num_iterations,
-    )
-    target_regions = round_balanced_plan(target_plan, capacities)
-    target_centroids = _region_centroids(target, target_regions, num_regions)
-    source_plan = sinkhorn_balanced_plan(
-        source,
-        target_centroids,
-        capacities,
-        epsilon=epsilon,
-        num_iterations=num_iterations,
-    )
-    source_regions = round_balanced_plan(source_plan, capacities)
-    permutation = torch.empty(
-        batch_size,
-        num_points,
-        dtype=torch.long,
-        device=source.device,
-    )
-
-    for batch_index in range(batch_size):
-        for region in range(num_regions):
-            source_indices = torch.where(source_regions[batch_index] == region)[0]
-            target_indices = torch.where(target_regions[batch_index] == region)[0]
-            order = torch.randperm(
-                target_indices.numel(),
-                device=source.device,
-                generator=generator,
-            )
-            permutation[batch_index, source_indices] = target_indices[order]
-
-    return permutation
-
-
-@torch.no_grad()
-def geometry_aware_sinkhorn_permutation(
-    source: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    num_regions: int,
-    epsilon: float,
-    num_iterations: int,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    batch_size, num_points, _ = source.shape
-    batch_indices = torch.arange(batch_size, device=source.device).unsqueeze(1)
-
-    target_anchor_indices = farthest_point_sample(target, num_regions)
-    target_anchors = target[batch_indices, target_anchor_indices]
-    target_regions = torch.cdist(target, target_anchors).square().argmin(dim=-1)
-    capacities = F.one_hot(target_regions, num_regions).sum(dim=1)
-    target_centroids = _region_centroids(target, target_regions, num_regions)
-    source_plan = sinkhorn_balanced_plan(
-        source,
-        target_centroids,
-        capacities,
-        epsilon=epsilon,
-        num_iterations=num_iterations,
-    )
-    source_regions = round_balanced_plan(source_plan, capacities)
-    permutation = torch.empty(
-        batch_size,
-        num_points,
-        dtype=torch.long,
-        device=source.device,
-    )
-
-    for batch_index in range(batch_size):
-        for region in range(num_regions):
-            source_indices = torch.where(source_regions[batch_index] == region)[0]
-            target_indices = torch.where(target_regions[batch_index] == region)[0]
-            order = torch.randperm(
-                target_indices.numel(),
-                device=source.device,
-                generator=generator,
-            )
-            permutation[batch_index, source_indices] = target_indices[order]
-
-    return permutation
-
-
-@torch.no_grad()
-def geometry_aware_hungarian_permutation(
-    source: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    num_regions: int,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    batch_size, num_points, _ = source.shape
-    batch_indices = torch.arange(batch_size, device=source.device).unsqueeze(1)
-
-    target_anchor_indices = farthest_point_sample(target, num_regions)
-    target_anchors = target[batch_indices, target_anchor_indices]
-    target_regions = torch.cdist(target, target_anchors).square().argmin(dim=-1)
-    target_centroids = _region_centroids(target, target_regions, num_regions)
-    target_orders = torch.stack(
-        [
-            torch.randperm(
-                num_points,
-                device=target.device,
-                generator=generator,
-            )
-            for _ in range(batch_size)
-        ]
-    )
-    ordered_regions = torch.gather(target_regions, dim=1, index=target_orders)
-    region_slots = target_centroids[batch_indices, ordered_regions]
-    costs = torch.cdist(source, region_slots).square().cpu().numpy()
-    permutation = torch.empty(
-        batch_size,
-        num_points,
-        dtype=torch.long,
-        device=source.device,
-    )
-
-    for batch_index in range(batch_size):
-        _, slot_indices = linear_sum_assignment(costs[batch_index])
-        slot_indices = torch.as_tensor(slot_indices, device=source.device)
-        permutation[batch_index] = target_orders[batch_index, slot_indices]
-
-    return permutation
-
-
-@torch.no_grad()
-def strict_target_guided_permutation(
-    source: torch.Tensor,
-    target: torch.Tensor,
-    target_centers: torch.Tensor,
-    *,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    batch_size, num_points, _ = source.shape
-    target_regions = torch.cdist(target, target_centers.unsqueeze(0)).argmin(dim=-1)
-    target_orders = torch.stack(
-        [
-            torch.randperm(
-                num_points,
-                device=target.device,
-                generator=generator,
-            )
-            for _ in range(batch_size)
-        ]
-    )
-    ordered_regions = torch.gather(target_regions, dim=1, index=target_orders)
-    region_slots = target_centers[ordered_regions]
-    costs = torch.cdist(source, region_slots).square().cpu().numpy()
-    permutation = torch.empty(
-        batch_size,
-        num_points,
-        dtype=torch.long,
-        device=source.device,
-    )
-
-    for batch_index in range(batch_size):
-        _, slot_indices = linear_sum_assignment(costs[batch_index])
-        slot_indices = torch.as_tensor(slot_indices, device=source.device)
-        permutation[batch_index] = target_orders[batch_index, slot_indices]
-
-    return permutation
-
-
-@torch.no_grad()
-def strict_target_guided_local_permutation(
-    source: torch.Tensor,
-    target: torch.Tensor,
-    target_centers: torch.Tensor,
-) -> torch.Tensor:
-    batch_size, num_points, _ = source.shape
-    num_regions = target_centers.shape[0]
-    target_regions = torch.cdist(target, target_centers.unsqueeze(0)).argmin(dim=-1)
-    region_slots = target_centers[target_regions]
-    region_costs = torch.cdist(source, region_slots).square().cpu().numpy()
-    source_regions = torch.empty_like(target_regions)
-
-    for batch_index in range(batch_size):
-        _, slot_indices = linear_sum_assignment(region_costs[batch_index])
-        slot_indices = torch.as_tensor(slot_indices, device=source.device)
-        source_regions[batch_index] = target_regions[batch_index, slot_indices]
-
-    return _local_hungarian_permutation(
-        source,
-        target,
-        source_regions,
-        target_regions,
-        num_regions,
-    )
-
-
-def _local_hungarian_permutation(
-    source: torch.Tensor,
-    target: torch.Tensor,
-    source_regions: torch.Tensor,
-    target_regions: torch.Tensor,
-    num_regions: int,
-) -> torch.Tensor:
-    batch_size, num_points, _ = source.shape
-    permutation = torch.empty(
-        batch_size,
-        num_points,
-        dtype=torch.long,
-        device=source.device,
-    )
-
-    for batch_index in range(batch_size):
-        for region in range(num_regions):
-            source_indices = torch.where(source_regions[batch_index] == region)[0]
-            target_indices = torch.where(target_regions[batch_index] == region)[0]
-            costs = torch.cdist(
-                source[batch_index, source_indices],
-                target[batch_index, target_indices],
-            ).square().cpu().numpy()
-            _, target_order = linear_sum_assignment(costs)
-            target_order = torch.as_tensor(target_order, device=source.device)
-            permutation[batch_index, source_indices] = target_indices[target_order]
-
-    return permutation
-
-
-def greedy_balanced_assignment(
-    points: torch.Tensor,
-    centers: torch.Tensor,
-    capacities: torch.Tensor,
-) -> torch.Tensor:
-    costs = torch.cdist(points, centers.unsqueeze(0)).square()
-    assignments = torch.empty(
-        points.shape[0],
-        points.shape[1],
-        dtype=torch.long,
-        device=points.device,
-    )
-
-    for batch_index in range(points.shape[0]):
-        sorted_costs, preferences = costs[batch_index].sort(dim=1)
-        margins = sorted_costs[:, 1] - sorted_costs[:, 0]
-        point_order = margins.argsort(descending=True).cpu().tolist()
-        preferences = preferences.cpu().tolist()
-        remaining = capacities[batch_index].cpu().tolist()
-        assignment = [-1] * points.shape[1]
-
-        for point_index in point_order:
-            for region in preferences[point_index]:
-                if remaining[region] > 0:
-                    assignment[point_index] = region
-                    remaining[region] -= 1
-                    break
-
-        assignments[batch_index] = torch.tensor(
-            assignment,
-            device=points.device,
-        )
-
-    return assignments
-
-
-@torch.no_grad()
-def strict_target_guided_balanced_permutation(
-    source: torch.Tensor,
-    target: torch.Tensor,
-    target_centers: torch.Tensor,
-) -> torch.Tensor:
-    num_regions = target_centers.shape[0]
-    target_regions = torch.cdist(target, target_centers.unsqueeze(0)).argmin(dim=-1)
-    capacities = F.one_hot(target_regions, num_regions).sum(dim=1)
-    source_regions = greedy_balanced_assignment(
-        source,
-        target_centers,
-        capacities,
-    )
-
-    return _local_hungarian_permutation(
-        source,
-        target,
-        source_regions,
-        target_regions,
-        num_regions,
-    )
-
-
-@torch.no_grad()
-def global_hungarian_permutation(
-    source: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    costs = torch.cdist(source, target).square().cpu().numpy()
-    permutation = torch.empty(
-        source.shape[0],
-        source.shape[1],
-        dtype=torch.long,
-        device=source.device,
-    )
-
-    for batch_index in range(source.shape[0]):
-        _, target_indices = linear_sum_assignment(costs[batch_index])
-        permutation[batch_index] = torch.as_tensor(
-            target_indices,
-            device=source.device,
-        )
-
-    return permutation
+def coupling_permutation(source, target, *, coupling, num_regions=None, target_centers=None,
+                         sinkhorn_epsilon=0.1, sinkhorn_iterations=100, generator=None):
+    method = canonical_method(coupling)
+    partition, assignment, local = METHODS[method]
+    if source.ndim != 3 or source.shape != target.shape:
+        raise ValueError("Source and target must have the same [B, N, D] shape")
+    if method == "independent":
+        return None
+    if method == "global_ot":
+        return torch.stack([exact_assignment(cost) for cost in torch.cdist(source, target).square()])
+    batch, n, _ = target.shape
+    rows = torch.arange(batch, device=target.device).unsqueeze(1)
+    options = {"epsilon": sinkhorn_epsilon, "iterations": sinkhorn_iterations}
+    if partition == "oracle":
+        if target_centers is None:
+            raise ValueError("Strict checkerboard experiments require known cell centers")
+        centers = target_centers
+        k = centers.shape[0]
+        target_labels = torch.cdist(target, centers.unsqueeze(0)).argmin(-1)
+        capacities = F.one_hot(target_labels, k).sum(1)
+    else:
+        if num_regions is None:
+            raise ValueError("num_regions is required")
+        k = num_regions
+        anchors = target[rows, farthest_point_sample(target, k)]
+        if partition == "nearest":
+            target_labels = torch.cdist(target, anchors).argmin(-1)
+        else:
+            if method == "regional" and n % k:
+                raise ValueError("Regional patch-to-patch matching requires N divisible by K")
+            capacities = torch.full((batch, k), n // k, dtype=torch.long, device=target.device)
+            capacities[:, :n % k] += 1
+            target_labels = assign_regions(target, anchors, capacities,
+                                           solver="sinkhorn" if assignment == "sinkhorn" else "exact", **options)
+        centers, capacities = region_centroids(target, target_labels, k)
+    if assignment == "regional":
+        anchors = source[rows, farthest_point_sample(source, k)]
+        source_labels = assign_regions(source, anchors, capacities)
+        source_centers, _ = region_centroids(source, source_labels, k)
+        matches = torch.stack([exact_assignment(cost) for cost in torch.cdist(source_centers, centers).square()])
+        source_labels = matches.gather(1, source_labels)
+    else:
+        source_labels = assign_regions(source, centers, capacities, solver=assignment, **options)
+    return pair_within_regions(source, target, source_labels, target_labels, k,
+                               local=local, generator=generator)

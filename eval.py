@@ -1,9 +1,4 @@
-import json
-import math
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
-from time import perf_counter
 
 import matplotlib
 matplotlib.use("Agg")
@@ -12,22 +7,12 @@ from matplotlib.colors import PowerNorm
 import numpy as np
 from scipy.ndimage import gaussian_filter
 import torch
-import yaml
 
 from data import sample_checkerboard
-from checkerboard_metrics import checkerboard_metrics
+from experiment import (evaluation_settings, evaluation_title, load_model,
+                        sample_for_evaluation, save_evaluation)
+from metrics import chamfer_distance, checkerboard_metrics
 from model import PointSetTransformer
-from sample import integrate_velocity
-
-
-def chamfer_distance(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    distances = torch.cdist(prediction, target).square()
-    prediction_to_target = distances.min(dim=2).values.mean(dim=1)
-    target_to_prediction = distances.min(dim=1).values.mean(dim=1)
-    return (prediction_to_target + target_to_prediction).mean()
 
 
 def sample_snapshots(
@@ -118,122 +103,24 @@ def render_density(
     plt.close(figure)
 
 
-def main(config_path: str = "independent.yaml") -> None:
-    with open(config_path, encoding="utf-8") as file:
-        config = yaml.safe_load(file)
-
-    torch.manual_seed(1)
-    device = torch.device(config["device"])
-    dtype = getattr(torch, config["dtype"])
-    data_config = config["data"]
-    coupling = config["coupling"]
-    run_name = Path(config["checkpoint"]).stem
-    integration_steps = 100
-    snapshot_times = (0.78, 0.89, 1.00)
-    snapshot_steps = tuple(round(time * integration_steps) for time in snapshot_times)
-    evaluation_batch_size = data_config["batch_size"] * 4
-
-    model = PointSetTransformer(**config["model"]).to(device=device, dtype=dtype)
-    state_dict = torch.load(
-        config["checkpoint"],
-        map_location=device,
-        weights_only=True,
-    )
-    model.load_state_dict(state_dict)
-
-    x_noise = torch.randn(
-        evaluation_batch_size,
-        data_config["n_points"],
-        2,
-        device=device,
-        dtype=dtype,
-    )
-
-    warmup_t = torch.zeros(
-        evaluation_batch_size,
-        1,
-        1,
-        device=device,
-        dtype=dtype,
-    )
-    model.eval()
-    with torch.no_grad():
-        for _ in range(10):
-            model(x_noise, warmup_t)
-
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    inference_start = perf_counter()
-    integrate_velocity(
-        model,
-        x_noise,
-        num_steps=integration_steps,
-    )
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    inference_seconds = perf_counter() - inference_start
-
-    snapshots = sample_snapshots(
-        model,
-        x_noise,
-        integration_steps,
-        snapshot_steps,
-    )
-    target = sample_checkerboard(
-        evaluation_batch_size,
-        data_config["n_points"],
-        device=device,
-        dtype=dtype,
-        grid_size=data_config["grid_size"],
-    )
-
-    prediction = snapshots[integration_steps].to(device)
-    score = chamfer_distance(prediction, target)
-    leakage, mass_error, histogram_js = checkerboard_metrics(
-        prediction, data_config["grid_size"],
-    )
-    evaluated_at = datetime.now(timezone.utc)
-    results = {
-        "dataset": "checkerboard",
-        "evaluated_at": evaluated_at.isoformat(),
-        "config_path": str(Path(config_path).resolve()),
-        "checkpoint": str(Path(config["checkpoint"]).resolve()),
-        "config": config,
-        "coupling": coupling,
-        "evaluation_seed": 1,
-        "evaluation_batch_size": evaluation_batch_size,
-        "n_points": data_config["n_points"],
-        "euler_steps": integration_steps,
-        "histogram_bins": 64,
-        "chamfer": score.item(),
-        "leakage": leakage,
-        "cell_mass_error": mass_error if math.isfinite(mass_error) else None,
-        "histogram_js": histogram_js,
-        "inference_seconds": inference_seconds,
-    }
-    results_dir = Path("eval_results")
-    results_dir.mkdir(exist_ok=True)
-    results_path = results_dir / (
-        f"checkerboard_{run_name}_euler{integration_steps}_"
-        f"{evaluated_at:%Y%m%dT%H%M%S%fZ}.json"
-    )
-    with results_path.open("x", encoding="utf-8") as file:
-        json.dump(results, file, indent=2, ensure_ascii=False, allow_nan=False)
-    print(f"saved_json={results_path}")
-    output_path = f"density_{run_name}.png"
-    render_density(
-        [snapshots[step] for step in snapshot_steps],
-        snapshot_times,
-        run_name,
-        output_path,
-    )
-
-    print(f"chamfer={score.item():.6f}")
-    print(f"leakage={leakage:.6f}")
-    print(f"cell_mass_error={mass_error:.6f}")
-    print(f"histogram_js={histogram_js:.6f}")
-    print(f"inference_seconds={inference_seconds:.6f}")
-    print(f"saved={output_path}")
+def main(config_path="checkerboard_experiments/independent.yaml", *, render=True):
+    model, config, checkpoint, metadata = load_model(config_path, PointSetTransformer, "checkerboard")
+    settings, data = evaluation_settings(config), config["data"]
+    steps, times = 100, (0.78, 0.89, 1.0)
+    noise, prediction, seconds = sample_for_evaluation(model, config, steps)
+    target = sample_checkerboard(settings["batch_size"], data["n_points"], prediction.device,
+                                 prediction.dtype, data["grid_size"])
+    leakage, mass, js = checkerboard_metrics(prediction, data["grid_size"], settings["histogram_bins"])
+    scores = {"chamfer": chamfer_distance(prediction, target).item(), "leakage": leakage,
+              "cell_mass_error": mass, "histogram_js": js}
+    output = save_evaluation(config_path, config, checkpoint, metadata, "checkerboard",
+                             steps, seconds, scores, render=render)
+    if render:
+        snapshot_steps = tuple(round(t * steps) for t in times)
+        snapshots = sample_snapshots(model, noise, steps, snapshot_steps)
+        render_density([snapshots[i] for i in snapshot_steps], times, evaluation_title(config), output)
+        print(f"saved={output}")
+    return output
 
 
 if __name__ == "__main__":

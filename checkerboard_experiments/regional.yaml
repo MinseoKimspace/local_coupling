@@ -1,13 +1,11 @@
 seed: 0
 device: cuda
 dtype: float32
-coupling: target_guided_sinkhorn
+coupling: regional
 num_regions: 8
-sinkhorn_epsilon: 0.1
-sinkhorn_iterations: 100
 
 data:
-  batch_size: 16
+  batch_size: 64
   n_points: 256
   grid_size: 4
 
@@ -25,4 +23,7 @@ training:
   weight_decay: 0.01
   log_every: 100
 
-checkpoint: model_target_guided_sinkhorn.pt
+evaluation:
+  batch_size: 64
+
+checkpoint: regional.pt
