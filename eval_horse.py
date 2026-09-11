@@ -63,13 +63,14 @@ def main(config_path="horse_experiments/horse_independent_n256_seed0.yaml", num_
         raise ValueError("num_steps must be positive")
     model, config, checkpoint, metadata = load_model(config_path, HorsePointSetTransformer, "horse")
     settings, data = evaluation_settings(config), config["data"]
+    print(f"nfe={steps}")
     _, prediction, seconds = sample_for_evaluation(model, config, steps)
     mask = load_horse_mask(prediction.device, prediction.dtype)
     target = sample_horse(mask, settings["batch_size"], data["n_points"])
     leakage, js = horse_metrics(prediction, mask, settings["histogram_bins"])
     scores = {"chamfer": chamfer_distance(prediction, target).item(), "leakage": leakage, "histogram_js": js}
     output = save_evaluation(config_path, config, checkpoint, metadata, "horse", steps, seconds, scores)
-    render_comparison(target.cpu(), prediction.cpu(), f"{evaluation_title(config)}\nEuler steps: {steps}", output)
+    render_comparison(target.cpu(), prediction.cpu(), f"{evaluation_title(config)}\nNFE: {steps} (Euler)", output)
     print(f"saved={output}")
     return output
 

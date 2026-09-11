@@ -62,11 +62,12 @@ def render_density(
             range=[[-limit, limit], [-limit, limit]],
         )
         density = gaussian_filter(density.T, sigma=1.2)
-        density /= density.sum()
+        density /= max(density.sum(), 1.0)
         densities.append(density)
 
     values = np.concatenate([density.ravel() for density in densities])
-    vmax = np.percentile(values[values > 0], 99.5)
+    positive = values[values > 0]
+    vmax = np.percentile(positive, 99.5) if positive.size else 1.0
     norm = PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax)
     figure, axes = plt.subplots(1, len(times), figsize=(9, 3.4))
     figure.text(
@@ -78,7 +79,7 @@ def render_density(
         fontsize=16,
     )
 
-    for axis, density, time in zip(axes, densities, times):
+    for axis, density, time in zip(np.atleast_1d(axes), densities, times):
         axis.imshow(
             density,
             origin="lower",
@@ -96,17 +97,20 @@ def render_density(
         left=0.02,
         right=0.98,
         bottom=0.04,
-        top=0.78,
+        top=0.70,
         wspace=0.12,
     )
     figure.savefig(output_path, dpi=200)
     plt.close(figure)
 
 
-def main(config_path="checkerboard_experiments/independent.yaml", *, render=True):
+def main(config_path="checkerboard_experiments/independent.yaml", num_steps=100, *, render=True):
+    steps = int(num_steps)
+    if steps < 1:
+        raise ValueError("num_steps must be positive")
     model, config, checkpoint, metadata = load_model(config_path, PointSetTransformer, "checkerboard")
     settings, data = evaluation_settings(config), config["data"]
-    steps, times = 100, (0.78, 0.89, 1.0)
+    print(f"nfe={steps}")
     noise, prediction, seconds = sample_for_evaluation(model, config, steps)
     target = sample_checkerboard(settings["batch_size"], data["n_points"], prediction.device,
                                  prediction.dtype, data["grid_size"])
@@ -116,9 +120,11 @@ def main(config_path="checkerboard_experiments/independent.yaml", *, render=True
     output = save_evaluation(config_path, config, checkpoint, metadata, "checkerboard",
                              steps, seconds, scores, render=render)
     if render:
-        snapshot_steps = tuple(round(t * steps) for t in times)
+        snapshot_steps = tuple(sorted({round(t * steps) for t in (0.78, 0.89, 1.0)}))
+        times = tuple(step / steps for step in snapshot_steps)
         snapshots = sample_snapshots(model, noise, steps, snapshot_steps)
-        render_density([snapshots[i] for i in snapshot_steps], times, evaluation_title(config), output)
+        render_density([snapshots[i] for i in snapshot_steps], times,
+                       f"{evaluation_title(config)}\nNFE: {steps} (Euler)", output)
         print(f"saved={output}")
     return output
 

@@ -254,6 +254,44 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(record["dataset"], "horse")
             self.assertEqual(record["euler_steps"], 2)
 
+    def test_evaluation_nfe_sweep(self):
+        horse_config = copy.deepcopy(self.config)
+        horse_config["data"].pop("grid_size")
+        horse_model = train_horse.HorsePointSetTransformer(**horse_config["model"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            checkerboard_run = self.save()
+            horse_run = save_training(horse_model, horse_config, "horse", "original.yaml", 1.23, .1)
+            for evaluator, run, render_name in (
+                (eval_checkerboard, checkerboard_run, "render_density"),
+                (eval_horse, horse_run, "render_comparison"),
+            ):
+                for nfe in (1, 2, 4, 8, 16, 32, 64, 128):
+                    with self.subTest(evaluator=evaluator.__name__, nfe=nfe):
+                        with patch.object(evaluator, render_name, wraps=getattr(evaluator, render_name)) as draw:
+                            picture = evaluator.main(run / "config.yaml", str(nfe))
+                        self.assertTrue(picture.is_file())
+                        record = json.loads(picture.with_suffix(".json").read_text())
+                        self.assertEqual(record["euler_steps"], nfe)
+                        self.assertIn(f"_euler{nfe}_", picture.name)
+                        self.assertIn(f"NFE: {nfe} (Euler)", draw.call_args.args[2])
+                        if evaluator is eval_checkerboard:
+                            times = draw.call_args.args[1]
+                            self.assertEqual(times, tuple(sorted(set(times))))
+                            self.assertEqual(times[-1], 1.0)
+                            for time in times:
+                                self.assertAlmostEqual(time * nfe, round(time * nfe))
+
+    def test_invalid_evaluation_steps(self):
+        for evaluator in (eval_checkerboard, eval_horse):
+            for nfe in ("0", "-1", "invalid"):
+                with self.subTest(evaluator=evaluator.__name__, nfe=nfe), self.assertRaises(ValueError):
+                    evaluator.main("missing.yaml", nfe)
+
+    def test_empty_checkerboard_render(self):
+        picture = Path("outside.png")
+        eval_checkerboard.render_density([torch.full((1, 4, 2), 10.)], (1.0,), "NFE: 1", picture)
+        self.assertTrue(picture.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
