@@ -1,5 +1,6 @@
 import contextlib
 import copy
+from datetime import datetime
 import io
 import json
 import os
@@ -227,7 +228,7 @@ class ArtifactTests(unittest.TestCase):
             for _ in range(2):
                 save_evaluation("original.yaml", config, checkpoint, metadata, "checkerboard", 100, .1,
                                 {"cell_mass_error": float("nan"), "leakage": 1.}, render=False)
-        records = list(Path("eval_results/checkerboard").glob("*.json"))
+        records = list(Path("eval_results/checkerboard").rglob("*.json"))
         self.assertEqual(len(records), 2)
         result = json.loads(records[0].read_text())
         self.assertIsNone(result["cell_mass_error"])
@@ -238,7 +239,7 @@ class ArtifactTests(unittest.TestCase):
             run = train.main("original.yaml")
             picture = eval_checkerboard.main(run / "config.yaml")
             self.assertTrue(picture.is_file())
-            self.assertEqual(picture.parent, Path("eval_results/checkerboard"))
+            self.assertEqual(picture.parent.parent, Path("eval_results/checkerboard"))
             record = json.loads(picture.with_suffix(".json").read_text())
             self.assertTrue(record["training_config_verified"])
             self.assertEqual(record["total_points"], 128)
@@ -249,7 +250,7 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(run.parent, Path("runs/horse"))
             picture = eval_horse.main(run / "config.yaml", 2)
             self.assertTrue(picture.is_file())
-            self.assertEqual(picture.parent, Path("eval_results/horse"))
+            self.assertEqual(picture.parent.parent, Path("eval_results/horse"))
             record = json.loads(picture.with_suffix(".json").read_text())
             self.assertEqual(record["dataset"], "horse")
             self.assertEqual(record["euler_steps"], 2)
@@ -272,7 +273,9 @@ class ArtifactTests(unittest.TestCase):
                         self.assertTrue(picture.is_file())
                         record = json.loads(picture.with_suffix(".json").read_text())
                         self.assertEqual(record["euler_steps"], nfe)
-                        self.assertIn(f"_euler{nfe}_", picture.name)
+                        self.assertTrue(picture.name.startswith(f"nfe_{nfe:03d}_"))
+                        self.assertEqual(picture.parent.parent, Path("eval_results") / record["dataset"])
+                        self.assertEqual(picture.parent.name, f"legacy_{record['checkpoint_sha256'][:12]}")
                         self.assertIn(f"NFE: {nfe} (Euler)", draw.call_args.args[2])
                         if evaluator is eval_checkerboard:
                             times = draw.call_args.args[1]
@@ -280,6 +283,24 @@ class ArtifactTests(unittest.TestCase):
                             self.assertEqual(times[-1], 1.0)
                             for time in times:
                                 self.assertAlmostEqual(time * nfe, round(time * nfe))
+
+    def test_evaluations_grouped_by_checkpoint(self):
+        folders = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(2):
+                run = self.save()
+                _, config, checkpoint, metadata = load_model(run / "config.yaml", PointSetTransformer, "checkerboard")
+                with patch("experiment.datetime") as clock:
+                    clock.now.return_value = datetime.fromisoformat(metadata["trained_at"])
+                    records = [save_evaluation(run / "config.yaml", config, checkpoint, metadata,
+                                               "checkerboard", nfe, .1, {"leakage": .1}, render=False)
+                               for nfe in (1, 2, 2)]
+                self.assertEqual(len(set(records)), 3)
+                self.assertEqual(len({record.parent for record in records}), 1)
+                self.assertEqual(len(list(records[0].parent.glob("*.json"))), 3)
+                self.assertEqual([json.loads(record.read_text())["euler_steps"] for record in records], [1, 2, 2])
+                folders.append(records[0].parent)
+        self.assertNotEqual(folders[0], folders[1])
 
     def test_invalid_evaluation_steps(self):
         for evaluator in (eval_checkerboard, eval_horse):

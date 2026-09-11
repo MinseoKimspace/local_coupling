@@ -6,6 +6,7 @@ import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
 
 import numpy as np
 import ot
@@ -132,14 +133,15 @@ def sample_for_evaluation(model, config, steps):
 def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, seconds, scores, *, render=True):
     now = datetime.now(timezone.utc)
     settings = evaluation_settings(config)
-    output_dir = Path("eval_results") / dataset
+    checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    output_dir = Path("eval_results") / dataset / f"{checkpoint.stem}_{checkpoint_hash[:12]}"
     output_dir.mkdir(parents=True, exist_ok=True)
-    name = f"{dataset}_{checkpoint.stem}_euler{steps}_{now:%Y%m%dT%H%M%S%fZ}"
+    name = f"nfe_{steps:03d}_{now:%Y%m%dT%H%M%SZ}_{uuid4().hex[:8]}"
     image_path = output_dir / f"{name}.png"
     results = {
         "dataset": dataset, "evaluated_at": now.isoformat(),
         "config_path": str(Path(config_path).resolve()), "checkpoint": str(checkpoint),
-        "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        "checkpoint_sha256": checkpoint_hash,
         "config": config, "coupling": config["coupling"],
         "training_config_verified": metadata["training_config_verified"],
         "coupling_details": metadata["coupling_details"],
