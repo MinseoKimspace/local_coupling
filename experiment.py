@@ -50,7 +50,7 @@ def save_training(model, config, dataset, config_path, seconds, loss):
     now = datetime.now(timezone.utc)
     method = canonical_method(config["coupling"])
     name = f"{dataset}_{method}_k{config.get('num_regions', 'na')}_n{config['data']['n_points']}_seed{config['seed']}"
-    run_dir = Path("runs") / dataset / f"{name}_{now:%Y%m%dT%H%M%S%fZ}"
+    run_dir = Path("runs") / dataset / f"{name}_{now:%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     snapshot = copy.deepcopy(config)
     snapshot["checkpoint"] = Path(config["checkpoint"]).name

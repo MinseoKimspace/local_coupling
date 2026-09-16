@@ -200,7 +200,9 @@ class ArtifactTests(unittest.TestCase):
     def test_preservation_metadata_and_mismatch(self):
         torch.save(self.model.state_dict(), "legacy.pt")
         original = Path("legacy.pt").read_bytes()
-        first, second = self.save(), self.save()
+        with patch("experiment.datetime") as clock:
+            clock.now.return_value = datetime.fromisoformat("2026-09-16T00:00:00+00:00")
+            first, second = self.save(), self.save()
         self.assertNotEqual(first, second)
         self.assertEqual(first.parent, Path("runs/checkerboard"))
         self.assertTrue((first / self.config["checkpoint"]).is_file())

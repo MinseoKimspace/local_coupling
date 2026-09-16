@@ -12,6 +12,9 @@ METHODS = {
     "independent": ("none", "none", "none"),
     "regional": ("balanced", "regional", "random"),
     "target_guided": ("balanced", "exact", "random"),
+    "target_guided_exact_optimized": ("balanced", "exact_batched", "random"),
+    "target_guided_source_greedy": ("balanced", "greedy", "random"),
+    "target_guided_source_sinkhorn": ("balanced", "sinkhorn", "random"),
     "target_guided_sinkhorn": ("balanced", "sinkhorn", "random"),
     "geometry_aware_sinkhorn": ("nearest", "sinkhorn", "random"),
     "geometry_aware_ot": ("nearest", "exact", "random"),
@@ -29,15 +32,25 @@ def canonical_method(name: str) -> str:
     return name
 
 
+def balanced_partition_solver(method):
+    if method == "target_guided_sinkhorn":
+        return "sinkhorn"
+    if method == "target_guided_exact_optimized":
+        return "exact_batched"
+    return "exact"
+
+
 def coupling_info(name: str) -> dict:
     name = canonical_method(name)
     partition, assignment, local = METHODS[name]
-    exact = assignment in ("exact", "global", "regional") or local == "exact"
-    return {
+    target_solver = balanced_partition_solver(name) if partition == "balanced" else None
+    exact = (assignment in ("exact", "exact_batched", "global", "regional") or local == "exact"
+             or target_solver in ("exact", "exact_batched"))
+    info = {
         "method": name,
         "implementation": "pot_v1",
         "target_partition": partition,
-        "source_assignment": assignment,
+        "source_assignment": "exact" if assignment == "exact_batched" else assignment,
         "local_pairing": local,
         "cost": "squared_euclidean" if name != "independent" else None,
         "fps_start": "farthest_from_set_mean" if partition in ("balanced", "nearest") else None,
@@ -45,6 +58,12 @@ def coupling_info(name: str) -> dict:
         "sinkhorn_solver": "POT/sinkhorn_log" if assignment == "sinkhorn" else None,
         "rounding": "capacity_preserving_greedy" if assignment == "sinkhorn" else None,
     }
+    if name in ("target_guided_exact_optimized", "target_guided_source_greedy", "target_guided_source_sinkhorn"):
+        info.update(implementation="pot_tg_cost_v1", target_partition_solver="POT/network_simplex",
+                    exact_transfer="batched" if assignment == "exact_batched" else "per_cloud")
+        if assignment == "greedy":
+            info["greedy_rule"] = "negative squared distance; descending best-vs-second margin; capacity preserving"
+    return info
 
 
 def farthest_point_sample(points: torch.Tensor, num_samples: int) -> torch.Tensor:
@@ -70,6 +89,11 @@ def exact_assignment(cost: torch.Tensor, capacities: torch.Tensor | None = None)
         capacities = torch.ones(k, dtype=torch.long, device=cost.device)
     capacity = capacities.detach().cpu().double().numpy()
     matrix = np.ascontiguousarray(cost.detach().cpu().double().numpy())
+    return torch.as_tensor(_exact_assignment_numpy(matrix, capacity), dtype=torch.long, device=cost.device)
+
+
+def _exact_assignment_numpy(matrix, capacity):
+    n, k = matrix.shape
     if (capacity.shape != (k,) or np.any(capacity < 0)
             or not np.equal(capacity, np.rint(capacity)).all() or capacity.sum() != n):
         raise ValueError("Integer nonnegative capacities must sum to the number of points")
@@ -81,7 +105,16 @@ def exact_assignment(cost: torch.Tensor, capacities: torch.Tensor | None = None)
             or not np.equal(hard.sum(1), 1).all()
             or not np.equal(hard.sum(0), capacity).all()):
         raise RuntimeError(f"POT did not return an optimal integral assignment: {log.get('warning')}")
-    return torch.as_tensor(hard.argmax(1), dtype=torch.long, device=cost.device)
+    return hard.argmax(1)
+
+
+def exact_assignment_batched(costs, capacities):
+    # Same float64 matrices and POT solves as exact_assignment; transfer the
+    # entire batch once in each direction instead of once per cloud.
+    matrices = np.ascontiguousarray(costs.detach().cpu().double().numpy())
+    counts = capacities.detach().cpu().double().numpy()
+    labels = np.stack([_exact_assignment_numpy(matrix, capacity) for matrix, capacity in zip(matrices, counts)])
+    return torch.as_tensor(labels, dtype=torch.long, device=costs.device)
 
 
 def round_balanced_plan(scores: torch.Tensor, capacities: torch.Tensor) -> torch.Tensor:
@@ -109,6 +142,8 @@ def assign_regions(points, centers, capacities, *, solver="exact", epsilon=0.1, 
     if centers.ndim == 2:
         centers = centers.unsqueeze(0).expand(points.shape[0], -1, -1)
     costs = torch.cdist(points, centers).square()
+    if solver == "exact_batched":
+        return exact_assignment_batched(costs, capacities)
     labels = []
     for cost, capacity in zip(costs, capacities):
         if solver == "exact":
@@ -194,7 +229,7 @@ def coupling_permutation(source, target, *, coupling, num_regions=None, target_c
             capacities = torch.full((batch, k), n // k, dtype=torch.long, device=target.device)
             capacities[:, :n % k] += 1
             target_labels = assign_regions(target, anchors, capacities,
-                                           solver="sinkhorn" if assignment == "sinkhorn" else "exact", **options)
+                                           solver=balanced_partition_solver(method), **options)
         centers, capacities = region_centroids(target, target_labels, k)
     if assignment == "regional":
         anchors = source[rows, farthest_point_sample(source, k)]
