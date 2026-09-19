@@ -1,0 +1,30 @@
+seed: 0
+device: cuda
+dtype: float32
+coupling: target_guided_mahalanobis
+num_regions: 8
+# Sigma + ridge * I; absolute squared-coordinate units, no trace normalization.
+mahalanobis_ridge: 0.001
+
+data:
+  batch_size: 64
+  n_points: 256
+
+model:
+  point_dim: 2
+  d_model: 256
+  nhead: 8
+  num_layers: 4
+  dim_feedforward: 1024
+  dropout: 0.0
+
+training:
+  num_steps: 10000
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  log_every: 100
+
+evaluation:
+  batch_size: 64
+
+checkpoint: horse_target_guided_mahalanobis_k8_n256_seed0.pt

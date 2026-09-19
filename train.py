@@ -25,11 +25,12 @@ def flow_matching_loss(model, x_data, x_noise, t):
 
 
 def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_centers=None,
-               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None):
+               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, mahalanobis_ridge=1e-3, coupling_generator=None):
     x_noise = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype)
     permutation = coupling_permutation(
         x_noise, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
         sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iterations=sinkhorn_iterations,
+        mahalanobis_ridge=mahalanobis_ridge,
         generator=coupling_generator,
     )
     if permutation is not None:
@@ -59,6 +60,7 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
             num_regions=config.get("num_regions"), target_centers=target_centers,
             sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
             sinkhorn_iterations=config.get("sinkhorn_iterations", 100), coupling_generator=generator,
+            mahalanobis_ridge=config.get("mahalanobis_ridge", 1e-3),
         )
         if step == 1 or step % training["log_every"] == 0:
             print(f"step={step} loss={loss.item():.6f}")

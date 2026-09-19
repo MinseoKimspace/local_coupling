@@ -13,6 +13,7 @@ METHODS = {
     "regional": ("balanced", "regional", "random"),
     "target_guided": ("balanced", "exact", "random"),
     "target_guided_exact_optimized": ("balanced", "exact_batched", "random"),
+    "target_guided_mahalanobis": ("balanced", "exact_batched", "random"),
     "target_guided_source_greedy": ("balanced", "greedy", "random"),
     "target_guided_source_sinkhorn": ("balanced", "sinkhorn", "random"),
     "target_guided_sinkhorn": ("balanced", "sinkhorn", "random"),
@@ -35,7 +36,7 @@ def canonical_method(name: str) -> str:
 def balanced_partition_solver(method):
     if method == "target_guided_sinkhorn":
         return "sinkhorn"
-    if method == "target_guided_exact_optimized":
+    if method in ("target_guided_exact_optimized", "target_guided_mahalanobis"):
         return "exact_batched"
     return "exact"
 
@@ -63,6 +64,14 @@ def coupling_info(name: str) -> dict:
                     exact_transfer="batched" if assignment == "exact_batched" else "per_cloud")
         if assignment == "greedy":
             info["greedy_rule"] = "negative squared distance; descending best-vs-second margin; capacity preserving"
+    if name == "target_guided_mahalanobis":
+        info.update(implementation="pot_tg_mahalanobis_v1", exact_transfer="batched",
+                    target_partition_solver="POT/network_simplex",
+                    cost="target_squared_euclidean/source_squared_mahalanobis",
+                    target_cost="squared_euclidean", source_cost="squared_mahalanobis",
+                    covariance="target_patch_population; centered on patch centroid",
+                    covariance_regularization="Sigma + mahalanobis_ridge * I; absolute squared-coordinate units",
+                    source_cost_dtype="float64")
     return info
 
 
@@ -179,6 +188,26 @@ def region_centroids(points, labels, k):
     return centers, counts.long()
 
 
+def mahalanobis_cost(source, target, target_labels, centers, capacities, ridge=1e-3):
+    if not np.isfinite(ridge) or ridge <= 0:
+        raise ValueError("mahalanobis_ridge must be finite and positive")
+    batch, k, dim = centers.shape
+    centers = centers.double()
+    offsets = target.double() - centers.gather(1, target_labels.unsqueeze(-1).expand(-1, -1, dim))
+    outer = (offsets.unsqueeze(-1) * offsets.unsqueeze(-2)).flatten(2)
+    covariance = centers.new_zeros(batch, k, dim * dim)
+    covariance.scatter_add_(1, target_labels.unsqueeze(-1).expand_as(outer), outer)
+    # Population covariance (1/n_k), not the unbiased 1/(n_k-1) estimator.
+    covariance = covariance.reshape(batch, k, dim, dim) / capacities[..., None, None]
+    covariance = covariance + ridge * torch.eye(dim, device=source.device, dtype=torch.float64)
+    # A = L L^T: delta^T A^{-1} delta = ||L^{-1} delta||^2.
+    # https://docs.pytorch.org/docs/stable/generated/torch.linalg.solve_triangular.html
+    factor = torch.linalg.cholesky(covariance)
+    delta = source.double().unsqueeze(1) - centers.unsqueeze(2)  # [B, K, N, D]
+    whitened = torch.linalg.solve_triangular(factor, delta.transpose(-1, -2), upper=False)
+    return whitened.square().sum(-2).transpose(1, 2)  # [B, N, K]
+
+
 def pair_within_regions(source, target, source_labels, target_labels, k, *, local="random", generator=None):
     permutation = torch.empty(source.shape[:2], dtype=torch.long, device=source.device)
     for b in range(source.shape[0]):
@@ -197,7 +226,7 @@ def pair_within_regions(source, target, source_labels, target_labels, k, *, loca
 
 @torch.no_grad()
 def coupling_permutation(source, target, *, coupling, num_regions=None, target_centers=None,
-                         sinkhorn_epsilon=0.1, sinkhorn_iterations=100, generator=None):
+                         sinkhorn_epsilon=0.1, sinkhorn_iterations=100, mahalanobis_ridge=1e-3, generator=None):
     method = canonical_method(coupling)
     partition, assignment, local = METHODS[method]
     if source.ndim != 3 or source.shape != target.shape:
@@ -231,7 +260,10 @@ def coupling_permutation(source, target, *, coupling, num_regions=None, target_c
             target_labels = assign_regions(target, anchors, capacities,
                                            solver=balanced_partition_solver(method), **options)
         centers, capacities = region_centroids(target, target_labels, k)
-    if assignment == "regional":
+    if method == "target_guided_mahalanobis":
+        costs = mahalanobis_cost(source, target, target_labels, centers, capacities, mahalanobis_ridge)
+        source_labels = exact_assignment_batched(costs, capacities)
+    elif assignment == "regional":
         anchors = source[rows, farthest_point_sample(source, k)]
         source_labels = assign_regions(source, anchors, capacities)
         source_centers, _ = region_centroids(source, source_labels, k)

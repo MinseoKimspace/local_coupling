@@ -110,6 +110,7 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=16, seed=2026, refer
         permutation = coupling_permutation(noise, target, coupling=config["coupling"],
             num_regions=config.get("num_regions"), target_centers=centers,
             sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
+            mahalanobis_ridge=config.get("mahalanobis_ridge", 1e-3),
             sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator)
         if permutation is not None:
             target = target.gather(1, permutation.unsqueeze(-1).expand_as(target))
