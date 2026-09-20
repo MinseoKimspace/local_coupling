@@ -1,0 +1,38 @@
+seed: 2
+experiment_group: tg_capacity_v1
+device: cuda
+dtype: float32
+coupling: target_guided_capacity_small
+num_regions: 8
+
+capacity:
+  profile: [16, 24, 24, 32, 32, 40, 40, 48]
+  window_radius: 0.35
+  low_frequencies: [0.5, 1.0]
+  high_frequencies: [2.0, 4.0]
+  num_directions: 16
+  min_effective_points: 8
+
+data:
+  batch_size: 64
+  n_points: 256
+  grid_size: 4
+
+model:
+  point_dim: 2
+  d_model: 128
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 256
+  dropout: 0.0
+
+training:
+  num_steps: 10000
+  learning_rate: 0.001
+  weight_decay: 0.01
+  log_every: 100
+
+evaluation:
+  batch_size: 64
+
+checkpoint: checkerboard_tg_capacity_small_k8_n256_seed2.pt

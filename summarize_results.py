@@ -117,7 +117,7 @@ def render_groups(groups, directory):
     for group in groups:
         spec = group["signature"]
         config = {k: v for k, v in spec["config"].items()
-                  if k not in ("coupling", "num_regions", "sinkhorn_epsilon", "sinkhorn_iterations", "mahalanobis_ridge")}
+                  if k not in ("coupling", "num_regions", "sinkhorn_epsilon", "sinkhorn_iterations", "capacity")}
         comparison = {**spec, "config": config}
         comparison.pop("coupling_details")
         comparisons[json.dumps(comparison, sort_keys=True)].append(group)
@@ -130,8 +130,6 @@ def render_groups(groups, directory):
         for group in members:
             config = group["signature"]["config"]
             label = f"{config['coupling']} K={config.get('num_regions', 'na')}"
-            if config["coupling"] == "target_guided_mahalanobis":
-                label += f" ridge={config.get('mahalanobis_ridge', 1e-3):g}"
             for ax, metric in zip(axes.flat, METRICS):
                 valid = [r for r in group["rows"] if r["metrics"].get(metric, {}).get("mean") is not None]
                 if not valid:

@@ -90,6 +90,7 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=16, seed=2026, refer
     torch.manual_seed(seed)  # reset AFTER model initialization; common draws across methods
     generator = torch.Generator(device=device).manual_seed(seed + 1)
     time_generator = torch.Generator(device=device).manual_seed(seed + 2)
+    capacity_generator = torch.Generator(device=device).manual_seed(seed + 3)
     n = config["data"]["n_points"]
     centers = None
     if dataset == "horse":
@@ -110,8 +111,8 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=16, seed=2026, refer
         permutation = coupling_permutation(noise, target, coupling=config["coupling"],
             num_regions=config.get("num_regions"), target_centers=centers,
             sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
-            mahalanobis_ridge=config.get("mahalanobis_ridge", 1e-3),
-            sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator)
+            sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator,
+            capacity=config.get("capacity"), capacity_generator=capacity_generator)
         if permutation is not None:
             target = target.gather(1, permutation.unsqueeze(-1).expand_as(target))
         for index, t in enumerate(TIMES):

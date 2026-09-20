@@ -22,8 +22,6 @@ def read_config(path):
     with Path(path).open(encoding="utf-8") as file:
         config = yaml.safe_load(file)
     config["coupling"] = canonical_method(config["coupling"])
-    if config["coupling"] == "target_guided_mahalanobis":
-        config.setdefault("mahalanobis_ridge", 1e-3)
     return config
 
 
