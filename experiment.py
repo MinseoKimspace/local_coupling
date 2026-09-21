@@ -44,7 +44,7 @@ def training_signature(config):
     return values
 
 
-def save_training(model, config, dataset, config_path, seconds, loss):
+def save_training(model, config, dataset, config_path, seconds, loss, *, coupling_diagnostics=None):
     if not np.isfinite(loss):
         raise FloatingPointError("Final training loss is nonfinite; checkpoint was not saved")
     now = datetime.now(timezone.utc)
@@ -62,6 +62,13 @@ def save_training(model, config, dataset, config_path, seconds, loss):
         "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in sorted(Path(__file__).parent.glob("*.py"))},
     }
+    if coupling_diagnostics is not None:
+        metadata["coupling_diagnostics"] = {
+            "sampling": "Training batches at step 1 and log_every; not an average of every update. Timing includes these diagnostics.",
+            "scope": "Finite-cloud conditional-path bounds, NOT learned ODE separation or a sharpness guarantee.",
+            "aggregation": "Gap/time statistics pool eligible pairs; mean_base_cost and mean_penalty average over points. Penalty is UNWEIGHTED R in D + weight*R.",
+            "records": coupling_diagnostics,
+        }
     checkpoint = run_dir / snapshot["checkpoint"]
     torch.save({**metadata, "model_state_dict": model.state_dict()}, checkpoint)
     with (run_dir / "config.yaml").open("x", encoding="utf-8") as file:

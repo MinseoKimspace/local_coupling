@@ -1,9 +1,14 @@
 seed: 1
-experiment_group: tg_capacity_v1
 device: cuda
 dtype: float32
-coupling: target_guided
+coupling: target_guided_separation
 num_regions: 8
+
+separation:
+  time: 0.5
+  margin_fraction: 0.25
+  weight: 10.0
+  min_target_gap: 0.000001
 
 data:
   batch_size: 64
@@ -27,4 +32,4 @@ training:
 evaluation:
   batch_size: 64
 
-checkpoint: checkerboard_tg_capacity_uniform_k8_n256_seed1.pt
+checkpoint: checkerboard_tg_separation_t050_k8_n256_seed1.pt
