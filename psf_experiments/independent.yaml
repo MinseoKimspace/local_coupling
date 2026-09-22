@@ -5,14 +5,15 @@ data:
   root: data/ShapeNetCore.v2.PC15k
   category: chair
   n_points: 2048
-  batch_size: 8
+  batch_size: 16
 model:
   embed_dim: 64
   use_att: true
   dropout: 0.1
 training:
-  num_steps: 10000
+  num_steps: 600000
+  accumulation_steps: 16
   learning_rate: 0.0002
-  lr_gamma: 0.998
   log_every: 100
-  save_every: 1000
+  save_every: 5000
+  checkpoint_steps: [50000, 100000, 200000, 400000, 600000]

@@ -130,6 +130,33 @@ class CouplingTests(unittest.TestCase):
 
 
 class MetricModelTests(unittest.TestCase):
+    def test_shared_loss_preserves_independent_train_step(self):
+        torch.manual_seed(11)
+        model = torch.nn.Linear(2, 2)
+        class Velocity(torch.nn.Module):
+            def __init__(self, layer):
+                super().__init__()
+                self.layer = layer
+            def forward(self, x, t):
+                return self.layer(x) + t
+        model = Velocity(model)
+        reference = copy.deepcopy(model)
+        target = torch.randn(2, 8, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        expected_optimizer = torch.optim.AdamW(reference.parameters())
+        state = torch.get_rng_state()
+        noise = torch.randn_like(target)
+        time = train.sample_time(2, device=target.device, dtype=target.dtype)
+        expected = train.flow_matching_loss(reference, target, noise, time)
+        expected_optimizer.zero_grad(set_to_none=True)
+        expected.backward()
+        expected_optimizer.step()
+        torch.set_rng_state(state)
+        actual = train_step(model, optimizer, target, coupling="independent")
+        torch.testing.assert_close(actual, expected.detach(), rtol=0, atol=0)
+        for a, b in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+
     def test_known_metrics(self):
         centers = checkerboard_centers(4, "cpu", torch.float32)
         points = torch.cat([centers, torch.full((72, 2), 10.)]).unsqueeze(0)

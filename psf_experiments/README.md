@@ -1,4 +1,4 @@
-# PSF backbone + TG (Windows pilot)
+# PSF backbone + TG (single-GPU coupling comparison)
 
 PSF is pinned as `third_party/PSF` at
 `c74b39e1200513039cfb8d776505fb75da599e68`.
@@ -8,7 +8,8 @@ The tiny PVCNN2 block configuration in `psf_adapter.py` is copied from its
 loader are imported from PSF. The full license remains in the submodule.
 
 This is **PSF first-stage FM with a coupling comparison**, not a reproduction
-of the full PSF reflow/distillation pipeline or the published benchmark.
+of the full PSF reflow/distillation pipeline or the published NSOT benchmark.
+The two YAML filenames are unchanged. Only the coupling differs between them.
 The existing 2D scripts/configs are unchanged.
 
 ## What the patch changes
@@ -55,7 +56,7 @@ working x64 developer CMD, do not open a nested shell. Otherwise open CMD and:
 ```bat
 call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" amd64 -vcvars_ver=14.44
 conda activate local_coupling
-set TORCH_CUDA_ARCH_LIST=8.9
+set TORCH_CUDA_ARCH_LIST=
 set MAX_JOBS=2
 set DISTUTILS_USE_SDK=1
 where cl
@@ -64,7 +65,9 @@ python psf_adapter.py
 python psf_adapter.py --coupling target_guided_exact_optimized
 ```
 
-Run from this repository root. `8.9` targets the lab RTX 6000 Ada, not every GPU.
+Run from this repository root. Clearing `TORCH_CUDA_ARCH_LIST` lets PyTorch
+detect the visible GPU. If setting it manually, RTX A6000 uses `8.6`, whereas
+the previously reported RTX 6000 Ada uses `8.9`; do not confuse these devices.
 These tests need no data and actually run forward, backward and an optimizer
 step on the original PVCNN kernels. Require `PSF_FORWARD_BACKWARD_OK` for both
 methods before training. The first call compiles to `.torch_extensions/`.
@@ -86,10 +89,13 @@ data/ShapeNetCore.v2.PC15k/03001627/test/*.npy
 Start with a short Independent run:
 
 ```bat
-python train_3d.py psf_experiments/independent.yaml --steps 100
+python train_3d.py psf_experiments/independent.yaml --steps 10
+python train_3d.py psf_experiments/target_guided.yaml --steps 10
 ```
 
-Then compare both full pilot configs:
+Check peak VRAM and seconds per optimizer update in both logs. The first updates
+are not steady-state timing. There is no automatic training-budget or OOM fallback.
+Then compare both full training configs:
 
 ```bat
 python train_3d.py psf_experiments/independent.yaml
@@ -97,32 +103,89 @@ python train_3d.py psf_experiments/target_guided.yaml
 ```
 
 Use `--dataroot "D:\datasets\ShapeNetCore.v2.PC15k"` if needed (also available
-in eval). Configs: chair, N=2048, K=8, batch=8, seed=0, 10,000 optimizer steps.
-This budget is a smoke/pilot choice, not a claim of convergence. Batch 8 is a
-conservative starting point; increase both configs together after measuring VRAM.
+in eval). Both configs use chair, N=2048, K=8, seed=0, and:
+
+| Setting | Value in both methods |
+| --- | --- |
+| Microbatch (shapes per forward/backward) | 16 |
+| Gradient accumulation | 16 microbatches per optimizer update |
+| Effective batch | 256 shapes |
+| Optimizer updates | 600,000 |
+| Optimizer | Adam, beta1=0.5, beta2=0.999, weight_decay=0 (PSF choice) |
+| Learning rate | Constant 0.0002; no scheduler |
+| EMA | None; evaluate raw weights |
+| Precision | float32; no AMP |
+
+Microbatch 16 is a conservative starting setting for a 48-GB-class single GPU,
+NOT a measured memory-fit guarantee. If it does not fit, set batch_size=8 and
+accumulation_steps=32 in BOTH YAMLs before starting new runs. If increasing it,
+keep their product 256 and use the same microbatch in both methods. Accumulation
+does not save total computation. One `--steps 10` run still processes 2,560 shapes.
+600,000 updates is a substantial single-GPU budget; inspect the measured cost
+before committing to a long run. The same update/sample budget is not the same
+wall-clock budget, so report training time alongside quality.
+
 The provided TG uses the existing exact optimized implementation: the same POT
 objective/constraints with batched transfers, not an approximate solver.
 
 Both use stock PVCNN2, uniform t, linear paths, MSE, and t*999 embeddings.
 Coupling only permutes target points during training. The internal random pairing
 uses a separate RNG, so it does not consume the baseline's noise/time RNG stream.
-Adam follows PSF's beta1=0.5; LR decays by 0.998 per completed epoch. No EMA,
-AMP, reflow or distillation; no upstream distributed/NCCL runner. DataLoader
-workers=0 for Windows. CUDA reductions are not guaranteed bitwise deterministic.
+The microbatch MSE is divided by accumulation_steps before backward; the optimizer
+is updated only once per effective batch. No scheduler, EMA, AMP, reflow,
+distillation, or upstream distributed/NCCL runner. DataLoader workers=0 for Windows;
+the resumable sampler shuffles each epoch and drops its final incomplete microbatch.
+CUDA reductions are not guaranteed bitwise deterministic. All methods retain
+the same architecture, source noise/time distribution and Euler sampler.
+
+## Relation to NSOT
+
+[NSOT Appendix B](https://arxiv.org/html/2502.12456v1#A2) reports roughly 600,000
+iterations, total batch 256, Adam with initial LR 2e-4, LR decay 0.998 every 1,000
+iterations, and EMA 0.9999 on four A100s. We match the reported update/effective
+batch budget, but deliberately omit EMA and LR decay at the user's request.
+Adam betas remain the PSF settings; do not label them as verified NSOT settings.
+This supports a controlled Independent-vs-TG experiment, not identical numerical
+reproduction of NSOT. Microbatch accumulation and four-GPU execution are not
+claimed to be bitwise equivalent. Fixed LR also does not guarantee convergence;
+inspect the intermediate checkpoints under a common evaluation protocol.
 
 The upstream loader loads the selected split into RAM and samples **with
 replacement** from each shape's first 10,000 points. This behavior is preserved.
 N=8192 is supported by this loader, but N=15000 is deliberately rejected rather
 than silently clamped to 10000. High-N TG time/VRAM must be measured separately.
+NSOT uses a 100K-point superset; the current data source is therefore another
+intentional difference, as is the current pilot evaluation protocol below.
+
+## Checkpoints and resume
 
 Runs: `runs/psf3d/<unique-run>/config.yaml`, `training.json`, `checkpoint.pt`.
-Checkpoint saved every 1,000 steps and at completion. Only the latest weights
-per run are retained; this minimal runner does not implement training resume.
+`checkpoint.pt` is saved every 5,000 optimizer updates and at completion.
+Separate `checkpoint_step_050000.pt`, `checkpoint_step_100000.pt`, etc. are kept
+at 50k/100k/200k/400k/600k. These snapshots also contain optimizer and RNG state.
+Resume into a NEW run directory (the original artifacts are preserved):
+
+```bat
+python train_3d.py psf_experiments/independent.yaml --resume "runs\psf3d\YOUR_RUN\checkpoint.pt"
+```
+
+`--steps` always means the TOTAL target optimizer updates, not additional updates.
+For example, first train both methods with `--steps 50000`, then resume each with
+the same YAML and no `--steps` to continue toward 600,000. Point sampling, shuffled
+shape order/position, Python/NumPy/Torch/CUDA RNGs and the coupling RNG are restored.
+Resume requires the same training settings, microbatch, data IDs/normalization,
+and source/PSF code hashes. Only data root, total target steps and logging/save
+intervals may change. Dataset contents must remain unchanged. Legacy v1 pilot
+checkpoints are still evaluable but cannot be resumed without optimizer/RNG state.
+
 Snapshots record normalization, shape IDs, PSF revision, patch hash, coupling,
-steps, losses, training time and code hashes. The PSF tracked working diff is also
+steps, effective batch, number of shape presentations, losses, peak allocated VRAM,
+training time and code hashes. The PSF tracked working diff is also
 hashed, so extra local backbone/kernel edits are not silently treated as stock PSF.
-Timing excludes initial JIT build
-and dataset load; includes the training loop and prior checkpoint writes.
+Timing excludes initial JIT build and dataset load; includes the training loop
+and prior checkpoint writes, but not the currently-being-written checkpoint.
+On resume, the previous recorded training time is carried forward; initialization
+and downtime between runs are excluded.
 
 ## Evaluation (no EMD)
 
@@ -136,7 +199,9 @@ Same source noise and reference shapes are used across NFEs for the same eval
 seed. Euler m steps = m model calls per generated batch. Saved training mean/std
 normalizes the held-out shapes; no refitting on val/test. References use the first
 10k points of **held-out shapes**, not training shapes. Each method must use the
-same category, split, seed, N and sample count. No test-time coupling or refinement.
+same category, split, seed, N and sample count. Both use raw (non-EMA) weights;
+this choice and the training budget are recorded in evaluation JSON.
+No test-time coupling or refinement.
 
 Outputs: `eval_results/psf3d/<run+hash>/nfe_*.json`, `.npy`, `.png`.
 Coordinates and CD are in the training-normalized domain (mean/std in JSON).
@@ -159,5 +224,7 @@ python -m unittest discover -s tests -p test_psf_bridge.py -v
 ```
 
 These check the upstream architecture configuration, adapter time/layout mapping,
-training-stat reuse, CD metrics and patch idempotence. They do not certify CUDA
+training-stat reuse, CD metrics, patch idempotence, identical YAML budgets,
+accumulated-vs-full-batch toy gradients, and exact CPU toy-training resume.
+They do not certify CUDA
 compilation, numerical equivalence of GPU kernels, or generation quality.

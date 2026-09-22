@@ -1,9 +1,11 @@
 """CPU checks only; actual PSF CUDA kernels are checked by psf_adapter.py."""
 import ast
 import contextlib
+import copy
 import io
 from pathlib import Path
 import tempfile
+import random
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -15,6 +17,8 @@ from eval_3d import cd_matrix, cd_metrics, cloud_cd
 from prepare_psf import PSF, main as prepare, provenance
 from psf_adapter import PSFVelocity, create_backbone, shapenet_dataset
 from sample import integrate_velocity
+from train_3d import (ResumableBatchSampler, accumulated_update, restore_rng,
+                      resume_signature, rng_state)
 
 
 class PSFBridgeTests(unittest.TestCase):
@@ -94,6 +98,134 @@ class PSFBridgeTests(unittest.TestCase):
             # No CUDA backend / Open3D / EMD is needed to use this dataset path.
             with self.assertRaises(ValueError):
                 shapenet_dataset(root, "chair", 15000)
+
+
+class TrainingProtocolTests(unittest.TestCase):
+    def setUp(self):
+        torch.set_num_threads(1)
+
+    def test_configs_differ_only_in_coupling(self):
+        import yaml
+        root = Path(__file__).resolve().parents[1]
+        configs = [yaml.safe_load((root / "psf_experiments" / name).read_text())
+                   for name in ("independent.yaml", "target_guided.yaml")]
+        self.assertEqual([c.pop("coupling") for c in configs], ["independent", "target_guided_exact_optimized"])
+        self.assertEqual(configs[0], configs[1])
+        config = configs[0]
+        self.assertEqual(config["training"]["num_steps"], 600000)
+        self.assertEqual(config["data"]["batch_size"] * config["training"]["accumulation_steps"], 256)
+        self.assertEqual(config["training"]["learning_rate"], 2e-4)
+        self.assertNotIn("lr_gamma", config["training"])
+        self.assertNotIn("ema_decay", config["training"])
+
+    def test_accumulation_matches_full_batch_adam_update(self):
+        torch.manual_seed(4)
+        model = torch.nn.Linear(3, 3).double()
+        reference = copy.deepcopy(model)
+        optimizer = torch.optim.Adam(model.parameters(), lr=2e-4, betas=(.5, .999))
+        full_optimizer = torch.optim.Adam(reference.parameters(), lr=2e-4, betas=(.5, .999))
+        x = torch.randn(8, 3, dtype=torch.float64)
+        loss_fn = lambda net, points: (net(points) - points).square().mean()
+        value = accumulated_update(model, optimizer, iter(x.split(2)), 4, loss_fn)
+        full_optimizer.zero_grad()
+        expected = loss_fn(reference, x)
+        expected.backward()
+        full_optimizer.step()
+        self.assertAlmostEqual(value, expected.item(), places=12)
+        for actual, wanted in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual, wanted, rtol=0, atol=1e-12)
+            self.assertEqual(optimizer.state[actual]["step"].item(), 1)
+        self.assertEqual(optimizer.param_groups[0]["lr"], 2e-4)
+
+    def test_nonfinite_loss_does_not_update_weights(self):
+        model = torch.nn.Linear(3, 3)
+        before = copy.deepcopy(model.state_dict())
+        optimizer = torch.optim.Adam(model.parameters())
+        batches = iter([torch.ones(2, 3), torch.full((2, 3), float("nan"))])
+        with self.assertRaises(FloatingPointError):
+            accumulated_update(model, optimizer, batches, 2, lambda net, x: net(x).square().mean())
+        self.assertEqual(optimizer.state, {})
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, before[key])
+        with self.assertRaisesRegex(ValueError, "equal microbatch"):
+            accumulated_update(model, optimizer, iter([torch.ones(2, 3), torch.ones(1, 3)]), 2,
+                               lambda net, x: net(x).square().mean())
+
+    def test_sampler_roundtrip_across_epoch(self):
+        sampler = ResumableBatchSampler(13, 4, 2)
+        iterator = iter(sampler)
+        first, second = next(iterator), next(iterator)
+        self.assertEqual(len(set(first + second)), 8)
+        state = sampler.state_dict()
+        expected = [next(iterator) for _ in range(5)]
+        resumed = ResumableBatchSampler(13, 4, 999)
+        resumed.load_state_dict(state)
+        iterator = iter(resumed)
+        self.assertEqual([next(iterator) for _ in range(5)], expected)
+
+    def test_resume_signature_rejects_training_changes(self):
+        config = {"coupling": "independent", "data": {"root": "a", "batch_size": 16},
+                  "training": {"num_steps": 100, "accumulation_steps": 16, "learning_rate": 2e-4}}
+        changed = copy.deepcopy(config)
+        changed["data"]["root"] = "b"
+        changed["training"]["num_steps"] = 600000
+        self.assertEqual(resume_signature(config), resume_signature(changed))
+        changed["training"]["learning_rate"] = 1e-4
+        self.assertNotEqual(resume_signature(config), resume_signature(changed))
+
+    def test_toy_resume_matches_uninterrupted_training(self):
+        # CPU toy network: tests accumulation + optimizer + dropout + loader/RNG
+        # restoration, NOT PVCNN CUDA kernels or the POT assignment solver.
+        class Dataset(torch.utils.data.Dataset):
+            def __len__(self):
+                return 13
+            def __getitem__(self, i):
+                return torch.tensor(np.random.normal(size=3) + random.random() + i / 13, dtype=torch.float32)
+
+        def setup():
+            net = torch.nn.Sequential(torch.nn.Linear(3, 5), torch.nn.Dropout(.2), torch.nn.Linear(5, 3))
+            opt = torch.optim.Adam(net.parameters(), lr=2e-4, betas=(.5, .999))
+            sampler = ResumableBatchSampler(13, 2, 4)
+            loader = torch.utils.data.DataLoader(Dataset(), batch_sampler=sampler, num_workers=0,
+                                                 generator=torch.Generator().manual_seed(8))
+            return net, opt, sampler, loader, torch.Generator().manual_seed(7)
+
+        def advance(net, opt, batches, pair_rng):
+            def loss_fn(net, target):
+                noise = torch.randn_like(target)
+                t = torch.rand(len(target), 1)
+                # A separate pairing stream is saved independently from noise/time.
+                target = target[:, torch.randperm(3, generator=pair_rng)]
+                return (net((1-t)*noise + t*target) - (target-noise)).square().mean()
+            return accumulated_update(net, opt, batches, 3, loss_fn)
+
+        with patch("torch.cuda.is_available", return_value=False):
+            random.seed(1)
+            np.random.seed(1)
+            torch.manual_seed(1)
+            net, opt, sampler, loader, pair_rng = setup()
+            batches = iter(loader)
+            for _ in range(2):
+                advance(net, opt, batches, pair_rng)
+            buffer = io.BytesIO()
+            torch.save({"model": net.state_dict(), "optimizer": opt.state_dict(),
+                        "sampler": sampler.state_dict(), "rng": rng_state(pair_rng)}, buffer)
+            expected_losses = [advance(net, opt, batches, pair_rng) for _ in range(3)]
+            buffer.seek(0)
+            saved = torch.load(buffer, weights_only=True)
+            resumed, resumed_opt, sampler, loader, pair_rng = setup()
+            resumed.load_state_dict(saved["model"])
+            resumed_opt.load_state_dict(saved["optimizer"])
+            sampler.load_state_dict(saved["sampler"])
+            restore_rng(saved["rng"], pair_rng)
+            batches = iter(loader)
+            actual_losses = [advance(resumed, resumed_opt, batches, pair_rng) for _ in range(3)]
+            self.assertEqual(actual_losses, expected_losses)
+            for a, b in zip(net.parameters(), resumed.parameters()):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+                for key in ("step", "exp_avg", "exp_avg_sq"):
+                    torch.testing.assert_close(opt.state[a][key], resumed_opt.state[b][key], rtol=0, atol=0)
+            self.assertEqual(resumed_opt.param_groups[0]["lr"], 2e-4)
 
 
 if __name__ == "__main__":

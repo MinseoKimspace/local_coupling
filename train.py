@@ -24,8 +24,8 @@ def flow_matching_loss(model, x_data, x_noise, t):
     return F.mse_loss(model(linear_path(x_data, x_noise, t), t), x_data - x_noise)
 
 
-def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_centers=None,
-               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None):
+def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, target_centers=None,
+                               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None):
     x_noise = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype)
     permutation = coupling_permutation(
         x_noise, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
@@ -35,8 +35,17 @@ def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_c
     if permutation is not None:
         x_data = x_data.gather(1, permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1]))
     t = sample_time(x_data.shape[0], device=x_data.device, dtype=x_data.dtype)
+    return flow_matching_loss(model, x_data, x_noise, t)
+
+
+def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_centers=None,
+               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None):
+    loss = coupled_flow_matching_loss(
+        model, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
+        sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iterations=sinkhorn_iterations,
+        coupling_generator=coupling_generator,
+    )
     optimizer.zero_grad(set_to_none=True)
-    loss = flow_matching_loss(model, x_data, x_noise, t)
     loss.backward()
     optimizer.step()
     return loss.detach()

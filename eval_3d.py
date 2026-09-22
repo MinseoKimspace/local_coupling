@@ -81,7 +81,7 @@ def main(checkpoint, dataroot=None, nfe=(1, 2, 4, 8, 16, 32, 64, 128),
     from experiment import environment, synchronize
     checkpoint = Path(checkpoint).resolve()
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    if payload.get("format") != "psf_tg_v1":
+    if payload.get("format") not in ("psf_tg_v1", "psf_tg_v2"):
         raise ValueError("Expected this adapter's PSF checkpoint, not a 2D/upstream checkpoint.")
     psf = provenance()
     if payload["psf"] != psf:
@@ -100,6 +100,9 @@ def main(checkpoint, dataroot=None, nfe=(1, 2, 4, 8, 16, 32, 64, 128),
     model = PSFVelocity(**config["model"]).cuda().eval()
     model.load_state_dict(payload["model_state_dict"])
     del payload["model_state_dict"]
+    # Training resume states are not needed for sampling.
+    for key in ("optimizer_state_dict", "sampler_state", "rng_state"):
+        payload.pop(key, None)
     noise = torch.randn(samples, data["n_points"], 3, device="cuda",
                         generator=torch.Generator(device="cuda").manual_seed(seed))
     with torch.no_grad():
@@ -124,6 +127,8 @@ def main(checkpoint, dataroot=None, nfe=(1, 2, 4, 8, 16, 32, 64, 128),
         result = {"dataset": "shapenet_psf3d", "checkpoint": str(checkpoint), "checkpoint_sha256": identifier,
                   "config": config, "psf": psf, "training_steps": payload["step"],
                   "training_seconds": payload["training_seconds"], "evaluation_environment": environment("cuda"),
+                  "evaluation_weights": "raw_no_ema", "training_schedule": payload.get("schedule"),
+                  "effective_batch_size": payload.get("effective_batch_size", data["batch_size"]),
                   "normalization": payload["normalization"], "evaluation_seed": seed, "split": split,
                   "reference_shape_ids": [dataset.all_cate_mids[int(i)] for i in indices],
                   "samples": samples, "batch_size": batch_size, "nfe": steps, "solver": "Euler",
