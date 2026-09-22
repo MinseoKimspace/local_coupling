@@ -5,7 +5,7 @@ import ot
 import torch
 import torch.nn.functional as F
 
-from separation import separation_penalty, separation_report, separation_settings
+from source_randomization import randomization_settings, randomize_assignment
 
 # Flamary et al., JMLR 22(78), 2021: https://jmlr.org/papers/v22/20-451.html
 ALIASES = {"global_hungarian": "global_ot", "geometry_aware_hungarian": "geometry_aware_ot"}
@@ -14,7 +14,7 @@ METHODS = {
     "independent": ("none", "none", "none"),
     "regional": ("balanced", "regional", "random"),
     "target_guided": ("balanced", "exact", "random"),
-    "target_guided_separation": ("balanced", "separation", "random"),
+    "target_guided_randomized": ("balanced", "randomized", "random"),
     "target_guided_exact_optimized": ("balanced", "exact_batched", "random"),
     "target_guided_source_greedy": ("balanced", "greedy", "random"),
     "target_guided_source_sinkhorn": ("balanced", "sinkhorn", "random"),
@@ -66,14 +66,10 @@ def coupling_info(name: str) -> dict:
                     exact_transfer="batched" if assignment == "exact_batched" else "per_cloud")
         if assignment == "greedy":
             info["greedy_rule"] = "negative squared distance; descending best-vs-second margin; capacity preserving"
-    if name == "target_guided_separation":
-        info.update(implementation="pot_tg_separation_v1", source_assignment="exact",
-                    cost="squared_centroid_distance_plus_separation_squared_hinges",
-                    separation_normals="target_FPS_anchor_differences",
-                    separation_pairs="all_unordered_pairs_with_projected_target_gap_above_threshold",
-                    separation_threshold="frozen_midpoint_of_baseline_source_projection_extrema",
-                    target_partition_solver="POT/network_simplex", exact_transfer="batched_source",
-                    separation_constraint="soft; measure achieved margin, not guaranteed by the solver")
+    if name == "target_guided_randomized":
+        info.update(implementation="pot_tg_randomized_v1", target_partition_solver="POT/network_simplex",
+                    source_assignment="exact_then_budgeted_random_swaps", exact_transfer="batched_source",
+                    randomization="finite symmetric point-pair proposals; accept iff cost stays within per-cloud budget")
     return info
 
 
@@ -190,6 +186,18 @@ def region_centroids(points, labels, k):
     return centers, counts.long()
 
 
+def balanced_target_partition(target, k, *, solver="exact", epsilon=0.1, iterations=100):
+    """Shared by training and the training-free patch audit."""
+    batch, n, _ = target.shape
+    rows = torch.arange(batch, device=target.device).unsqueeze(1)
+    anchors = target[rows, farthest_point_sample(target, k)]
+    capacities = torch.full((batch, k), n // k, dtype=torch.long, device=target.device)
+    capacities[:, :n % k] += 1
+    labels = assign_regions(target, anchors, capacities, solver=solver, epsilon=epsilon, iterations=iterations)
+    centers, capacities = region_centroids(target, labels, k)
+    return anchors, labels, centers, capacities
+
+
 def pair_within_regions(source, target, source_labels, target_labels, k, *, local="random", generator=None):
     permutation = torch.empty(source.shape[:2], dtype=torch.long, device=source.device)
     for b in range(source.shape[0]):
@@ -209,11 +217,11 @@ def pair_within_regions(source, target, source_labels, target_labels, k, *, loca
 @torch.no_grad()
 def coupling_permutation(source, target, *, coupling, num_regions=None, target_centers=None,
                          sinkhorn_epsilon=0.1, sinkhorn_iterations=100, generator=None,
-                         separation=None, separation_diagnostics=None):
+                         source_randomization=None, assignment_generator=None, coupling_diagnostics=None):
     method = canonical_method(coupling)
-    if separation is not None and method != "target_guided_separation":
-        raise ValueError("separation settings require target_guided_separation")
-    settings = separation_settings(separation) if method == "target_guided_separation" else None
+    if source_randomization is not None and method != "target_guided_randomized":
+        raise ValueError("source_randomization requires target_guided_randomized")
+    settings = randomization_settings(source_randomization) if method == "target_guided_randomized" else None
     partition, assignment, local = METHODS[method]
     if source.ndim != 3 or source.shape != target.shape:
         raise ValueError("Source and target must have the same [B, N, D] shape")
@@ -235,39 +243,28 @@ def coupling_permutation(source, target, *, coupling, num_regions=None, target_c
         if num_regions is None:
             raise ValueError("num_regions is required")
         k = num_regions
-        anchors = target[rows, farthest_point_sample(target, k)]
         if partition == "nearest":
+            anchors = target[rows, farthest_point_sample(target, k)]
             target_labels = torch.cdist(target, anchors).argmin(-1)
+            centers, capacities = region_centroids(target, target_labels, k)
         else:
             if method == "regional" and n % k:
                 raise ValueError("Regional patch-to-patch matching requires N divisible by K")
-            capacities = torch.full((batch, k), n // k, dtype=torch.long, device=target.device)
-            capacities[:, :n % k] += 1
-            target_labels = assign_regions(target, anchors, capacities,
-                                           solver=balanced_partition_solver(method), **options)
-        centers, capacities = region_centroids(target, target_labels, k)
+            anchors, target_labels, centers, capacities = balanced_target_partition(
+                target, k, solver=balanced_partition_solver(method), **options)
     if assignment == "regional":
         anchors = source[rows, farthest_point_sample(source, k)]
         source_labels = assign_regions(source, anchors, capacities)
         source_centers, _ = region_centroids(source, source_labels, k)
         matches = torch.stack([exact_assignment(cost) for cost in torch.cdist(source_centers, centers).square()])
         source_labels = matches.gather(1, source_labels)
-    elif assignment == "separation":
-        # Original centroid TG is the reference; target partition stays fixed.
-        base_cost = torch.cdist(source, centers).square()
-        baseline_labels = exact_assignment_batched(base_cost, capacities)
-        source_labels = baseline_labels.clone()
-        if settings["weight"] > 0 or separation_diagnostics is not None:
-            penalty, state = separation_penalty(source, target, anchors, baseline_labels, target_labels, settings)
-            active = (penalty.gather(2, baseline_labels.unsqueeze(-1)).sum((1, 2)) > 0) & (settings["weight"] > 0)
-            # A zero-penalty baseline is already globally optimal for D+lambda*R.
-            active_count = int(active.sum().item())
-            if active_count:
-                source_labels[active] = exact_assignment_batched(
-                    base_cost[active] + settings["weight"] * penalty[active], capacities[active])
-            if separation_diagnostics is not None:
-                separation_diagnostics.update(separation_report(source, baseline_labels, source_labels,
-                    base_cost, penalty, state, settings, active_count))
+    elif assignment == "randomized":
+        costs = np.ascontiguousarray(torch.cdist(source, centers).square().cpu().double().numpy())
+        counts = capacities.cpu().double().numpy()
+        baseline = np.stack([_exact_assignment_numpy(cost, count) for cost, count in zip(costs, counts)])
+        labels = randomize_assignment(costs, baseline, settings, generator=assignment_generator,
+                                      diagnostics=coupling_diagnostics)
+        source_labels = torch.as_tensor(labels, dtype=torch.long, device=source.device)
     else:
         source_labels = assign_regions(source, centers, capacities, solver=assignment, **options)
     return pair_within_regions(source, target, source_labels, target_labels, k,

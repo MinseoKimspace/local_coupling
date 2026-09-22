@@ -16,12 +16,15 @@ import yaml
 
 from coupling import canonical_method, coupling_info
 from sample import integrate_velocity
+from source_randomization import randomization_settings
 
 
 def read_config(path):
     with Path(path).open(encoding="utf-8") as file:
         config = yaml.safe_load(file)
     config["coupling"] = canonical_method(config["coupling"])
+    if config["coupling"] == "target_guided_randomized":
+        config["source_randomization"] = randomization_settings(config.get("source_randomization"))
     return config
 
 
@@ -64,9 +67,7 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     }
     if coupling_diagnostics is not None:
         metadata["coupling_diagnostics"] = {
-            "sampling": "Training batches at step 1 and log_every; not an average of every update. Timing includes these diagnostics.",
-            "scope": "Finite-cloud conditional-path bounds, NOT learned ODE separation or a sharpness guarantee.",
-            "aggregation": "Gap/time statistics pool eligible pairs; mean_base_cost and mean_penalty average over points. Penalty is UNWEIGHTED R in D + weight*R.",
+            "sampling": "Training batches at step 1 and log_every, not every update; included in training_seconds.",
             "records": coupling_diagnostics,
         }
     checkpoint = run_dir / snapshot["checkpoint"]

@@ -117,7 +117,7 @@ def render_groups(groups, directory):
     for group in groups:
         spec = group["signature"]
         config = {k: v for k, v in spec["config"].items()
-                  if k not in ("coupling", "num_regions", "sinkhorn_epsilon", "sinkhorn_iterations", "separation")}
+                  if k not in ("coupling", "num_regions", "sinkhorn_epsilon", "sinkhorn_iterations", "source_randomization")}
         comparison = {**spec, "config": config}
         comparison.pop("coupling_details")
         comparisons[json.dumps(comparison, sort_keys=True)].append(group)
@@ -130,10 +130,9 @@ def render_groups(groups, directory):
         for group in members:
             config = group["signature"]["config"]
             label = f"{config['coupling']} K={config.get('num_regions', 'na')}"
-            if "separation" in config:
-                separation = config["separation"]
-                label += (f" tau={separation['time']:g} alpha={separation['margin_fraction']:g}"
-                          f" weight={separation['weight']:g} min_gap={separation['min_target_gap']:g}")
+            if "source_randomization" in config:
+                options = config["source_randomization"]
+                label += f" budget={options['relative_budget']:g} sweeps={options['proposal_sweeps']}"
             for ax, metric in zip(axes.flat, METRICS):
                 valid = [r for r in group["rows"] if r["metrics"].get(metric, {}).get("mean") is not None]
                 if not valid:

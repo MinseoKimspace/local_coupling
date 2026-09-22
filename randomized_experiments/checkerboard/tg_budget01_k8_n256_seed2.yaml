@@ -1,14 +1,11 @@
 seed: 2
 device: cuda
 dtype: float32
-coupling: target_guided_separation
+coupling: target_guided_randomized
 num_regions: 8
-
-separation:
-  time: 0.75
-  margin_fraction: 0.25
-  weight: 10.0
-  min_target_gap: 0.000001
+source_randomization:
+  relative_budget: 0.01
+  proposal_sweeps: 4
 
 data:
   batch_size: 64
@@ -32,4 +29,5 @@ training:
 evaluation:
   batch_size: 64
 
-checkpoint: checkerboard_tg_separation_t075_k8_n256_seed2.pt
+checkpoint: checkerboard_tg_randomized_budget01_k8_n256_seed2.pt
+

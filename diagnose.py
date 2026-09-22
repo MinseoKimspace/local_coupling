@@ -90,6 +90,8 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=16, seed=2026, refer
     torch.manual_seed(seed)  # reset AFTER model initialization; common draws across methods
     generator = torch.Generator(device=device).manual_seed(seed + 1)
     time_generator = torch.Generator(device=device).manual_seed(seed + 2)
+    assignment_generator = torch.Generator(device="cpu").manual_seed(seed + 3)
+    coupling_records = []
     n = config["data"]["n_points"]
     centers = None
     if dataset == "horse":
@@ -104,18 +106,18 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=16, seed=2026, refer
     endpoint_errors = {nfe: [] for nfe in NFES}
     energy, ratios, reference_errors = [], [], []
     first_path = None
-    separation_records = []
     for batch in range(batches):
         target = sample_target()
         noise = torch.randn_like(target)
-        separation_diagnostics = {} if config["coupling"] == "target_guided_separation" else None
+        coupling_diagnostics = {} if config["coupling"] == "target_guided_randomized" else None
         permutation = coupling_permutation(noise, target, coupling=config["coupling"],
             num_regions=config.get("num_regions"), target_centers=centers,
             sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
             sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator,
-            separation=config.get("separation"), separation_diagnostics=separation_diagnostics)
-        if separation_diagnostics is not None:
-            separation_records.append({"batch": batch, **separation_diagnostics})
+            source_randomization=config.get("source_randomization"), assignment_generator=assignment_generator,
+            coupling_diagnostics=coupling_diagnostics)
+        if coupling_diagnostics is not None:
+            coupling_records.append({"batch": batch, **coupling_diagnostics})
         if permutation is not None:
             target = target.gather(1, permutation.unsqueeze(-1).expand_as(target))
         for index, t in enumerate(TIMES):
@@ -167,8 +169,8 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=16, seed=2026, refer
         "example_trajectory": {"times": [i / reference_nfe for i in range(reference_nfe + 1)],
                                "points": first_path.tolist()},
     }
-    if separation_records:
-        payload["separation_diagnostics"] = separation_records
+    if coupling_records:
+        payload["coupling_diagnostics"] = coupling_records
     directory = output_directory(Path(output) / dataset, checkpoint.stem + "_diagnostic")
     save_json(directory / "diagnostics.json", payload)
     render(payload, first_path, directory)
