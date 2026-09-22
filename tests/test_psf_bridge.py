@@ -100,6 +100,55 @@ class PSFBridgeTests(unittest.TestCase):
                 shapenet_dataset(root, "chair", 15000)
 
 
+    def test_wrapped_layout_matches_standard_for_all_splits(self):
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
+            roots = [Path(folder) / layout for layout in ("standard", "wrapped")]
+            rng = np.random.default_rng(42)
+            for split in ("train", "val", "test"):
+                for i in (1, 0):
+                    points = rng.normal(size=(15000, 3)).astype("float32")
+                    for root, middle in zip(roots, ("", "_")):
+                        directory = root / "02691156" / middle / split
+                        directory.mkdir(parents=True, exist_ok=True)
+                        np.save(directory / f"shape{i}.npy", points)
+            stats = None
+            for split in ("train", "val", "test"):
+                standard, wrapped = [shapenet_dataset(root, "airplane", 1024, split=split, normalization=stats)
+                                     for root in roots]
+                np.testing.assert_array_equal(standard.all_points, wrapped.all_points)
+                np.testing.assert_array_equal(standard.all_points_mean, wrapped.all_points_mean)
+                np.testing.assert_array_equal(standard.all_points_std, wrapped.all_points_std)
+                self.assertEqual(standard.all_cate_mids, wrapped.all_cate_mids)
+                self.assertEqual(standard.cate_idx_lst, wrapped.cate_idx_lst)
+                self.assertEqual(standard.synset_ids, wrapped.synset_ids)
+                self.assertEqual(standard.cates, wrapped.cates)
+                self.assertEqual(standard.display_axis_order, wrapped.display_axis_order)
+                np.random.seed(5)
+                expected = standard[0]
+                np.random.seed(5)
+                actual = wrapped[0]
+                for key in ("train_points", "test_points"):
+                    torch.testing.assert_close(expected[key], actual[key], rtol=0, atol=0)
+                self.assertEqual(expected["sid"], actual["sid"])
+                self.assertEqual(expected["mid"], actual["mid"])
+                if split == "train":
+                    stats = {"mean": standard.all_points_mean.tolist(), "std": standard.all_points_std.tolist()}
+
+    def test_wrapped_layout_missing_or_ambiguous_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with self.assertRaisesRegex(FileNotFoundError, "or"):
+                shapenet_dataset(root, "chair", 1024)
+            for middle in ("", "_"):
+                directory = root / "03001627" / middle / "train"
+                directory.mkdir(parents=True)
+                np.save(directory / "shape.npy", np.zeros((15000, 3), dtype="float32"))
+            with self.assertRaisesRegex(ValueError, "Ambiguous"):
+                shapenet_dataset(root, "chair", 1024)
+            with self.assertRaisesRegex(ValueError, "split"):
+                shapenet_dataset(root, "chair", 1024, split="invalid")
+
+
 class TrainingProtocolTests(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)

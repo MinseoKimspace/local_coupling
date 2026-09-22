@@ -84,21 +84,40 @@ class PSFVelocity(nn.Module):
 def shapenet_dataset(root, category, n_points, *, split="train", normalization=None):
     if not 1024 <= n_points <= 10000:
         raise ValueError("PSF loader training subset supports 1024 <= N <= 10000.")
+    if split not in ("train", "val", "test"):
+        raise ValueError("split must be train, val or test")
     module = upstream_module("_psf_shapenet", "datasets/shapenet_data_pc.py")
     if category not in module.cate_to_synsetid:
         raise ValueError(f"Unknown ShapeNet category: {category}")
-    directory = Path(root) / module.cate_to_synsetid[category] / split
-    if not directory.is_dir() or not any(directory.glob("*.npy")):
-        raise FileNotFoundError(f"Expected ShapeNet PC15k .npy files in {directory}")
+    synset = module.cate_to_synsetid[category]
+    category_root = Path(root) / synset
+    candidates = (category_root / split, category_root / "_" / split)
+    directories = [path for path in candidates if path.is_dir() and any(path.glob("*.npy"))]
+    if not directories:
+        raise FileNotFoundError(f"Expected ShapeNet PC15k .npy files in {candidates[0]} or {candidates[1]}")
+    if len(directories) != 1:
+        raise ValueError(f"Ambiguous ShapeNet layout: both {candidates[0]} and {candidates[1]} contain .npy files")
+    wrapped = directories[0] == candidates[1]
+    # ShapeNet's thin wrapper hardcodes root/synset/split. Its original base
+    # loader accepts root/subdir/split, including subdir='synset/_'. No copies,
+    # links or edits to the dataset or the upstream module are needed.
+    loader = module.Uniform15KPC if wrapped else module.ShapeNet15kPointClouds
+    location = {"subdirs": [os.path.join(synset, "_")]} if wrapped else {"categories": [category]}
     stats = {} if normalization is None else {
         "all_points_mean": np.asarray(normalization["mean"]),
         "all_points_std": np.asarray(normalization["std"]),
     }
-    dataset = module.ShapeNet15kPointClouds(
-        root_dir=str(root), categories=[category], split=split,
+    dataset = loader(
+        root_dir=str(root), **location, split=split,
         tr_sample_size=n_points, te_sample_size=min(n_points, 5000),
         random_subsample=True, normalize_per_shape=False, normalize_std_per_axis=False,
         reflow=False, use_mask=False, **stats)
+    if wrapped:
+        # Preserve the ShapeNet wrapper's public metadata and canonical shape
+        # IDs: the packaging folder must not change shape identity or labels.
+        dataset.cates, dataset.synset_ids = [category], [synset]
+        dataset.gravity_axis, dataset.display_axis_order = 1, [0, 2, 1]
+        dataset.all_cate_mids = [(synset, mid) for _, mid in dataset.all_cate_mids]
     if not np.isfinite(dataset.all_points).all():
         raise ValueError("Nonfinite ShapeNet coordinates after normalization")
     return dataset

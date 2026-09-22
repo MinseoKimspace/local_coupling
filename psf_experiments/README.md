@@ -86,6 +86,16 @@ data/ShapeNetCore.v2.PC15k/03001627/val/*.npy
 data/ShapeNetCore.v2.PC15k/03001627/test/*.npy
 ```
 
+The alternative archive layout `03001627/_/train/*.npy` (likewise `val` and
+`test`) is also detected automatically. Keep `data.root` / `--dataroot` pointing
+to `ShapeNetCore.v2.PC15k`, not to the category or `_` folder. No data moves,
+symlinks, re-extraction, or additional `prepare_psf.py` call are needed.
+Both layouts use the original PSF loading, normalization and point subsampling;
+category/shape IDs are identical. If both layouts contain .npy files for the same
+category/split, loading stops rather than silently selecting or merging them.
+`02691156` is airplane; `03001627` is chair. The configs still default to chair;
+to train airplane, set `data.category: airplane` in BOTH existing YAML files.
+
 Start with a short Independent run:
 
 ```bat
