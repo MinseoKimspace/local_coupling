@@ -70,7 +70,9 @@ class PatchAuditTests(unittest.TestCase):
         torch.set_num_threads(1)
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
             for dataset in ("checkerboard", "horse"):
-                config = read_config(ROOT / f"randomized_experiments/{dataset}/tg_baseline_k8_n256_seed0.yaml")
+                config_path = ("horse_experiments/horse_target_guided_k8_n256_seed0.yaml" if dataset == "horse"
+                               else "checkerboard_experiments/target_guided.yaml")
+                config = read_config(ROOT / config_path)
                 config["device"] = "cpu"
                 config["data"]["n_points"] = 32
                 config["num_regions"] = 4

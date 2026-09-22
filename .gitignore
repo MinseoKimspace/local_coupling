@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.torch_extensions/
+runs/psf3d/
+eval_results/psf3d/
+data/ShapeNetCore.v2.PC15k/

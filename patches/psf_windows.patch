@@ -1,0 +1,66 @@
+diff --git a/modules/functional/backend.py b/modules/functional/backend.py
+--- a/modules/functional/backend.py
++++ b/modules/functional/backend.py
+@@ -4,7 +4,8 @@ from torch.utils.cpp_extension import load
+ 
+ _src_path = os.path.dirname(os.path.abspath(__file__))
+ _backend = load(name='_pvcnn_backend',
+-                extra_cflags=['-O3', '-std=c++17'],
++                extra_cflags=['/O2', '/std:c++17'] if os.name == 'nt' else ['-O3', '-std=c++17'],
++                verbose=True,
+                 sources=[os.path.join(_src_path,'src', f) for f in [
+                     'ball_query/ball_query.cpp',
+                     'ball_query/ball_query.cu',
+diff --git a/modules/functional/src/cuda_utils.cuh b/modules/functional/src/cuda_utils.cuh
+--- a/modules/functional/src/cuda_utils.cuh
++++ b/modules/functional/src/cuda_utils.cuh
+@@ -10,6 +10,12 @@
+ 
+ #include <vector>
+ 
++#ifdef _MSC_VER
++#define PVCNN_FUNCTION_NAME __FUNCTION__
++#else
++#define PVCNN_FUNCTION_NAME __PRETTY_FUNCTION__
++#endif
++
+ #define MAXIMUM_THREADS 512
+ 
+ inline int optimal_num_threads(int work_size) {
+@@ -30,7 +36,7 @@
+     cudaError_t err = cudaGetLastError();                                      \
+     if (cudaSuccess != err) {                                                  \
+       fprintf(stderr, "CUDA kernel failed : %s\n%s at L:%d in %s\n",           \
+-              cudaGetErrorString(err), __PRETTY_FUNCTION__, __LINE__,          \
++              cudaGetErrorString(err), PVCNN_FUNCTION_NAME, __LINE__,          \
+               __FILE__);                                                       \
+       exit(-1);                                                                \
+     }                                                                          \
+diff --git a/datasets/shapenet_data_pc.py b/datasets/shapenet_data_pc.py
+--- a/datasets/shapenet_data_pc.py
++++ b/datasets/shapenet_data_pc.py
+@@ -4,7 +4,6 @@ import numpy as np
+ from torch.utils.data import Dataset
+ from torch.utils import data
+ import random
+-import open3d as o3d
+ import numpy as np
+ import torch.nn.functional as F
+ 
+@@ -72,7 +71,7 @@ class Uniform15KPC(Dataset):
+                 continue
+ 
+             all_mids = []
+-            for x in os.listdir(sub_path):
++            for x in sorted(os.listdir(sub_path)):
+                 if not x.endswith('.npy'):
+                     continue
+                 all_mids.append(os.path.join(self.split, x[:-len('.npy')]))
+@@ -266,6 +265,7 @@ class PointCloudMasks(object):
+ 
+ 
+     def __call__(self, points):
++        import open3d as o3d  # Only required for the optional shape-completion mask.
+ 
+         pcd = o3d.geometry.PointCloud()
+         pcd.points = o3d.utility.Vector3dVector(points)

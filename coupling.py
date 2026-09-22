@@ -5,8 +5,6 @@ import ot
 import torch
 import torch.nn.functional as F
 
-from source_randomization import randomization_settings, randomize_assignment
-
 # Flamary et al., JMLR 22(78), 2021: https://jmlr.org/papers/v22/20-451.html
 ALIASES = {"global_hungarian": "global_ot", "geometry_aware_hungarian": "geometry_aware_ot"}
 
@@ -14,7 +12,6 @@ METHODS = {
     "independent": ("none", "none", "none"),
     "regional": ("balanced", "regional", "random"),
     "target_guided": ("balanced", "exact", "random"),
-    "target_guided_randomized": ("balanced", "randomized", "random"),
     "target_guided_exact_optimized": ("balanced", "exact_batched", "random"),
     "target_guided_source_greedy": ("balanced", "greedy", "random"),
     "target_guided_source_sinkhorn": ("balanced", "sinkhorn", "random"),
@@ -66,10 +63,6 @@ def coupling_info(name: str) -> dict:
                     exact_transfer="batched" if assignment == "exact_batched" else "per_cloud")
         if assignment == "greedy":
             info["greedy_rule"] = "negative squared distance; descending best-vs-second margin; capacity preserving"
-    if name == "target_guided_randomized":
-        info.update(implementation="pot_tg_randomized_v1", target_partition_solver="POT/network_simplex",
-                    source_assignment="exact_then_budgeted_random_swaps", exact_transfer="batched_source",
-                    randomization="finite symmetric point-pair proposals; accept iff cost stays within per-cloud budget")
     return info
 
 
@@ -216,12 +209,8 @@ def pair_within_regions(source, target, source_labels, target_labels, k, *, loca
 
 @torch.no_grad()
 def coupling_permutation(source, target, *, coupling, num_regions=None, target_centers=None,
-                         sinkhorn_epsilon=0.1, sinkhorn_iterations=100, generator=None,
-                         source_randomization=None, assignment_generator=None, coupling_diagnostics=None):
+                         sinkhorn_epsilon=0.1, sinkhorn_iterations=100, generator=None):
     method = canonical_method(coupling)
-    if source_randomization is not None and method != "target_guided_randomized":
-        raise ValueError("source_randomization requires target_guided_randomized")
-    settings = randomization_settings(source_randomization) if method == "target_guided_randomized" else None
     partition, assignment, local = METHODS[method]
     if source.ndim != 3 or source.shape != target.shape:
         raise ValueError("Source and target must have the same [B, N, D] shape")
@@ -258,13 +247,6 @@ def coupling_permutation(source, target, *, coupling, num_regions=None, target_c
         source_centers, _ = region_centroids(source, source_labels, k)
         matches = torch.stack([exact_assignment(cost) for cost in torch.cdist(source_centers, centers).square()])
         source_labels = matches.gather(1, source_labels)
-    elif assignment == "randomized":
-        costs = np.ascontiguousarray(torch.cdist(source, centers).square().cpu().double().numpy())
-        counts = capacities.cpu().double().numpy()
-        baseline = np.stack([_exact_assignment_numpy(cost, count) for cost, count in zip(costs, counts)])
-        labels = randomize_assignment(costs, baseline, settings, generator=assignment_generator,
-                                      diagnostics=coupling_diagnostics)
-        source_labels = torch.as_tensor(labels, dtype=torch.long, device=source.device)
     else:
         source_labels = assign_regions(source, centers, capacities, solver=assignment, **options)
     return pair_within_regions(source, target, source_labels, target_labels, k,
