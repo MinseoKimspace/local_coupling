@@ -1,0 +1,48 @@
+        # Resample x0, x1 according to transport matrix
+        a1, b1 = pot.unif(x0.size()[0]), pot.unif(x1.size()[0])
+        #M = torch.cdist(x0, x1) ** 2
+        M = torch.zeros(batchsize, batchsize)
+        for i in range(batchsize):
+            points2_reordered = []
+            points1 = x0[i].reshape(n_particles, n_dimensions)#.cpu()
+
+            for j in range(batchsize):
+                # define two sets of points
+                points2 = x1[j].reshape(n_particles, n_dimensions)#.cpu()
+
+                # compute pairwise distances between the two sets of points
+                distances = torch.cdist(points1, points2)
+
+                # use the Hungarian algorithm to solve the assignment problem
+                row_idx, col_idx = linear_sum_assignment(distances**2)
+
+                # reorder the second set of points according to the optimal assignment
+                points2_reordered.append(points2[col_idx].unsqueeze(0))
+            # Find optimal rotation
+            superposed_points2 = superpose_points_batch(torch.cat(points2_reordered, dim=0), reference=points1)
+            M[i] = torch.cdist(points1.reshape(1, -1), superposed_points2.reshape(batchsize, -1))[0]
+
+        M = M**2
+        M = M / M.max()
+        pi = pot.emd(a1, b1, M.detach().cpu().numpy())
+        # Sample random interpolations on pi
+        p = pi.flatten()
+        p = p / p.sum()
+        choices = np.random.choice(pi.shape[0] * pi.shape[1], p=p, size=batchsize)
+        i, j = np.divmod(choices, pi.shape[1])
+        x0 = x0[i]
+        x1 = x1[j]
+        for i in range(batchsize):
+            # define two sets of points
+            points1 = x0[i].reshape(n_particles, n_dimensions)#.cpu()
+            points2 = x1[i].reshape(n_particles, n_dimensions)#.cpu()
+
+            # compute pairwise distances between the two sets of points
+            distances = torch.cdist(points1, points2)
+
+            # use the Hungarian algorithm to solve the assignment problem
+            row_idx, col_idx = linear_sum_assignment(distances**2)
+
+            # reorder the second set of points according to the optimal assignment and rotate
+            x1[i] = superpose_points(x1[i].reshape(n_particles, n_dimensions)[col_idx],
+                                     x0[i].reshape(n_particles, n_dimensions)).flatten()

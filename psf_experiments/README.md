@@ -32,6 +32,14 @@ the submodule to discard changes. Preparation never downloads packages.
 
 ## Lab PC: fetch and prepare
 
+For subsequent sessions, double-click `open_psf.cmd` in the project checkout.
+It opens an interactive CMD with MSVC 14.44 and `local_coupling` activated.
+It uses the launcher's directory as the working directory, and places CUDA
+build caches and temporary files beside that directory. To save runs on D:,
+launch the copy in `D:\mkim958\local_coupling`, not the old C: copy.
+No training starts automatically and no system-wide environment is changed.
+If Conda cannot be located, launch the file from an Anaconda Prompt.
+
 In the existing project checkout:
 
 ```bat
@@ -211,7 +219,7 @@ normalizes the held-out shapes; no refitting on val/test. References use the fir
 10k points of **held-out shapes**, not training shapes. Each method must use the
 same category, split, seed, N and sample count. Both use raw (non-EMA) weights;
 this choice and the training budget are recorded in evaluation JSON.
-No test-time coupling or refinement.
+No test-time coupling.
 
 Outputs: `eval_results/psf3d/<run+hash>/nfe_*.json`, `.npy`, `.png`.
 Coordinates and CD are in the training-normalized domain (mean/std in JSON).

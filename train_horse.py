@@ -1,12 +1,10 @@
 import math
-import sys
 
 import torch
 from skimage.data import horse
 from torch import nn
 
-from experiment import read_config
-from train import train_model
+from train import read_training_config, train_model, training_arguments
 
 
 class HorsePointSetTransformer(nn.Module):
@@ -89,8 +87,8 @@ def sample_horse(
     return torch.stack([x, y], dim=-1)
 
 
-def main(config_path: str = "horse_experiments/horse_independent_n256_seed0.yaml"):
-    config = read_config(config_path)
+def main(config_path: str = "horse_experiments/horse_independent_n256_seed0.yaml", *, seed=None, steps=None):
+    config = read_training_config(config_path, seed=seed, steps=steps)
     torch.manual_seed(config["seed"])
     device, dtype = torch.device(config["device"]), getattr(torch, config["dtype"])
     data = config["data"]
@@ -103,4 +101,4 @@ def main(config_path: str = "horse_experiments/horse_independent_n256_seed0.yaml
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    main(**training_arguments("horse_experiments/horse_independent_n256_seed0.yaml"))

@@ -2,8 +2,10 @@ import argparse
 import hashlib
 from pathlib import Path
 
+import numpy as np
 import torch
 
+from experiment import evaluation_title
 from summarize_results import output_directory, save_json, save_table, statistics, formatted, plt
 
 
@@ -59,7 +61,7 @@ def render(payload, path, directory):
     axes[1, 1].set_title("First cloud, first 24 particles (not target paths)")
     axes[1, 1].legend()
     config = payload["config"]
-    title = f"{payload['dataset']} | {config['coupling']} | K={config.get('num_regions', 'na')} | N={config['data']['n_points']} | seed={config['seed']}"
+    title = f"{payload['dataset']} | {evaluation_title(config)}"
     fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(directory / "diagnostics.png", dpi=170)
@@ -71,23 +73,29 @@ def render(payload, path, directory):
     save_table(directory / "table.png", ["Diagnostic", "Mean ± cloud SD"], table, title)
 
 
-def diagnose(config_path, dataset, *, batches=8, batch_size=16, seed=2026, reference_nfe=128,
+def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, reference_nfe=128,
              output="analysis_results"):
-    from coupling import coupling_permutation
+    from coupling import CLOUD_METHODS, coupled_points
     from data import checkerboard_centers, sample_checkerboard
     from experiment import environment, load_model
     from model import PointSetTransformer
     from train_horse import HorsePointSetTransformer, load_horse_mask, sample_horse
 
-    if min(batches, batch_size) < 1 or reference_nfe < max(NFES):
+    if batches < 1 or (batch_size is not None and batch_size < 1) or reference_nfe < max(NFES):
         raise ValueError("batches/batch_size must be positive; reference_nfe must be >=128")
     model_class = HorsePointSetTransformer if dataset == "horse" else PointSetTransformer
     model, config, checkpoint, metadata = load_model(config_path, model_class, dataset)
     if not metadata["training_config_verified"]:
         raise ValueError("Diagnostics require a verified checkpoint and its matching run config.yaml")
+    cloud_coupling = config["coupling"] in CLOUD_METHODS
+    if batch_size is None:
+        batch_size = config["data"]["batch_size"] if cloud_coupling else 16
+    if cloud_coupling and batch_size != config["data"]["batch_size"]:
+        raise ValueError("Cloud OT diagnostics require the training data.batch_size to preserve the coupling law")
     parameter = next(model.parameters())
     device, dtype = parameter.device, parameter.dtype
     torch.manual_seed(seed)  # reset AFTER model initialization; common draws across methods
+    np.random.seed(seed + 1)
     generator = torch.Generator(device=device).manual_seed(seed + 1)
     time_generator = torch.Generator(device=device).manual_seed(seed + 2)
     n = config["data"]["n_points"]
@@ -107,27 +115,25 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=16, seed=2026, refer
     for batch in range(batches):
         target = sample_target()
         noise = torch.randn_like(target)
-        permutation = coupling_permutation(noise, target, coupling=config["coupling"],
+        paired_noise, target = coupled_points(noise, target, coupling=config["coupling"],
             num_regions=config.get("num_regions"), target_centers=centers,
             sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
             sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator)
-        if permutation is not None:
-            target = target.gather(1, permutation.unsqueeze(-1).expand_as(target))
         for index, t in enumerate(TIMES):
-            error, baseline = fm_errors(model, noise, target, noise.new_full((batch_size, 1, 1), t))
+            error, baseline = fm_errors(model, paired_noise, target, noise.new_full((batch_size, 1, 1), t))
             errors[index].extend(error.tolist())
             if index == 0:
                 energy.extend(baseline.tolist())
         for index, (lo, hi) in enumerate(BINS):
             t = torch.rand(batch_size, 1, 1, device=device, dtype=dtype, generator=time_generator) * (hi - lo) + lo
-            error, _ = fm_errors(model, noise, target, t)
+            error, _ = fm_errors(model, paired_noise, target, t)
             bin_errors[index].extend(error.tolist())
         reference, ratio, path = rollout(model, noise, reference_nfe, keep_path=batch == 0)
         ratios.extend(ratio.tolist())
         if batch == 0:
             first_path = path.numpy()
-        refined, _, _ = rollout(model, noise, 2 * reference_nfe)
-        reference_errors.extend((reference - refined).square().mean((1, 2)).tolist())
+        doubled_reference, _, _ = rollout(model, noise, 2 * reference_nfe)
+        reference_errors.extend((reference - doubled_reference).square().mean((1, 2)).tolist())
         for nfe in NFES:
             prediction = reference if nfe == reference_nfe else rollout(model, noise, nfe)[0]
             endpoint_errors[nfe].extend((prediction - reference).square().mean((1, 2)).tolist())
@@ -174,7 +180,8 @@ if __name__ == "__main__":
     parser.add_argument("config", help="Saved runs/.../config.yaml")
     parser.add_argument("--dataset", required=True, choices=["checkerboard", "horse"])
     parser.add_argument("--batches", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Default: training batch size for cloud OT, otherwise 16")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--reference-nfe", type=int, default=128)
     parser.add_argument("--output", default="analysis_results")

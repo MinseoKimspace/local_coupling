@@ -1,7 +1,8 @@
-seed: 2
+seed: 0
 device: cuda
 dtype: float32
-coupling: independent
+coupling: target_guided
+num_regions: 4
 
 data:
   batch_size: 64
@@ -24,4 +25,4 @@ training:
 evaluation:
   batch_size: 64
 
-checkpoint: horse_independent_n256_seed2.pt
+checkpoint: horse_target_guided_k4_n256_seed0.pt

@@ -1,10 +1,11 @@
-import sys
+import argparse
 from time import perf_counter
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
-from coupling import coupling_permutation
+from coupling import coupled_points
 from data import checkerboard_centers, sample_checkerboard
 from experiment import read_config, save_training, synchronize
 from model import PointSetTransformer
@@ -27,13 +28,11 @@ def flow_matching_loss(model, x_data, x_noise, t):
 def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, target_centers=None,
                                sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None):
     x_noise = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype)
-    permutation = coupling_permutation(
+    x_noise, x_data = coupled_points(
         x_noise, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
         sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iterations=sinkhorn_iterations,
         generator=coupling_generator,
     )
-    if permutation is not None:
-        x_data = x_data.gather(1, permutation.unsqueeze(-1).expand(-1, -1, x_data.shape[-1]))
     t = sample_time(x_data.shape[0], device=x_data.device, dtype=x_data.dtype)
     return flow_matching_loss(model, x_data, x_noise, t)
 
@@ -59,6 +58,7 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
     optimizer = torch.optim.AdamW(model.parameters(), lr=training["learning_rate"],
                                  weight_decay=training["weight_decay"])
     generator = torch.Generator(device=device).manual_seed(config["seed"] + 1)
+    np.random.seed(config["seed"] + 1)  # Original upstream OT samplers use NumPy.
     model.train()
     synchronize(device)
     start = perf_counter()
@@ -78,8 +78,27 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
     return save_training(model, config, dataset, config_path, seconds, loss.item())
 
 
-def main(config_path="checkerboard_experiments/independent.yaml"):
+def read_training_config(config_path, *, seed=None, steps=None):
     config = read_config(config_path)
+    if seed is not None:
+        config["seed"] = seed
+    if steps is not None:
+        if steps < 1:
+            raise ValueError("steps must be positive")
+        config["training"]["num_steps"] = steps
+    return config
+
+
+def training_arguments(default_config):
+    parser = argparse.ArgumentParser(description="Train with the configured coupling and unchanged FM.")
+    parser.add_argument("config_path", nargs="?", default=default_config)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--steps", type=int, default=None, help="Override update count; saved in the run config")
+    return vars(parser.parse_args())
+
+
+def main(config_path="checkerboard_experiments/independent.yaml", *, seed=None, steps=None):
+    config = read_training_config(config_path, seed=seed, steps=steps)
     torch.manual_seed(config["seed"])
     device, dtype = torch.device(config["device"]), getattr(torch, config["dtype"])
     data = config["data"]
@@ -93,4 +112,4 @@ def main(config_path="checkerboard_experiments/independent.yaml"):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    main(**training_arguments("checkerboard_experiments/independent.yaml"))

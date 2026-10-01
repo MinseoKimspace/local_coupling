@@ -1,3 +1,5 @@
+import hashlib
+from pathlib import Path
 import warnings
 
 import numpy as np
@@ -7,6 +9,7 @@ import torch.nn.functional as F
 
 # Flamary et al., JMLR 22(78), 2021: https://jmlr.org/papers/v22/20-451.html
 ALIASES = {"global_hungarian": "global_ot", "geometry_aware_hungarian": "geometry_aware_ot"}
+CLOUD_METHODS = {"minibatch_ot", "equivariant_ot_permutation"}
 
 METHODS = {
     "independent": ("none", "none", "none"),
@@ -27,7 +30,7 @@ METHODS = {
 
 def canonical_method(name: str) -> str:
     name = ALIASES.get(name, name)
-    if name not in METHODS:
+    if name not in METHODS and name not in CLOUD_METHODS:
         raise ValueError(f"Unknown coupling: {name}")
     return name
 
@@ -42,6 +45,27 @@ def balanced_partition_solver(method):
 
 def coupling_info(name: str) -> dict:
     name = canonical_method(name)
+    if name in CLOUD_METHODS:
+        equivariant = name == "equivariant_ot_permutation"
+        vendor = ("equivariant_flow_matching/coupling.py" if equivariant
+                  else "torchcfm/optimal_transport.py")
+        return {
+            "method": name,
+            "implementation": "efm_permutation_adapter_v1" if equivariant else "torchcfm_vendored_v1",
+            "target_partition": "none", "source_assignment": "cloud_minibatch_ot",
+            "local_pairing": "exact_permutation" if equivariant else "identity",
+            "cost": "minimum_permutation_squared_euclidean" if equivariant else "squared_euclidean_flat_cloud",
+            "exact_solver": "POT/network_simplex",
+            "point_solver": "SciPy/linear_sum_assignment" if equivariant else None,
+            "matching_batch_size": "training data.batch_size",
+            "plan_sampling": "with_replacement", "plan_rng": "numpy.random; training seed + 1",
+            "target_rotation": False, "target_centering": False,
+            "upstream_revision": ("supplementary DW4 notebook cell 10" if equivariant
+                                  else "7c653857de4c25b979a740ef8b6a5d5ddb09b6c1"),
+            "upstream_archive_sha256": ("21be6d364baa77f2d3f86c8bd337d1971ff1c1a579f1822d6204800742ca83d6"
+                                        if equivariant else None),
+            "vendor_sha256": hashlib.sha256((Path(__file__).parent / "third_party" / vendor).read_bytes()).hexdigest(),
+        }
     partition, assignment, local = METHODS[name]
     target_solver = balanced_partition_solver(name) if partition == "balanced" else None
     exact = (assignment in ("exact", "exact_batched", "global", "regional") or local == "exact"
@@ -211,6 +235,8 @@ def pair_within_regions(source, target, source_labels, target_labels, k, *, loca
 def coupling_permutation(source, target, *, coupling, num_regions=None, target_centers=None,
                          sinkhorn_epsilon=0.1, sinkhorn_iterations=100, generator=None):
     method = canonical_method(coupling)
+    if method in CLOUD_METHODS:
+        raise ValueError(f"{method} reassigns clouds; use coupled_points to obtain both paired tensors")
     partition, assignment, local = METHODS[method]
     if source.ndim != 3 or source.shape != target.shape:
         raise ValueError("Source and target must have the same [B, N, D] shape")
@@ -251,3 +277,23 @@ def coupling_permutation(source, target, *, coupling, num_regions=None, target_c
         source_labels = assign_regions(source, centers, capacities, solver=assignment, **options)
     return pair_within_regions(source, target, source_labels, target_labels, k,
                                local=local, generator=generator)
+
+
+@torch.no_grad()
+def coupled_points(source, target, *, coupling, **options):
+    """Pair [B, N, D] tensors, allowing cloud resampling as well as point permutations."""
+    method = canonical_method(coupling)
+    if source.ndim != 3 or source.shape != target.shape or min(source.shape) < 1:
+        raise ValueError("Source and target must have the same nonempty [B, N, D] shape")
+    if source.device != target.device or source.dtype != target.dtype:
+        raise ValueError("Source and target must share device and dtype")
+    if method == "minibatch_ot":
+        from third_party.torchcfm.optimal_transport import OTPlanSampler
+        return OTPlanSampler(method="exact").sample_plan(source, target, replace=True)
+    if method == "equivariant_ot_permutation":
+        from third_party.equivariant_flow_matching.coupling import sample_permutation_plan
+        return sample_permutation_plan(source, target)
+    permutation = coupling_permutation(source, target, coupling=method, **options)
+    if permutation is not None:
+        target = target.gather(1, permutation.unsqueeze(-1).expand_as(target))
+    return source, target
