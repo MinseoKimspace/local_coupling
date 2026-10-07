@@ -75,7 +75,7 @@ def render(payload, path, directory):
 
 def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, reference_nfe=128,
              output="analysis_results"):
-    from coupling import CLOUD_METHODS, coupled_points
+    from coupling import CLOUD_METHODS, TG_CACHED_METHODS, coupled_points
     from data import checkerboard_centers, sample_checkerboard
     from experiment import environment, load_model
     from model import PointSetTransformer
@@ -103,6 +103,9 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
     if config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, dataset, device, dtype)
+    elif config["coupling"] in TG_CACHED_METHODS:
+        from tg_cache import TGCachedPairSampler
+        pair_sampler = TGCachedPairSampler(config, dataset, device, dtype)
     centers = None
     if dataset == "horse":
         mask = load_horse_mask(device, dtype)
@@ -159,7 +162,7 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
         "diagnostic_seed": seed, "batches": batches, "batch_size": batch_size,
         "reference_nfe": reference_nfe, "reference_check_nfe": 2 * reference_nfe,
         "definitions": {
-            "fm_sampling_scope": ("fresh draws/noise from fixed training cache; NOT unseen target pool"
+            "fm_sampling_scope": ("fresh pairing draws from fixed training cache; NOT unseen source/target pool"
                                   if pair_sampler is not None else "fresh source and target clouds"),
             "mse": "mean squared error over points and coordinates per cloud; then mean across fresh clouds",
             "fm": "held-out interpolation velocity residual against this checkpoint's own coupling; NOT conditional variance or training-history loss",

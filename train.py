@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from coupling import coupled_points
+from coupling import OFFLINE_METHODS, TG_CACHED_METHODS, coupled_points
 from data import checkerboard_centers, sample_checkerboard
 from experiment import read_config, save_training, synchronize
 from model import PointSetTransformer
@@ -36,9 +36,9 @@ def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, tar
             generator=coupling_generator,
         )
     else:
-        if coupling != "nsot" or paired_noise.shape != x_data.shape \
+        if coupling not in OFFLINE_METHODS or paired_noise.shape != x_data.shape \
                 or paired_noise.device != x_data.device or paired_noise.dtype != x_data.dtype:
-            raise ValueError("Precomputed noise requires matching NSOT [B,N,D] tensors")
+            raise ValueError("Precomputed noise requires an offline coupling and matching [B,N,D] tensors")
         x_noise = paired_noise
     t = sample_time(x_data.shape[0], device=x_data.device, dtype=x_data.dtype)
     return flow_matching_loss(model, x_data, x_noise, t)
@@ -72,25 +72,38 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
         pair_sampler = NSOTPairSampler(config, dataset, device, next(model.parameters()).dtype)
         config["nsot"]["cache_sha256"] = pair_sampler.cache_sha256
         print(f"nsot_cache_sha256={pair_sampler.cache_sha256} beta={pair_sampler.beta}", flush=True)
+    elif config["coupling"] in TG_CACHED_METHODS:
+        from tg_cache import TGCachedPairSampler
+        pair_sampler = TGCachedPairSampler(config, dataset, device, next(model.parameters()).dtype, training=True)
+        config["tg_cache"]["cache_sha256"] = pair_sampler.cache_sha256
+        print(f"tg_cache_sha256={pair_sampler.cache_sha256} "
+              f"sampling={pair_sampler.metadata['sampling']} clouds={pair_sampler.metadata['num_clouds']}", flush=True)
     model.train()
     synchronize(device)
     start = perf_counter()
-    for step in range(1, training["num_steps"] + 1):
-        log_step = step == 1 or step % training["log_every"] == 0
-        paired_noise = None
-        if pair_sampler is None:
-            target = sample_batch()
-        else:
-            paired_noise, target = pair_sampler.sample(config["data"]["batch_size"], generator=generator)
-        loss = train_step(
-            model, optimizer, target, coupling=config["coupling"],
-            num_regions=config.get("num_regions"), target_centers=target_centers,
-            sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
-            sinkhorn_iterations=config.get("sinkhorn_iterations", 100), coupling_generator=generator,
-            paired_noise=paired_noise,
-        )
-        if log_step:
-            print(f"step={step} loss={loss.item():.6f}")
+    try:
+        for step in range(1, training["num_steps"] + 1):
+            log_step = step == 1 or step % training["log_every"] == 0
+            paired_noise = None
+            if pair_sampler is None:
+                target = sample_batch()
+            else:
+                paired_noise, target = pair_sampler.sample(config["data"]["batch_size"], generator=generator)
+            loss = train_step(
+                model, optimizer, target, coupling=config["coupling"],
+                num_regions=config.get("num_regions"), target_centers=target_centers,
+                sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
+                sinkhorn_iterations=config.get("sinkhorn_iterations", 100), coupling_generator=generator,
+                paired_noise=paired_noise,
+            )
+            if log_step:
+                value = loss.item()
+                timing = (f" seconds/update={(perf_counter() - start) / step:.4f}"
+                          if config["coupling"] in TG_CACHED_METHODS else "")
+                print(f"step={step} loss={value:.6f}{timing}")
+    finally:
+        if config["coupling"] in TG_CACHED_METHODS and pair_sampler is not None:
+            pair_sampler.close()
     synchronize(device)
     seconds = perf_counter() - start
     print(f"training_seconds={seconds:.3f}")

@@ -11,7 +11,7 @@ from time import perf_counter
 import numpy as np
 import torch
 
-from coupling import CLOUD_METHODS, coupled_points
+from coupling import CLOUD_METHODS, TG_CACHED_METHODS, coupled_points
 from data import checkerboard_centers
 from diagnose import BINS, NFES, TIMES, fm_errors, rollout
 from diagnostic_data import (DiagnosticData, diagnostic_metadata, finite_scores,
@@ -120,6 +120,9 @@ def fm_summary(model, config, data, batches, batch_size, seed):
     if config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, data.dataset, parameter.device, parameter.dtype)
+    elif config["coupling"] in TG_CACHED_METHODS:
+        from tg_cache import TGCachedPairSampler
+        pair_sampler = TGCachedPairSampler(config, data.dataset, parameter.device, parameter.dtype)
     centers = (checkerboard_centers(config["data"]["grid_size"], parameter.device, parameter.dtype)
                if data.dataset == "checkerboard" else None)
     errors, bins, energy = [[] for _ in TIMES], [[] for _ in BINS], []
@@ -154,7 +157,7 @@ def fm_summary(model, config, data, batches, batch_size, seed):
     if not np.isfinite(energy + sum(errors, []) + sum(bins, [])).all():
         raise FloatingPointError("Nonfinite held-out FM diagnostics")
     return {"batches": batches, "matching_batch_size": batch_size,
-            "sampling_scope": ("fresh draws/noise from checkpoint's fixed training cache; NOT unseen target pool"
+            "sampling_scope": ("fresh pairing draws from checkpoint's fixed training cache; NOT unseen source/target pool"
                                if pair_sampler is not None else "fresh source and target clouds"),
             "time_errors": [{"t": t, "mse": statistics(v)} for t, v in zip(TIMES, errors)],
             "time_bins": [{"interval": limits, "mse": statistics(v)} for limits, v in zip(BINS, bins)],
