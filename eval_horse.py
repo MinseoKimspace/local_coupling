@@ -1,4 +1,4 @@
-import sys
+import argparse
 
 import matplotlib
 matplotlib.use("Agg")
@@ -11,6 +11,7 @@ import torch
 from experiment import (evaluation_settings, evaluation_title, load_model,
                         sample_for_evaluation, save_evaluation)
 from metrics import chamfer_distance, horse_metrics
+from horse_regions import HorseRegions
 from train_horse import HorsePointSetTransformer, load_horse_mask, sample_horse
 
 
@@ -57,7 +58,7 @@ def render_comparison(
     plt.close(figure)
 
 
-def main(config_path="horse_experiments/horse_independent_n256_seed0.yaml", num_steps=100):
+def main(config_path="horse_experiments/horse_independent_n256_seed0.yaml", num_steps=100, *, roi_file=None):
     steps = int(num_steps)
     if steps < 1:
         raise ValueError("num_steps must be positive")
@@ -69,11 +70,23 @@ def main(config_path="horse_experiments/horse_independent_n256_seed0.yaml", num_
     target = sample_horse(mask, settings["batch_size"], data["n_points"])
     leakage, js = horse_metrics(prediction, mask, settings["histogram_bins"])
     scores = {"chamfer": chamfer_distance(prediction, target).item(), "leakage": leakage, "histogram_js": js}
-    output = save_evaluation(config_path, config, checkpoint, metadata, "horse", steps, seconds, scores)
+    regions = HorseRegions(mask, roi_file)
+    scores.update(regions.score(prediction))
+    roi_definition = regions.definition()
+    output = save_evaluation(config_path, config, checkpoint, metadata, "horse", steps, seconds, scores,
+                             metric_metadata={"horse_roi_definition": roi_definition})
+    roi_image = output.parent / f"horse_rois_{regions.file_hash[:8]}_{roi_definition['mask_sha256'][:8]}.png"
+    if not roi_image.exists():
+        regions.render(roi_image)
     render_comparison(target.cpu(), prediction.cpu(), f"{evaluation_title(config)}\nNFE: {steps} (Euler)", output)
     print(f"saved={output}")
     return output
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    parser = argparse.ArgumentParser(description="Horse generation evaluation including fixed thin/gap ROIs.")
+    parser.add_argument("config", nargs="?", default="horse_experiments/horse_independent_n256_seed0.yaml")
+    parser.add_argument("num_steps", nargs="?", type=int, default=100)
+    parser.add_argument("--roi-file", default=None, help="Same prespecified ROI JSON for all compared methods")
+    args = parser.parse_args()
+    main(args.config, args.num_steps, roi_file=args.roi_file)

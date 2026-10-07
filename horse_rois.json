@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "description": "Fixed normalized-coordinate crops for the project's unrotated skimage horse silhouette. Foreground crops intersect the exact horse mask; gap crops count only background. Not anatomical segmentation labels.",
+  "regions": [
+    {"name": "rear_leg", "kind": "foreground", "box": [-0.82, -0.61, -0.80, -0.30]},
+    {"name": "rear_inner_leg", "kind": "foreground", "box": [-0.55, -0.28, -0.80, -0.30]},
+    {"name": "front_legs", "kind": "foreground", "box": [0.18, 0.55, -0.80, -0.25]},
+    {"name": "tail_side", "kind": "foreground", "box": [-0.99, -0.78, -0.36, 0.38]},
+    {"name": "between_legs", "kind": "background", "box": [-0.25, 0.27, -0.70, -0.16]},
+    {"name": "rear_leg_gap", "kind": "background", "box": [-0.61, -0.54, -0.70, -0.32]}
+  ]
+}

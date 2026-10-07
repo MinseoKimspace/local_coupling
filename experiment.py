@@ -130,7 +130,8 @@ def sample_for_evaluation(model, config, steps):
     return noise, prediction, perf_counter() - start
 
 
-def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, seconds, scores, *, render=True):
+def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, seconds, scores, *,
+                    render=True, metric_metadata=None):
     now = datetime.now(timezone.utc)
     settings = evaluation_settings(config)
     checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
@@ -154,6 +155,7 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
                                "leakage": "invalid points / all pooled points",
                                "cell_mass_error": "TV over valid checkerboard cells, conditioned on valid points",
                                "histogram_js": "pooled JS divergence in nats, with an outside bin"},
+        "metric_metadata": metric_metadata,
         "image": str(image_path.resolve()) if render else None,
         **scores,
     }

@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 
 METRICS = ("chamfer", "leakage", "cell_mass_error", "histogram_js",
-           "inference_seconds", "training_seconds")
+           "inference_seconds", "training_seconds", "thin_region_mass_mae", "gap_region_leakage")
 
 
 def statistics(values):
@@ -59,7 +59,7 @@ def signature(record):
     return {"dataset": record["dataset"], "config": config,
             **{k: record.get(k) for k in (
                 "coupling_details", "evaluation_seed", "evaluation_batch_size", "histogram_bins",
-                "metric_definitions", "training_environment", "evaluation_environment")}}
+                "metric_definitions", "metric_metadata", "training_environment", "evaluation_environment")}}
 
 
 def collect_results(root, seeds):
@@ -125,7 +125,7 @@ def render_groups(groups, directory):
         prefix = hashlib.sha256(key.encode()).hexdigest()[:10]
         spec = members[0]["signature"]
         title = f"{spec['dataset']} | N={spec['config']['data']['n_points']} | training-seed mean ± sample SD"
-        fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+        fig, axes = plt.subplots(math.ceil(len(METRICS) / 3), 3, figsize=(14, 11))
         table_rows = []
         for group in members:
             config = group["signature"]["config"]

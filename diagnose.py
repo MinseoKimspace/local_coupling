@@ -185,6 +185,18 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--reference-nfe", type=int, default=128)
     parser.add_argument("--output", default="analysis_results")
+    parser.add_argument("--quality", action="store_true",
+                        help="Joint common-bank quality, refined reference, and horse ROI diagnostics")
+    from audit_generation import arguments as quality_arguments
+    quality_arguments(parser)
     args = parser.parse_args()
-    diagnose(args.config, args.dataset, batches=args.batches, batch_size=args.batch_size,
-             seed=args.seed, reference_nfe=args.reference_nfe, output=args.output)
+    if args.quality:
+        from audit_generation import audit
+        audit(args.config, args.dataset, clouds=args.clouds, batch_size=args.eval_batch_size,
+              nfes=args.nfes, reference_nfe=args.reference_nfe, max_reference_nfe=args.max_reference_nfe,
+              endpoint_tolerance=args.endpoint_tolerance, quality_tolerance=args.quality_tolerance,
+              fm_batches=0 if args.skip_fm else args.batches, matching_batch_size=args.batch_size,
+              seed=args.seed, roi_file=args.roi_file, output=args.output)
+    else:
+        diagnose(args.config, args.dataset, batches=args.batches, batch_size=args.batch_size,
+                 seed=args.seed, reference_nfe=args.reference_nfe, output=args.output)
