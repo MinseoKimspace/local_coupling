@@ -26,23 +26,30 @@ def flow_matching_loss(model, x_data, x_noise, t):
 
 
 def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, target_centers=None,
-                               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None):
-    x_noise = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype)
-    x_noise, x_data = coupled_points(
-        x_noise, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
-        sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iterations=sinkhorn_iterations,
-        generator=coupling_generator,
-    )
+                               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None,
+                               paired_noise=None):
+    if paired_noise is None:
+        x_noise = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype)
+        x_noise, x_data = coupled_points(
+            x_noise, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
+            sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iterations=sinkhorn_iterations,
+            generator=coupling_generator,
+        )
+    else:
+        if coupling != "nsot" or paired_noise.shape != x_data.shape \
+                or paired_noise.device != x_data.device or paired_noise.dtype != x_data.dtype:
+            raise ValueError("Precomputed noise requires matching NSOT [B,N,D] tensors")
+        x_noise = paired_noise
     t = sample_time(x_data.shape[0], device=x_data.device, dtype=x_data.dtype)
     return flow_matching_loss(model, x_data, x_noise, t)
 
 
 def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_centers=None,
-               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None):
+               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None, paired_noise=None):
     loss = coupled_flow_matching_loss(
         model, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
         sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iterations=sinkhorn_iterations,
-        coupling_generator=coupling_generator,
+        coupling_generator=coupling_generator, paired_noise=paired_noise,
     )
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -59,23 +66,36 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
                                  weight_decay=training["weight_decay"])
     generator = torch.Generator(device=device).manual_seed(config["seed"] + 1)
     np.random.seed(config["seed"] + 1)  # Original upstream OT samplers use NumPy.
+    pair_sampler = None
+    if config["coupling"] == "nsot":
+        from nsot import NSOTPairSampler
+        pair_sampler = NSOTPairSampler(config, dataset, device, next(model.parameters()).dtype)
+        config["nsot"]["cache_sha256"] = pair_sampler.cache_sha256
+        print(f"nsot_cache_sha256={pair_sampler.cache_sha256} beta={pair_sampler.beta}", flush=True)
     model.train()
     synchronize(device)
     start = perf_counter()
     for step in range(1, training["num_steps"] + 1):
         log_step = step == 1 or step % training["log_every"] == 0
+        paired_noise = None
+        if pair_sampler is None:
+            target = sample_batch()
+        else:
+            paired_noise, target = pair_sampler.sample(config["data"]["batch_size"], generator=generator)
         loss = train_step(
-            model, optimizer, sample_batch(), coupling=config["coupling"],
+            model, optimizer, target, coupling=config["coupling"],
             num_regions=config.get("num_regions"), target_centers=target_centers,
             sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
             sinkhorn_iterations=config.get("sinkhorn_iterations", 100), coupling_generator=generator,
+            paired_noise=paired_noise,
         )
         if log_step:
             print(f"step={step} loss={loss.item():.6f}")
     synchronize(device)
     seconds = perf_counter() - start
     print(f"training_seconds={seconds:.3f}")
-    return save_training(model, config, dataset, config_path, seconds, loss.item())
+    return save_training(model, config, dataset, config_path, seconds, loss.item(),
+                         coupling_metadata=pair_sampler.details() if pair_sampler is not None else None)
 
 
 def read_training_config(config_path, *, seed=None, steps=None):

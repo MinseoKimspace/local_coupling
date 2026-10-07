@@ -99,6 +99,10 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
     generator = torch.Generator(device=device).manual_seed(seed + 1)
     time_generator = torch.Generator(device=device).manual_seed(seed + 2)
     n = config["data"]["n_points"]
+    pair_sampler = None
+    if config["coupling"] == "nsot":
+        from nsot import NSOTPairSampler
+        pair_sampler = NSOTPairSampler(config, dataset, device, dtype)
     centers = None
     if dataset == "horse":
         mask = load_horse_mask(device, dtype)
@@ -115,10 +119,13 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
     for batch in range(batches):
         target = sample_target()
         noise = torch.randn_like(target)
-        paired_noise, target = coupled_points(noise, target, coupling=config["coupling"],
-            num_regions=config.get("num_regions"), target_centers=centers,
-            sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
-            sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator)
+        if pair_sampler is None:
+            paired_noise, target = coupled_points(noise, target, coupling=config["coupling"],
+                num_regions=config.get("num_regions"), target_centers=centers,
+                sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
+                sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator)
+        else:
+            paired_noise, target = pair_sampler.sample(batch_size, generator=generator)
         for index, t in enumerate(TIMES):
             error, baseline = fm_errors(model, paired_noise, target, noise.new_full((batch_size, 1, 1), t))
             errors[index].extend(error.tolist())
@@ -152,6 +159,8 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
         "diagnostic_seed": seed, "batches": batches, "batch_size": batch_size,
         "reference_nfe": reference_nfe, "reference_check_nfe": 2 * reference_nfe,
         "definitions": {
+            "fm_sampling_scope": ("fresh draws/noise from fixed training cache; NOT unseen target pool"
+                                  if pair_sampler is not None else "fresh source and target clouds"),
             "mse": "mean squared error over points and coordinates per cloud; then mean across fresh clouds",
             "fm": "held-out interpolation velocity residual against this checkpoint's own coupling; NOT conditional variance or training-history loss",
             "std": "sample SD across diagnostic clouds, NOT across training seeds or confidence interval",

@@ -116,6 +116,10 @@ def fm_summary(model, config, data, batches, batch_size, seed):
     parameter = next(model.parameters())
     generator = torch.Generator(device=parameter.device).manual_seed(seed + 1)
     time_generator = torch.Generator(device=parameter.device).manual_seed(seed + 2)
+    pair_sampler = None
+    if config["coupling"] == "nsot":
+        from nsot import NSOTPairSampler
+        pair_sampler = NSOTPairSampler(config, data.dataset, parameter.device, parameter.dtype)
     centers = (checkerboard_centers(config["data"]["grid_size"], parameter.device, parameter.dtype)
                if data.dataset == "checkerboard" else None)
     errors, bins, energy = [[] for _ in TIMES], [[] for _ in BINS], []
@@ -126,10 +130,13 @@ def fm_summary(model, config, data, batches, batch_size, seed):
             indices = range(batch * batch_size, (batch + 1) * batch_size)
             source = torch.stack([data.source(i, "fm") for i in indices])
             target = torch.stack([data.target(i, "fm") for i in indices])
-            paired_source, paired_target = coupled_points(
-                source, target, coupling=config["coupling"], num_regions=config.get("num_regions"),
-                target_centers=centers, sinkhorn_epsilon=config.get("sinkhorn_epsilon", .1),
-                sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator)
+            if pair_sampler is None:
+                paired_source, paired_target = coupled_points(
+                    source, target, coupling=config["coupling"], num_regions=config.get("num_regions"),
+                    target_centers=centers, sinkhorn_epsilon=config.get("sinkhorn_epsilon", .1),
+                    sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator)
+            else:
+                paired_source, paired_target = pair_sampler.sample(batch_size, generator=generator)
             for j, t in enumerate(TIMES):
                 residual, baseline = fm_errors(model, paired_source, paired_target,
                                                source.new_full((batch_size, 1, 1), t))
@@ -147,6 +154,8 @@ def fm_summary(model, config, data, batches, batch_size, seed):
     if not np.isfinite(energy + sum(errors, []) + sum(bins, [])).all():
         raise FloatingPointError("Nonfinite held-out FM diagnostics")
     return {"batches": batches, "matching_batch_size": batch_size,
+            "sampling_scope": ("fresh draws/noise from checkpoint's fixed training cache; NOT unseen target pool"
+                               if pair_sampler is not None else "fresh source and target clouds"),
             "time_errors": [{"t": t, "mse": statistics(v)} for t, v in zip(TIMES, errors)],
             "time_bins": [{"interval": limits, "mse": statistics(v)} for limits, v in zip(BINS, bins)],
             "target_velocity_energy": statistics(energy),

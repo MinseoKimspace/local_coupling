@@ -1,0 +1,38 @@
+# Paper-based 2D NSOT exact-superset setting, NOT author code/main 100K results.
+# Model/training/evaluation are identical to minibatch_ot.yaml.
+# Finite cached targets replace online fresh targets; report this adaptation.
+seed: 0
+device: cuda
+dtype: float32
+coupling: nsot
+
+nsot:
+  cache: coupling_cache/nsot/checkerboard_m10000_seed0.npz
+  superset_size: 10000
+  cache_seed: 0
+  beta: 0.2
+  solver: scipy_linear_sum_assignment
+
+data:
+  batch_size: 64
+  n_points: 256
+  grid_size: 4
+
+model:
+  point_dim: 2
+  d_model: 128
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 256
+  dropout: 0.0
+
+training:
+  num_steps: 10000
+  learning_rate: 0.001
+  weight_decay: 0.01
+  log_every: 100
+
+evaluation:
+  batch_size: 64
+
+checkpoint: nsot.pt

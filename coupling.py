@@ -10,6 +10,7 @@ import torch.nn.functional as F
 # Flamary et al., JMLR 22(78), 2021: https://jmlr.org/papers/v22/20-451.html
 ALIASES = {"global_hungarian": "global_ot", "geometry_aware_hungarian": "geometry_aware_ot"}
 CLOUD_METHODS = {"minibatch_ot", "equivariant_ot_permutation"}
+OFFLINE_METHODS = {"nsot"}
 
 METHODS = {
     "independent": ("none", "none", "none"),
@@ -30,7 +31,7 @@ METHODS = {
 
 def canonical_method(name: str) -> str:
     name = ALIASES.get(name, name)
-    if name not in METHODS and name not in CLOUD_METHODS:
+    if name not in METHODS and name not in CLOUD_METHODS and name not in OFFLINE_METHODS:
         raise ValueError(f"Unknown coupling: {name}")
     return name
 
@@ -45,6 +46,19 @@ def balanced_partition_solver(method):
 
 def coupling_info(name: str) -> dict:
     name = canonical_method(name)
+    if name == "nsot":
+        return {
+            "method": name, "implementation": "paper_based_2d_exact_superset_v1",
+            "paper": "https://arxiv.org/abs/2502.12456",
+            "author_code": False, "target_partition": "none",
+            "source_assignment": "offline_superset_ot", "local_pairing": "cached_exact_bijection",
+            "cost": "squared_euclidean", "exact_solver": "SciPy/linear_sum_assignment",
+            "plan_sampling": "iid_with_replacement_cached_pairs", "target_rotation": False,
+            "target_centering": False, "hybrid": "sqrt(1-beta)*cached_source + sqrt(beta)*fresh_gaussian",
+            "inference_source": "fresh_iid_standard_gaussian_no_cache",
+            "marginals": "finite empirical supersets; approximate population marginals",
+            "paper_variant": "M<=10000 exact OT, NOT the main 100K gradient-flow experiment",
+        }
     if name in CLOUD_METHODS:
         equivariant = name == "equivariant_ot_permutation"
         vendor = ("equivariant_flow_matching/coupling.py" if equivariant
@@ -235,6 +249,8 @@ def pair_within_regions(source, target, source_labels, target_labels, k, *, loca
 def coupling_permutation(source, target, *, coupling, num_regions=None, target_centers=None,
                          sinkhorn_epsilon=0.1, sinkhorn_iterations=100, generator=None):
     method = canonical_method(coupling)
+    if method in OFFLINE_METHODS:
+        raise ValueError("nsot samples precomputed pairs; use NSOTPairSampler, not a fresh-cloud permutation")
     if method in CLOUD_METHODS:
         raise ValueError(f"{method} reassigns clouds; use coupled_points to obtain both paired tensors")
     partition, assignment, local = METHODS[method]
@@ -283,6 +299,8 @@ def coupling_permutation(source, target, *, coupling, num_regions=None, target_c
 def coupled_points(source, target, *, coupling, **options):
     """Pair [B, N, D] tensors, allowing cloud resampling as well as point permutations."""
     method = canonical_method(coupling)
+    if method in OFFLINE_METHODS:
+        raise ValueError("nsot requires NSOTPairSampler and its offline superset cache")
     if source.ndim != 3 or source.shape != target.shape or min(source.shape) < 1:
         raise ValueError("Source and target must have the same nonempty [B, N, D] shape")
     if source.device != target.device or source.dtype != target.dtype:

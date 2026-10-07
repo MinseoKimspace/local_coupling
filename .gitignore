@@ -4,4 +4,5 @@ __pycache__/
 runs/psf3d/
 eval_results/psf3d/
 analysis_results/
+coupling_cache/
 data/ShapeNetCore.v2.PC15k/
