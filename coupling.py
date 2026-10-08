@@ -10,7 +10,7 @@ import torch.nn.functional as F
 # Flamary et al., JMLR 22(78), 2021: https://jmlr.org/papers/v22/20-451.html
 ALIASES = {"global_hungarian": "global_ot", "geometry_aware_hungarian": "geometry_aware_ot"}
 CLOUD_METHODS = {"minibatch_ot", "equivariant_ot_permutation"}
-TG_CACHED_METHODS = {"target_guided_cached", "target_guided_soft_cached"}
+TG_CACHED_METHODS = {"target_guided_cached"}
 OFFLINE_METHODS = {"nsot"} | TG_CACHED_METHODS
 
 METHODS = {
@@ -48,13 +48,11 @@ def balanced_partition_solver(method):
 def coupling_info(name: str) -> dict:
     name = canonical_method(name)
     if name in TG_CACHED_METHODS:
-        soft = name == "target_guided_soft_cached"
         return {"method": name, "implementation": "tg_offline_v1", "target_partition": "balanced",
-                "source_assignment": "entropic_ot_dependent_rounding" if soft else "exact",
+                "source_assignment": "exact",
                 "local_pairing": "fresh_uniform_random_bijection", "cost": "squared_euclidean",
                 "exact_solver": "POT/network_simplex", "target_partition_solver": "POT/network_simplex",
-                "sinkhorn_solver": "POT/sinkhorn_log_float64 + K-1 BFGS dual refinement if needed" if soft else None,
-                "rounding": "bipartite_cycle_dependent" if soft else None,
+                "sinkhorn_solver": None, "rounding": None,
                 "target_rotation": False, "target_centering": False,
                 "source_coordinates": "unchanged Gaussian draws; no jitter or whitening",
                 "inference_source": "fresh_iid_standard_gaussian_no_cache"}

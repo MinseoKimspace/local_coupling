@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from time import perf_counter
 import unittest
 from unittest.mock import patch
 
@@ -22,68 +21,12 @@ from experiment import load_model
 from model import PointSetTransformer
 import prepare_tg
 import tg_cache
-from tg_rounding import dependent_round, entropic_plan, feasible_plan, random_fine_permutation
+from tg_cache import random_fine_permutation
 import train
 import train_horse
 
 
-class RoundingTests(unittest.TestCase):
-    def test_counts_and_monte_carlo_marginals_not_greedy(self):
-        rng = np.random.default_rng(42)
-        plans = [(np.array([[.8, .2], [.2, .8]]), np.array([1, 1])),
-                 (np.full((6, 3), 1 / 3), np.array([2, 2, 2]))]
-        for plan, counts in plans:
-            accumulated = np.zeros_like(plan)
-            for _ in range(3000):
-                labels = dependent_round(plan, counts, rng)
-                np.testing.assert_array_equal(np.bincount(labels, minlength=len(counts)), counts)
-                accumulated += np.eye(len(counts))[labels]
-            np.testing.assert_allclose(accumulated / 3000, plan, atol=.03, rtol=0)
-
-    def test_extremes_zero_capacity_reproducibility_and_no_mutation(self):
-        plan = np.array([[1., 0, 0], [0, 0, 1], [1, 0, 0]])
-        original = plan.copy()
-        a = dependent_round(plan, [2, 0, 1], np.random.default_rng(0))
-        b = dependent_round(plan, [2, 0, 1], np.random.default_rng(0))
-        np.testing.assert_array_equal(a, [0, 2, 0])
-        np.testing.assert_array_equal(a, b)
-        np.testing.assert_array_equal(plan, original)
-        for bad in (np.full((2, 2), .2), np.array([[1., -.1], [0, 1.1]])):
-            with self.assertRaises(ValueError):
-                dependent_round(bad, [1, 1], np.random.default_rng(0))
-        with self.assertRaises(ValueError):
-            dependent_round(np.full((2, 2), .5), [.5, 1.5], np.random.default_rng(0))
-
-    def test_soft_cost_bias_and_temperature_extremes(self):
-        cost = np.array([[0., 3.], [3., 0.]])
-        small, before, after = entropic_plan(cost, [1, 1], epsilon=.1, iterations=3000)
-        large, _, _ = entropic_plan(cost, [1, 1], epsilon=1e6, iterations=3000)
-        self.assertGreater(small[0, 0], .999)
-        self.assertLess(after, 1e-8)
-        np.testing.assert_allclose(large, .5, atol=1e-6)
-        repaired, _, _ = feasible_plan(np.full((2, 2), .5) * (1 + 1e-8), [1, 1])
-        np.testing.assert_allclose(repaired.sum(0), 1, atol=1e-12)
-        with self.assertRaisesRegex(ValueError, "increase sinkhorn_iterations"):
-            feasible_plan(np.full((2, 2), .4), [1, 1])
-
-    def test_dual_refinement_recovers_small_epsilon_nonconvergence(self):
-        rng = np.random.default_rng(4)
-        cost = rng.random((16, 4)) * 20
-        plan, _, after = entropic_plan(cost, [4, 4, 4, 4], epsilon=.1, iterations=100)
-        np.testing.assert_allclose(plan.sum(0), 4, atol=1e-8)
-        np.testing.assert_allclose(plan.sum(1), 1, atol=1e-8)
-
-    def test_configured_size_counts_and_rounding_timing(self):
-        rng = np.random.default_rng(7)
-        source, centers = rng.normal(size=(256, 2)), rng.normal(size=(8, 2))
-        cost = ((source[:, None] - centers[None]) ** 2).sum(-1)
-        plan, _, _ = entropic_plan(cost, np.full(8, 32), epsilon=.1, iterations=3000)
-        tick = perf_counter()
-        for _ in range(3):
-            labels = dependent_round(plan, np.full(8, 32), rng)
-            np.testing.assert_array_equal(np.bincount(labels, minlength=8), np.full(8, 32))
-        print(f"tg_rounding_N256_K8_seconds_per_cloud={(perf_counter() - tick) / 3:.6f}")
-
+class FinePairingTests(unittest.TestCase):
     def test_fine_bijection_preserves_membership_and_varies(self):
         source, target = np.array([0, 1, 0, 1, 0, 1]), np.array([1, 1, 0, 0, 1, 0])
         rng, seen = np.random.default_rng(3), set()
@@ -122,34 +65,31 @@ class TGCacheTests(unittest.TestCase):
                   "checkpoint": f"{dataset}_{method}.pt"}
         if dataset == "checkerboard":
             result["data"]["grid_size"] = 4
-        if method == "target_guided_soft_cached":
-            result["tg_cache"].update(epsilon=.1, sinkhorn_iterations=3000)
         return result
 
     def prepare(self, config, dataset="checkerboard"):
         with contextlib.redirect_stdout(io.StringIO()):
             return tg_cache.prepare(config, dataset)
 
-    def test_hard_soft_share_endpoints_partition_and_rng_isolation(self):
-        hard, soft = self.config(), self.config("target_guided_soft_cached")
+    def test_hard_determinism_exact_assignment_and_rng_isolation(self):
+        hard = self.config()
+        repeated = copy.deepcopy(hard)
+        repeated["tg_cache"]["path"] += "_repeat"
         torch.manual_seed(93)
         state = torch.get_rng_state()
         h_path, h_meta = self.prepare(hard)
         torch.testing.assert_close(state, torch.get_rng_state(), rtol=0, atol=0)
-        s_path, s_meta = self.prepare(soft)
-        for name in ("source", "target", "target_labels", "capacities"):
-            self.assertEqual(h_meta["array_sha256"][name], s_meta["array_sha256"][name])
-        self.assertIn("plan", s_meta["array_sha256"])
+        _, repeated_meta = self.prepare(repeated)
+        self.assertEqual(h_meta["array_sha256"], repeated_meta["array_sha256"])
         source = torch.from_numpy(np.load(h_path / "source.npy"))
         target = torch.from_numpy(np.load(h_path / "target.npy"))
         _, labels, centers, capacities = coupling.balanced_target_partition(target, 2, solver="exact_batched")
         expected = coupling.assign_regions(source, centers, capacities, solver="exact_batched").numpy()
         np.testing.assert_array_equal(expected, np.load(h_path / "source_labels.npy"))
-        self.assertLess(s_meta["max_sinkhorn_residual_after_repair"], 1e-8)
 
-    def test_actual_n256_k8_geometry_and_sampler_moment_identity(self):
+    def test_actual_n256_k8_geometry_and_full_target_set(self):
         for dataset in ("checkerboard", "horse"):
-            config = self.config("target_guided_soft_cached", dataset)
+            config = self.config(dataset=dataset)
             config["num_regions"] = 8
             config["data"]["n_points"] = 256
             config["tg_cache"]["num_clouds"] = 32
@@ -157,28 +97,31 @@ class TGCacheTests(unittest.TestCase):
             sampler = tg_cache.TGCachedPairSampler(config, dataset, "cpu", torch.float32)
             try:
                 rng = np.random.default_rng(32)
+                original_source = np.load(path / "source.npy")
+                original_target = np.load(path / "target.npy")
                 for index in range(32):
                     source, target = sampler.dataset.draw(index, rng)
                     self.assertTrue(torch.isfinite(target).all())
-                    np.testing.assert_array_equal(source.numpy(), np.load(path / "source.npy", mmap_mode="r")[index])
+                    np.testing.assert_array_equal(source.numpy(), original_source[index])
+                    self.assertEqual(sorted(map(tuple, target.numpy())),
+                                     sorted(map(tuple, original_target[index])))
             finally:
                 sampler.close()
-        config = self.config("target_guided_soft_cached")
-        config["tg_cache"]["path"] = "moment_identity"
+
+    def test_legacy_hard_metadata_and_checkpoint_fingerprint_remain_supported(self):
+        config = self.config()
         path, meta = self.prepare(config)
+        meta.update(epsilon=None, sinkhorn_iterations=None, rounding_numeric_tolerance=1e-8,
+                    max_sinkhorn_residual_before_repair=0., max_sinkhorn_residual_after_repair=0.,
+                    offline_rounding_seconds=0.)
+        (path / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
+        config["tg_cache"]["cache_sha256"] = tg_cache._fingerprint(meta)
         sampler = tg_cache.TGCachedPairSampler(config, "checkerboard", "cpu", torch.float32)
-        target = np.load(path / "target.npy")[0].astype(float)
-        labels = np.load(path / "target_labels.npy")[0]
-        plan = np.load(path / "plan.npy")[0]
-        centers = np.stack([target[labels == k].mean(0) for k in range(2)])
-        mean = plan @ centers
-        within = ((target - centers[labels]) ** 2).mean()
-        between = (plan[:, :, None] * (centers[None] - mean[:, None]) ** 2).sum() / target.size
-        rng = np.random.default_rng(12)
-        endpoints = np.stack([sampler.dataset.draw(0, rng)[1].numpy() for _ in range(2000)])
-        np.testing.assert_allclose(endpoints.mean(0), mean, atol=.035, rtol=0)
-        self.assertAlmostEqual(endpoints.var(0).mean(), within + between, delta=.02)
-        sampler.close()
+        try:
+            self.assertEqual(sampler.details()["cache_sha256"], config["tg_cache"]["cache_sha256"])
+            self.assertEqual(sampler.sample(2)[0].shape, (2, 8, 2))
+        finally:
+            sampler.close()
 
     def test_cache_reuse_mismatch_integrity_and_incomplete_fail_loudly(self):
         config = self.config()
@@ -225,7 +168,7 @@ class TGCacheTests(unittest.TestCase):
             for left, right in zip(a, b):
                 torch.testing.assert_close(left, right, rtol=0, atol=0)
 
-    def test_stream_single_use_no_online_rounding_and_steps_guard(self):
+    def test_stream_single_use_no_online_ot_and_steps_guard(self):
         for method in tg_cache.METHODS:
             config = self.config(method, sampling="stream")
             config["tg_cache"]["num_clouds"] = None
@@ -234,7 +177,7 @@ class TGCacheTests(unittest.TestCase):
             self.assertNotIn("plan", meta["array_sha256"])
             sampler = tg_cache.TGCachedPairSampler(config, "checkerboard", "cpu", torch.float32, training=True)
             expected = torch.from_numpy(np.load(path / "source.npy"))
-            with patch.object(tg_cache, "dependent_round", side_effect=AssertionError("online rounding")):
+            with patch.object(tg_cache, "assign_regions", side_effect=AssertionError("online OT")):
                 first, _ = sampler.sample(2)
                 second, _ = sampler.sample(2)
             torch.testing.assert_close(torch.cat([first, second]), expected)
@@ -308,10 +251,9 @@ class TGCacheTests(unittest.TestCase):
                     self.assertEqual(result["coupling_details"], metadata["coupling_details"])
                     self.assertTrue(np.isfinite(result["chamfer"]))
 
-    def test_windows_spawn_workers_hard_soft_and_stream(self):
+    def test_windows_spawn_workers_bank_and_stream(self):
         for method, sampling in (("target_guided_cached", "bank"),
-                                 ("target_guided_soft_cached", "bank"),
-                                 ("target_guided_soft_cached", "stream")):
+                                 ("target_guided_cached", "stream")):
             config = self.config(method, sampling=sampling)
             config["tg_cache"]["num_workers"] = 1
             self.prepare(config)

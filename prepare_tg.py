@@ -1,18 +1,16 @@
-"""Precompute hard or soft-coarse TG on checkerboard/horse, without training.
+"""Precompute hard TG on checkerboard/horse, without training.
 
 Use the SAME experiment YAML here and in train.py/train_horse.py.
 Existing caches are validated/reused, never overwritten. Interruptions leave
 an incomplete directory; choose a new path rather than silently reusing it.
 
-Defaults are bank mode, 4096 clouds, K=8, N=256, seed=0. Hard/soft YAMLs have
+Defaults are bank mode, 4096 clouds, K=8, N=256, seed=0. Hard YAMLs have
 the same model, optimizer, batch and updates as the corresponding online TG.
-Soft epsilon=.1 is a controlled starting setting, NOT a selected optimum.
 
 For a full single-use stream, set tg_cache.sampling: stream, num_clouds: null,
 and a NEW tg_cache.path in a COPY of the YAML. At B=64 and 10000 updates this
-prepares 640000 clouds (~3.68 GiB per cache). Soft stream samples the coarse
-labels offline; soft bank resamples them per visit on CPU workers. Both draw
-fine pairing and time afresh in training. Soft bank rounding still costs time.
+prepares 640000 clouds (~3.68 GiB per cache). Both modes cache exact coarse
+labels offline and draw fine pairing and time afresh in training.
 
 Generation uses the existing eval.py/eval_horse.py and saved run config.yaml.
 audit_generation.py supports these caches; FM residuals use their training

@@ -1,9 +1,8 @@
-"""Offline 2D hard/soft-coarse TG, with fresh random within-patch bijections.
+"""Offline 2D hard TG, with fresh random within-patch bijections.
 
-bank: reuse a finite paired-cloud bank; soft coarse assignments are resampled
-from the cached feasible Sinkhorn plan by dependent rounding on every visit.
-stream: prepare the complete training stream; each cloud is used once, with
-soft coarse assignments sampled offline. No online OT or rounding is needed.
+bank: reuse a finite paired-cloud bank with cached exact coarse assignments.
+stream: prepare the complete training stream; each cloud is used once.
+Neither mode requires online OT. Fine pairing is resampled on every visit.
 Inference always starts from fresh iid standard Gaussian, without the cache.
 """
 
@@ -19,11 +18,22 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 
 from coupling import assign_regions, balanced_target_partition
 from nsot import dataset_spec, file_sha256
-from tg_rounding import dependent_round, entropic_plan, random_fine_permutation
 
 
-METHODS = {"target_guided_cached", "target_guided_soft_cached"}
+METHODS = {"target_guided_cached"}
 FORMAT_VERSION = 1
+
+
+def random_fine_permutation(source_labels, target_labels, k, rng):
+    """Uniform random bijections per patch; source indices are unchanged."""
+    permutation = np.empty(len(source_labels), dtype=np.int64)
+    for patch in range(k):
+        source = np.flatnonzero(source_labels == patch)
+        target = np.flatnonzero(target_labels == patch)
+        if len(source) != len(target):
+            raise ValueError("Source and target patch counts differ")
+        permutation[source] = rng.permutation(target)
+    return permutation
 
 
 def _integer(value, name, minimum=1):
@@ -35,7 +45,7 @@ def _integer(value, name, minimum=1):
 def settings(config):
     method = config.get("coupling")
     if method not in METHODS:
-        raise ValueError("TG cache requires target_guided_cached or target_guided_soft_cached")
+        raise ValueError("TG cache requires target_guided_cached")
     value = config.get("tg_cache", {})
     n = _integer(config["data"]["n_points"], "n_points")
     _integer(config["data"]["batch_size"], "batch_size")
@@ -58,13 +68,6 @@ def settings(config):
               "num_clouds": count, "cache_seed": _integer(value.get("seed", 0), "tg_cache.seed", 0),
               "prepare_batch_size": _integer(value.get("prepare_batch_size", 64), "prepare_batch_size"),
               "num_workers": workers, "n_points": n, "num_regions": k}
-    if method == "target_guided_soft_cached":
-        epsilon = value.get("epsilon", .1)
-        if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)) \
-                or not np.isfinite(epsilon) or epsilon <= 0:
-            raise ValueError("tg_cache.epsilon must be positive and finite")
-        result.update(epsilon=float(epsilon),
-                      sinkhorn_iterations=_integer(value.get("sinkhorn_iterations", 3000), "sinkhorn_iterations"))
     return result
 
 
@@ -73,8 +76,7 @@ def _spec(config, dataset, opts):
             "sampling": opts["sampling"], "configured_num_clouds": opts["num_clouds"],
             "cache_seed": opts["cache_seed"], "prepare_batch_size": opts["prepare_batch_size"],
             "n_points": opts["n_points"], "num_regions": opts["num_regions"],
-            "dataset_spec": dataset_spec(config, dataset),
-            "epsilon": opts.get("epsilon"), "sinkhorn_iterations": opts.get("sinkhorn_iterations")}
+            "dataset_spec": dataset_spec(config, dataset)}
 
 
 def _cloud_count(config, opts):
@@ -91,10 +93,7 @@ def _array_shapes(count, opts):
     n, k = opts["n_points"], opts["num_regions"]
     shapes = {"source": ((count, n, 2), np.float32), "target": ((count, n, 2), np.float32),
               "target_labels": ((count, n), np.int32), "capacities": ((count, k), np.int32)}
-    if opts["method"] == "target_guided_soft_cached" and opts["sampling"] == "bank":
-        shapes["plan"] = ((count, n, k), np.float64)
-    else:
-        shapes["source_labels"] = ((count, n), np.int32)
+    shapes["source_labels"] = ((count, n), np.int32)
     return shapes
 
 
@@ -160,9 +159,7 @@ def prepare(config, dataset):
     path.mkdir(exist_ok=False)
     arrays = {name: np.lib.format.open_memmap(path / f"{name}.npy", mode="w+", dtype=dtype, shape=shape)
               for name, (shape, dtype) in shapes.items()}
-    draw_seconds = partition_seconds = assignment_seconds = rounding_seconds = 0.
-    residual_before = residual_after = 0.
-    rng = np.random.default_rng(opts["cache_seed"])
+    draw_seconds = partition_seconds = assignment_seconds = 0.
     threads = torch.get_num_threads()
     try:
         # Small CPU N x K solves; avoid large thread-pool overhead. Restore the
@@ -191,24 +188,9 @@ def prepare(config, dataset):
                 arrays["target_labels"][begin:end] = labels.numpy()
                 arrays["capacities"][begin:end] = capacities.numpy()
                 tick = perf_counter()
-                if opts["method"] == "target_guided_cached":
-                    arrays["source_labels"][begin:end] = assign_regions(
-                        source, centers, capacities, solver="exact_batched").numpy()
-                    assignment_seconds += perf_counter() - tick
-                else:
-                    costs = torch.cdist(source, centers).square().double().numpy()
-                    for offset, (cost, capacity) in enumerate(zip(costs, capacities.numpy())):
-                        tick = perf_counter()
-                        plan, before, after = entropic_plan(cost, capacity, epsilon=opts["epsilon"],
-                                                           iterations=opts["sinkhorn_iterations"])
-                        assignment_seconds += perf_counter() - tick
-                        residual_before, residual_after = max(residual_before, before), max(residual_after, after)
-                        if opts["sampling"] == "bank":
-                            arrays["plan"][begin + offset] = plan
-                        else:
-                            tick = perf_counter()
-                            arrays["source_labels"][begin + offset] = dependent_round(plan, capacity, rng)
-                            rounding_seconds += perf_counter() - tick
+                arrays["source_labels"][begin:end] = assign_regions(
+                    source, centers, capacities, solver="exact_batched").numpy()
+                assignment_seconds += perf_counter() - tick
                 print(f"tg_prepared={end}/{count}", flush=True)
     finally:
         torch.set_num_threads(threads)
@@ -220,22 +202,19 @@ def prepare(config, dataset):
     metadata = {**spec, "num_clouds": count, "array_sha256": hashes,
                 "implementation": "tg_offline_v1", "source_coordinates": "unmodified iid standard Gaussian draws",
                 "target_partition": "balanced FPS, exact POT transportation; actual patch centroids",
-                "source_assignment": "exact POT" if opts["method"] == "target_guided_cached" else "entropic OT (POT log scaling + K-1 BFGS dual refinement when needed) + bipartite cycle dependent rounding",
-                "coarse_resampling": "fresh dependent rounding per visit" if "plan" in shapes else "cached labels",
+                "source_assignment": "exact POT",
+                "coarse_resampling": "cached labels",
                 "fine_pairing": "fresh uniform random bijection per patch per visit",
                 "marginals": "finite empirical paired-cloud bank" if opts["sampling"] == "bank" else "pre-drawn iid cloud stream; each cloud used at most once",
                 "inference_source": "fresh iid standard Gaussian; no cache, anchors or patches",
-                "max_sinkhorn_residual_before_repair": residual_before,
-                "max_sinkhorn_residual_after_repair": residual_after,
-                "rounding_numeric_tolerance": 1e-8,
                 "draw_seconds": draw_seconds, "target_partition_seconds": partition_seconds,
-                "source_assignment_seconds": assignment_seconds, "offline_rounding_seconds": rounding_seconds,
+                "source_assignment_seconds": assignment_seconds,
                 "precompute_seconds": perf_counter() - start,
                 "precompute_timing_scope": "draws, solves, array IO and array hashing; excludes final metadata write",
                 "storage_bytes": storage,
                 "environment": {"torch": str(torch.__version__), "numpy": np.__version__},
                 "source_sha256": {name: file_sha256(Path(__file__).parent / name)
-                                  for name in ("tg_cache.py", "tg_rounding.py", "coupling.py", "data.py", "train_horse.py")}}
+                                  for name in ("tg_cache.py", "coupling.py", "data.py", "train_horse.py")}}
     # Written last: interruption leaves an explicitly incomplete cache, never a
     # apparently valid one. No overwrite/automatic deletion of existing data.
     with (path / "metadata.json").open("x", encoding="utf-8") as stream:
@@ -261,8 +240,7 @@ class _CloudDataset(Dataset):
             self.arrays = {name: np.load(Path(self.path) / f"{name}.npy", mmap_mode="r", allow_pickle=False)
                            for name in self.metadata["array_sha256"]}
         arrays = self.arrays
-        source_labels = (dependent_round(arrays["plan"][index], arrays["capacities"][index], rng)
-                         if "plan" in arrays else arrays["source_labels"][index])
+        source_labels = arrays["source_labels"][index]
         permutation = random_fine_permutation(source_labels, arrays["target_labels"][index],
                                              self.metadata["num_regions"], rng)
         # Copies make writable CPU tensors without modifying read-only caches.
@@ -345,8 +323,7 @@ class TGCachedPairSampler:
                 "precompute_timing_scope": meta["precompute_timing_scope"],
                 "timing_scope": "training_seconds is online loop only; report precompute and cache setup separately",
                 "marginals": meta["marginals"], "coarse_resampling": meta["coarse_resampling"],
-                "fine_pairing": meta["fine_pairing"], "epsilon": meta["epsilon"],
-                "rounding_numeric_tolerance": meta["rounding_numeric_tolerance"],
+                "fine_pairing": meta["fine_pairing"],
                 "cached_source_sha256": meta["array_sha256"]["source"],
                 "cached_target_sha256": meta["array_sha256"]["target"],
                 "cached_target_partition_sha256": meta["array_sha256"]["target_labels"],
