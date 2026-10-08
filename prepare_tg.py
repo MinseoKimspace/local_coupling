@@ -18,6 +18,10 @@ bank and are NOT unseen-target tests. audit_mean_field.py intentionally does
 NOT claim to estimate a population conditional field for a finite cloud bank.
 Report precompute_seconds, cache_setup_seconds and training_seconds separately.
 
+Opt-in fine-pairing conflict search uses separate untangle YAMLs and
+prepare_tg_untangle.py; it never edits this original hard bank. That variant
+samples a finite permutation pool rather than fresh uniform pairing.
+
 Alternatively pass --sampling stream. The CLI derives a separate _stream
 cache, writes its effective config.yaml there WITHOUT changing your input,
 and prints the training command for that generated configuration.

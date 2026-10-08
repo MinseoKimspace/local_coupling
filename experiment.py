@@ -50,6 +50,9 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     now = datetime.now(timezone.utc)
     method = canonical_method(config["coupling"])
     name = f"{dataset}_{method}_k{config.get('num_regions', 'na')}_n{config['data']['n_points']}_seed{config['seed']}"
+    variant = (coupling_metadata or {}).get("fine_pairing_variant")
+    if variant in ("conflict_optimized_pool", "random_pool_control"):
+        name += "_" + variant
     run_dir = Path("runs") / dataset / f"{name}_{now:%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     snapshot = copy.deepcopy(config)
@@ -175,5 +178,10 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 
 def evaluation_title(config):
-    return (f"{config['coupling']} | K={config.get('num_regions', 'na')} | "
+    fine = config.get("tg_cache", {}).get("untangle")
+    variant = ""
+    if isinstance(fine, dict) and fine.get("enabled", True):
+        variant = " | fine=" + ("conflict_optimized_pool" if fine.get("swap_steps", 256)
+                                 else "random_pool_control")
+    return (f"{config['coupling']}{variant} | K={config.get('num_regions', 'na')} | "
             f"N={config['data']['n_points']} | seed={config['seed']}")

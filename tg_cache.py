@@ -2,7 +2,9 @@
 
 bank: reuse a finite paired-cloud bank with cached exact coarse assignments.
 stream: prepare the complete training stream; each cloud is used once.
-Neither mode requires online OT. Fine pairing is resampled on every visit.
+Neither mode requires online OT. By default fine pairing is resampled on every
+visit. An opt-in untangle experiment samples a separately prepared finite
+permutation pool, without changing the original bank or source coordinates.
 Inference always starts from fresh iid standard Gaussian, without the cache.
 """
 
@@ -18,10 +20,12 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 
 from coupling import assign_regions, balanced_target_partition
 from nsot import dataset_spec, file_sha256
+from tg_untangle import normalize_options
 
 
 METHODS = {"target_guided_cached"}
 FORMAT_VERSION = 1
+UNTANGLE_FORMAT_VERSION = 2
 
 
 def random_fine_permutation(source_labels, target_labels, k, rng):
@@ -68,15 +72,27 @@ def settings(config):
               "num_clouds": count, "cache_seed": _integer(value.get("seed", 0), "tg_cache.seed", 0),
               "prepare_batch_size": _integer(value.get("prepare_batch_size", 64), "prepare_batch_size"),
               "num_workers": workers, "n_points": n, "num_regions": k}
+    untangle = normalize_options(value.get("untangle"))
+    if untangle["enabled"]:
+        if untangle["neighbors"] >= n:
+            raise ValueError("untangle.neighbors must be smaller than n_points")
+        if not isinstance(value.get("base_path"), str) or not value["base_path"]:
+            raise ValueError("Untangle requires tg_cache.base_path naming the original hard cache")
+        if Path(value["base_path"]).resolve() == Path(value["path"]).resolve():
+            raise ValueError("Untangle must use a NEW cache path, different from base_path")
+        result.update(untangle=untangle, base_path=value["base_path"])
     return result
 
 
 def _spec(config, dataset, opts):
-    return {"format_version": FORMAT_VERSION, "method": opts["method"],
+    result = {"format_version": FORMAT_VERSION, "method": opts["method"],
             "sampling": opts["sampling"], "configured_num_clouds": opts["num_clouds"],
             "cache_seed": opts["cache_seed"], "prepare_batch_size": opts["prepare_batch_size"],
             "n_points": opts["n_points"], "num_regions": opts["num_regions"],
             "dataset_spec": dataset_spec(config, dataset)}
+    if "untangle" in opts:
+        result.update(format_version=UNTANGLE_FORMAT_VERSION, untangle=opts["untangle"])
+    return result
 
 
 def _cloud_count(config, opts):
@@ -94,6 +110,11 @@ def _array_shapes(count, opts):
     shapes = {"source": ((count, n, 2), np.float32), "target": ((count, n, 2), np.float32),
               "target_labels": ((count, n), np.int32), "capacities": ((count, k), np.int32)}
     shapes["source_labels"] = ((count, n), np.int32)
+    if "untangle" in opts:
+        p = opts["untangle"]["permutations"]
+        shapes.update(fine_permutations=((count, p, n), np.int32),
+                      untangle_scores=((count, p, 2), np.float64),
+                      untangle_accepted_swaps=((count, p), np.int32))
     return shapes
 
 
@@ -129,6 +150,20 @@ def load_cache(config, dataset):
                 raise ValueError(f"TG cache shape/dtype mismatch: {name}")
         finally:
             array._mmap.close()
+    if "untangle" in opts:
+        parent = metadata.get("parent_cache", {})
+        parent_meta = parent.get("metadata", {})
+        if parent.get("sha256") != _fingerprint(parent_meta):
+            raise ValueError("Untangle parent cache fingerprint mismatch")
+        base_opts = {k: v for k, v in opts.items() if k not in ("untangle", "base_path")}
+        for key, value in _spec(config, dataset, base_opts).items():
+            if parent_meta.get(key) != value:
+                raise ValueError(f"Untangle parent cache/config mismatch: {key}")
+        if parent_meta.get("num_clouds") != count:
+            raise ValueError("Untangle parent cache cloud count mismatch")
+        for name in _array_shapes(count, base_opts):
+            if parent_meta.get("array_sha256", {}).get(name) != metadata["array_sha256"][name]:
+                raise ValueError(f"Untangle changed original cached array: {name}")
     digest = _fingerprint(metadata)
     if config["tg_cache"].get("cache_sha256", digest) != digest:
         raise ValueError("TG cache differs from the checkpoint training cache")
@@ -138,6 +173,9 @@ def load_cache(config, dataset):
 def prepare(config, dataset):
     """Exclusive, memory-mapped cache creation; existing caches are never overwritten."""
     opts = settings(config)
+    if "untangle" in opts:
+        from tg_untangle_cache import prepare_guided
+        return prepare_guided(config, dataset, opts)
     spec = _spec(config, dataset, opts)
     path = Path(opts["path"])
     if path.exists():
@@ -241,8 +279,12 @@ class _CloudDataset(Dataset):
                            for name in self.metadata["array_sha256"]}
         arrays = self.arrays
         source_labels = arrays["source_labels"][index]
-        permutation = random_fine_permutation(source_labels, arrays["target_labels"][index],
-                                             self.metadata["num_regions"], rng)
+        if "fine_permutations" in arrays:
+            pool = arrays["fine_permutations"][index]
+            permutation = pool[int(rng.integers(len(pool)))]
+        else:
+            permutation = random_fine_permutation(source_labels, arrays["target_labels"][index],
+                                                 self.metadata["num_regions"], rng)
         # Copies make writable CPU tensors without modifying read-only caches.
         return torch.from_numpy(arrays["source"][index].copy()), torch.from_numpy(arrays["target"][index][permutation].copy())
 
@@ -317,7 +359,7 @@ class TGCachedPairSampler:
 
     def details(self):
         meta = self.metadata
-        return {"cache_sha256": self.cache_sha256, "cache_seed": meta["cache_seed"],
+        result = {"cache_sha256": self.cache_sha256, "cache_seed": meta["cache_seed"],
                 "cache_clouds": meta["num_clouds"], "cache_sampling": meta["sampling"],
                 "cache_setup_seconds": self.setup_seconds, "precompute_seconds": meta["precompute_seconds"],
                 "precompute_timing_scope": meta["precompute_timing_scope"],
@@ -328,3 +370,16 @@ class TGCachedPairSampler:
                 "cached_target_sha256": meta["array_sha256"]["target"],
                 "cached_target_partition_sha256": meta["array_sha256"]["target_labels"],
                 "precompute_source_sha256": meta["source_sha256"]}
+        if "untangle" in meta:
+            result.update(implementation=meta["implementation"],
+                          local_pairing=meta["local_pairing"],
+                          fine_pairing_variant=meta["fine_pairing_variant"],
+                          fine_pairing_objective=meta["untangle_summary"]["objective"],
+                          untangle=meta["untangle"], untangle_summary=meta["untangle_summary"],
+                          untangle_optimization_seconds=meta["untangle_optimization_seconds"],
+                          parent_cache_sha256=meta["parent_cache"]["sha256"],
+                          parent_precompute_seconds=meta["parent_precompute_seconds"],
+                          parent_cache_prepared_now=meta["parent_cache_prepared_now"],
+                          cached_permutations_sha256=meta["array_sha256"]["fine_permutations"],
+                          one_lipschitz_guaranteed=False)
+        return result
