@@ -151,3 +151,82 @@ Report CD, leakage, density/ROI scores and the no-flow prior together. Low leaka
 - Standard evaluation `inference_seconds` measures integration only: source sampling, warmup, model loading, metrics and rendering are excluded. Do not call it end-to-end latency. Diagnostic rollout timing has a different scope, including batching/transfers and path bookkeeping.
 - Report fixed-center fitting, cache preparation, cache setup and online training separately. Do not assume that prior fitting is included in another timing field without checking the stored scope.
 - These experiments do not guarantee improved quality over Hard Bank, Gaussian-prior NSOT, minibatch OT or permutation-only EFM. NFE=128 alone is not a proof of convergence; inspect the successive finite-reference checks.
+
+## Directional component-centered hybrid: same prior, different coupling
+
+The optional `nsot.directional_hybrid` variant changes only the hybrid source-target coupling. It retains the same fixed GMM prior, target points, exact OT pair cache, model architecture and FM objective as isotropic anchor-prior NSOT. It adds no neural-network Jacobian computation, model conditioning, teacher, candidate permutation search or extra training loss.
+
+For each original source component k, fit a fixed 2x2 matrix S_k once from the cached OT pairs, then use fresh independent standard-normal epsilon during training:
+
+```text
+X_hybrid = c_k + sqrt(I-S_k) @ (Z-c_k) + sigma * sqrt(S_k) @ epsilon
+0 <= S_k <= I
+```
+
+Both square roots are symmetric positive-semidefinite matrix square roots. Noise scaling and residual contraction change together; changing just the noise covariance would not preserve the original isotropic component law. With fixed S_k and a fresh population draw `Z | k ~ Normal(c_k, sigma^2 I)`, the resulting component is still `Normal(c_k, sigma^2 I)` because its residual covariance is `sigma^2 (I-S_k) + sigma^2 S_k = sigma^2 I`. The equally weighted population GMM is therefore unchanged. As with scalar hybrid noise, drawing Z from a finite cached bank instead gives only an empirical approximation; exact finite-bank Gaussianity is not claimed.
+
+The fit uses only cached training pairs, grouped by the **original source component label**:
+
+- Fit a ridge-regularized local linear correspondence `Y ~= d_k + J_k (Z-c_k)`.
+- Take the target PCA minor-axis direction n_k as a local thin-direction proxy and pull it back into source coordinates using `J_k.T @ n_k`.
+- Retain more source-target information along this pulled-back direction by assigning less noise there and more noise in its orthogonal direction. The matrix is constant per component, not adapted separately to each training point.
+- Require sufficient component points, target PCA anisotropy and normal-direction regression R-squared. Small, nearly isotropic, poorly fitted or degenerate components fall back to scalar `S_k = beta I`.
+
+The default settings are `strength: 0.9`, `ridge: 0.001`, `min_points: 32`, `min_target_anisotropy: 1.5` and `min_normal_r2: 0.25`. The trace remains `tr(S_k) = 2 * beta`, matching the isotropic noise budget. At beta=0.2 and strength=0.9 an accepted component has eigenvalues 0.02 and 0.38; a fallback component has 0.2 and 0.2. At strength=0 the hybrid is isotropic. PCA and ridge regression are cheap fixed 2D surrogates, not proof that a component corresponds to one semantic part or that the neural flow is Lipschitz.
+
+The directional settings and fitted matrices are stored in a separate JSON sidecar, bound to the original pair cache. The experiment templates deliberately reuse the existing `.npz` paths: do not delete a valid isotropic anchor-NSOT pair cache. Preparation validates/reuses it and fits the directional sidecar, without rerunning global OT when that cache already exists. Different directional settings require a distinct sidecar path rather than overwriting a conflicting artifact. The scalar control templates and their caches remain usable unchanged.
+
+### Prepare and train the two directional experiments
+
+```powershell
+python prepare_nsot.py checkerboard_experiments/nsot_anchor_prior_directional_k8_n256_seed0.yaml --dataset checkerboard
+python train.py checkerboard_experiments/nsot_anchor_prior_directional_k8_n256_seed0.yaml
+
+python prepare_nsot.py horse_experiments/horse_nsot_anchor_prior_directional_k8_n256_seed0.yaml --dataset horse
+python train_horse.py horse_experiments/horse_nsot_anchor_prior_directional_k8_n256_seed0.yaml
+```
+
+Both keep K=8, N=256, sigma=0.1, beta=0.2, M=10,000, seed=0 and 10,000 updates. The checkpoint names include `directional`, and run prefixes are distinct:
+
+```text
+checkerboard_nsot_k8_n256_seed0_anchor_prior_directional_<timestamp>_<run_id>
+horse_nsot_k8_n256_seed0_anchor_prior_directional_<timestamp>_<run_id>
+```
+
+### Evaluate saved directional runs
+
+Use the exact saved configuration paths printed by training; replace the placeholder directory names below. Validate both before starting evaluation. Argument arrays ensure a missing/empty config cannot silently be replaced by the NFE positional argument.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$directionalChecker = 'runs/checkerboard/<directional-checker-run>/config.yaml'
+$directionalHorse = 'runs/horse/<directional-horse-run>/config.yaml'
+$directionalJobs = @(
+    [pscustomobject]@{ Script='eval.py'; Dataset='checkerboard'; Config=$directionalChecker },
+    [pscustomobject]@{ Script='eval_horse.py'; Dataset='horse'; Config=$directionalHorse }
+)
+foreach ($directionalJob in $directionalJobs) {
+    if ([string]::IsNullOrWhiteSpace($directionalJob.Config) -or
+        -not (Test-Path -LiteralPath $directionalJob.Config -PathType Leaf)) {
+        throw ('Saved config not found: ' + $directionalJob.Config)
+    }
+}
+foreach ($directionalJob in $directionalJobs) {
+    Write-Host ('Evaluating: ' + $directionalJob.Config)
+    foreach ($directionalNfe in @(1,2,4,8,16,32,64,128)) {
+        $directionalEvalArgs = @($directionalJob.Script, $directionalJob.Config, [string]$directionalNfe)
+        & python @directionalEvalArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw ('Evaluation failed: ' + $directionalJob.Config + ' / NFE=' + $directionalNfe)
+        }
+    }
+    $directionalAuditArgs = @('audit_generation.py', $directionalJob.Config,
+        '--dataset', $directionalJob.Dataset, '--clouds', '32', '--skip-fm', '--seed', '2026',
+        '--nfes', '1', '2', '4', '8', '16', '32', '64', '128',
+        '--reference-nfe', '128', '--max-reference-nfe', '512')
+    & python @directionalAuditArgs
+    if ($LASTEXITCODE -ne 0) { throw ('Generation audit failed: ' + $directionalJob.Config) }
+}
+```
+
+Inference still draws the same saved isotropic GMM and uses the same network; the directional matrices are a training-coupling mechanism, not an extra inference transform. Compare against the existing isotropic anchor-NSOT runs with the same prior centers, pair cache, beta, architecture and evaluation streams. Report 1-NFE CD together with leakage, density/cell-mass and horse thin/gap ROI metrics, plus accepted/fallback component counts and sidecar fitting time. The covariance identity preserves the source law, **not** the generated endpoint density, thin structures, 1-step quality or superiority over any baseline.

@@ -13,6 +13,7 @@ import ot
 import scipy
 import torch
 import yaml
+import nsot_directional
 
 from anchor_flow import experiment_details, sample_source, settings as anchor_flow_settings, variant_suffix
 from coupling import canonical_method, coupling_info
@@ -24,6 +25,7 @@ def read_config(path):
         config = yaml.safe_load(file)
     config["coupling"] = canonical_method(config["coupling"])
     anchor_flow_settings(config)  # Validate templates without resolving or fitting a source prior.
+    nsot_directional.settings(config)
     return config
 
 

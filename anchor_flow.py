@@ -216,9 +216,24 @@ def experiment_details(config):
             paper_variant="experimental fixed anchor-GMM source plus component-centered hybrid; not the original NSOT Gaussian kernel",
             limitation="changed prior and changed hybrid kernel; experimental NSOT extension, not original-NSOT marginal or quality guarantees",
         )
+        if config.get("nsot", {}).get("directional_hybrid") is not None:
+            shared.update(
+                implementation="nsot_anchor_prior_directional_hybrid_v1",
+                anchor_flow_implementation="nsot_anchor_prior_directional_hybrid_v1",
+                source_coordinates="same fixed anchor GMM and exact OT bank; fixed per-component directional stationary hybrid during training",
+                conditional_velocity="paired_target-actual_directional_hybrid_source",
+                hybrid="c[k]+sqrt(I-S[k])@(cached_source-c[k])+sigma*sqrt(S[k])@fresh_gaussian",
+                paper_variant="experimental same-anchor-prior directional hybrid; not original NSOT and not model conditioning",
+                limitation="population prior preservation does not guarantee finite-cache marginals, learned output density or thin-structure quality",
+            )
     return shared
 
 
 def variant_suffix(config):
     opts = settings(config)
-    return "" if opts is None else opts["mode"]
+    if opts is None:
+        return ""
+    suffix = opts["mode"]
+    if config.get("nsot", {}).get("directional_hybrid") is not None:
+        suffix += "_directional"
+    return suffix
