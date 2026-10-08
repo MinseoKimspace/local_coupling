@@ -1,0 +1,56 @@
+# Experimental frozen-teacher fine pairing; original Hard bank stays unchanged.
+# --teacher-config must name a verified existing horse N256 checkpoint.
+seed: 0
+device: cuda
+dtype: float32
+coupling: target_guided_cached
+num_regions: 8
+
+tg_cache:
+  base_path: coupling_cache/horse_tg_hard_k8_n256_seed0
+  path: coupling_cache/horse_tg_model_guided_k8_n256_seed0
+  sampling: bank
+  num_clouds: 4096
+  seed: 0
+  prepare_batch_size: 64
+  num_workers: 2
+  model_guidance:
+    enabled: true
+    teacher_config: REPLACE_WITH_VERIFIED_RUN_CONFIG.yaml
+    neighbors: 8
+    times: [0.25, 0.5, 0.75]
+    candidates: 8
+    keep: 4
+    probes: 1
+    fd_epsilon: 0.001
+    weights:
+      regression: 1.0
+      local: 0.25
+      jacobian: 0.1
+    normalization: candidate_mean
+    inference_batch_size: 16
+    selection: score
+    seed: 0
+
+data:
+  batch_size: 64
+  n_points: 256
+
+model:
+  point_dim: 2
+  d_model: 256
+  nhead: 8
+  num_layers: 4
+  dim_feedforward: 1024
+  dropout: 0.0
+
+training:
+  num_steps: 10000
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  log_every: 100
+
+evaluation:
+  batch_size: 64
+
+checkpoint: horse_target_guided_cached_model_guided_k8_n256_seed0.pt

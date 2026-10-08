@@ -51,7 +51,7 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     method = canonical_method(config["coupling"])
     name = f"{dataset}_{method}_k{config.get('num_regions', 'na')}_n{config['data']['n_points']}_seed{config['seed']}"
     variant = (coupling_metadata or {}).get("fine_pairing_variant")
-    if variant in ("conflict_optimized_pool", "random_pool_control"):
+    if variant in ("model_guided_pool", "model_guided_random_control"):
         name += "_" + variant
     run_dir = Path("runs") / dataset / f"{name}_{now:%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -79,8 +79,10 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     return run_dir
 
 
-def load_model(config_path, model_class, dataset):
+def load_model(config_path, model_class, dataset, *, device=None):
     config = read_config(config_path)
+    if device is not None:
+        config["device"] = str(torch.device(device))
     checkpoint = Path(config["checkpoint"])
     if not checkpoint.is_absolute():
         relative = Path(config_path).resolve().parent / checkpoint
@@ -178,10 +180,11 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 
 def evaluation_title(config):
-    fine = config.get("tg_cache", {}).get("untangle")
     variant = ""
-    if isinstance(fine, dict) and fine.get("enabled", True):
-        variant = " | fine=" + ("conflict_optimized_pool" if fine.get("swap_steps", 256)
-                                 else "random_pool_control")
+    guided = config.get("tg_cache", {}).get("model_guidance")
+    if isinstance(guided, dict) and guided.get("enabled", True):
+        variant = " | fine=" + ("model_guided_random_control"
+                                  if guided.get("selection", "score") == "random"
+                                  else "model_guided_pool")
     return (f"{config['coupling']}{variant} | K={config.get('num_regions', 'na')} | "
             f"N={config['data']['n_points']} | seed={config['seed']}")
