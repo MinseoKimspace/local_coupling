@@ -4,8 +4,8 @@ bank: reuse a finite paired-cloud bank with cached exact coarse assignments.
 stream: prepare the complete training stream; each cloud is used once.
 Neither mode requires online OT. Fine pairing is resampled on every visit.
 By default inference starts from fresh iid standard Gaussian, without the
-cache. Optional anchor_flow experiments have explicit, checkpointed priors
-or training paths; they never silently reinterpret the baseline cache.
+cache. Optional anchor_flow experiments have explicit, checkpointed priors;
+they never silently reinterpret the baseline cache.
 """
 
 import copy
@@ -89,7 +89,6 @@ def _spec(config, dataset, opts):
             "cache_seed": opts["cache_seed"], "prepare_batch_size": opts["prepare_batch_size"],
             "n_points": opts["n_points"], "num_regions": opts["num_regions"],
             "dataset_spec": dataset_spec(config, dataset)}
-    # A waypoint changes only the training path, not the X/Y/coarse cache.
     # Prior experiments DO change X and therefore require a different spec.
     flow = anchor_flow.cache_spec(config)
     if flow is not None and flow["mode"] == "anchor_prior":
@@ -268,11 +267,10 @@ def prepare(config, dataset):
 class _CloudDataset(Dataset):
     """Open read-only memmaps separately in each Windows-spawned worker."""
 
-    def __init__(self, path, metadata, seed, *, waypoint=False):
+    def __init__(self, path, metadata, seed):
         self.path, self.metadata = str(path), metadata
         self.arrays = None
         self.rng = np.random.default_rng(seed)
-        self.waypoint = waypoint
 
     def __len__(self):
         return self.metadata["num_clouds"]
@@ -286,21 +284,8 @@ class _CloudDataset(Dataset):
         permutation = random_fine_permutation(source_labels, arrays["target_labels"][index],
                                              self.metadata["num_regions"], rng)
         # Copies make writable CPU tensors without modifying read-only caches.
-        pair = (torch.from_numpy(arrays["source"][index].copy()),
+        return (torch.from_numpy(arrays["source"][index].copy()),
                 torch.from_numpy(arrays["target"][index][permutation].copy()))
-        if not self.waypoint:
-            return pair
-        # Actual target patch means, mapped to SOURCE indices. Resampling the
-        # fine permutation never changes these centers. Only cheap O(N) work;
-        # no new FPS, OT or candidate search happens during training.
-        labels = arrays["target_labels"][index]
-        points = arrays["target"][index]
-        k = self.metadata["num_regions"]
-        counts = np.bincount(labels, minlength=k)
-        centers = np.stack([np.bincount(labels, weights=points[:, d], minlength=k)
-                            for d in range(2)], axis=-1) / counts[:, None]
-        mapped = centers[source_labels].astype(np.float32)
-        return (*pair, torch.from_numpy(mapped))
 
     def __getitem__(self, index):
         return self.draw(index, self.rng)
@@ -327,10 +312,8 @@ class TGCachedPairSampler:
         if "anchor_prior" in self.metadata:
             anchor_flow.bind_prior_centers(config, self.metadata["prior_centers"])
         self.flow_details = anchor_flow.experiment_details(config)
-        flow = anchor_flow.settings(config)
-        self.waypoint = flow is not None and flow["mode"] == "anchor_waypoint"
         self.device, self.dtype = torch.device(device), dtype
-        self.dataset = _CloudDataset(self.path, self.metadata, config["seed"] + 1, waypoint=self.waypoint)
+        self.dataset = _CloudDataset(self.path, self.metadata, config["seed"] + 1)
         self.iterator, self.loader = None, None
         if training:
             batch = config["data"]["batch_size"]

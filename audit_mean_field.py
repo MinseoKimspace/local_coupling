@@ -36,8 +36,6 @@ def conditional_moments(source, target, config):
     the project's exchangeable iid samplers; its fine/between split conditions
     on the UNORDERED target set, not the original ordered target tensor.
     """
-    if (config.get("anchor_flow") or {}).get("mode") == "anchor_waypoint":
-        raise ValueError("This fresh-cloud analytic audit does not support anchor_waypoint's cached coupling law")
     method = canonical_method(config["coupling"])
     if method not in SUPPORTED:
         raise ValueError("t=0 analytic audit supports " + ", ".join(sorted(SUPPORTED))
@@ -145,8 +143,6 @@ def audit(config_path, dataset, *, clouds=16, targets=128, batch_size=8, seed=20
     if clouds < 1 or targets < 2 or batch_size < 1:
         raise ValueError("clouds/batch_size must be positive; targets must be >=2")
     template = read_config(config_path)
-    if (template.get("anchor_flow") or {}).get("mode") == "anchor_waypoint":
-        raise ValueError("This fresh-cloud t=0 audit does not support anchor_waypoint's cached coupling law")
     if canonical_method(template["coupling"]) not in SUPPORTED:
         raise ValueError("Analytic t=0 audit supports " + ", ".join(sorted(SUPPORTED)))
     if prefixes is None:

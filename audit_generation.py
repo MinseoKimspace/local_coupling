@@ -106,8 +106,6 @@ def convergence_checks(predictions, quality, levels, endpoint_tolerance, quality
 
 @torch.no_grad()
 def fm_summary(model, config, data, batches, batch_size, seed):
-    if batches > 0 and (config.get("anchor_flow") or {}).get("mode") == "anchor_waypoint":
-        raise ValueError("Linear-path FM residuals are invalid for anchor_waypoint; use --skip-fm")
     cloud_coupling = config["coupling"] in CLOUD_METHODS
     if batch_size is None:
         batch_size = config["data"]["batch_size"] if cloud_coupling else 16
@@ -225,9 +223,6 @@ def audit(config_path, dataset, *, clouds=32, batch_size=16, nfes=NFES, referenc
     if max(requested) > max_reference_nfe:
         raise ValueError("Requested NFEs must not exceed max_reference_nfe")
     model, config, checkpoint, metadata = load_verified_model(config_path, dataset)
-    if fm_batches > 0 and (config.get("anchor_flow") or {}).get("mode") == "anchor_waypoint":
-        raise ValueError("This audit's optional FM residual assumes a linear path, not anchor_waypoint; "
-                         "add --skip-fm to evaluate generation and integration only")
     if (matching_batch_size is not None and config["coupling"] in CLOUD_METHODS
             and matching_batch_size != config["data"]["batch_size"] and fm_batches > 0):
         raise ValueError("Cloud OT diagnostics require training data.batch_size")
