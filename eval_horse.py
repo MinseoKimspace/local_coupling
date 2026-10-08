@@ -65,13 +65,18 @@ def main(config_path="horse_experiments/horse_independent_n256_seed0.yaml", num_
     model, config, checkpoint, metadata = load_model(config_path, HorsePointSetTransformer, "horse")
     settings, data = evaluation_settings(config), config["data"]
     print(f"nfe={steps}")
-    _, prediction, seconds = sample_for_evaluation(model, config, steps)
+    noise, prediction, seconds = sample_for_evaluation(model, config, steps)
     mask = load_horse_mask(prediction.device, prediction.dtype)
     target = sample_horse(mask, settings["batch_size"], data["n_points"])
     leakage, js = horse_metrics(prediction, mask, settings["histogram_bins"])
     scores = {"chamfer": chamfer_distance(prediction, target).item(), "leakage": leakage, "histogram_js": js}
     regions = HorseRegions(mask, roi_file)
     scores.update(regions.score(prediction))
+    if config.get("anchor_flow") is not None:
+        source_leakage, source_js = horse_metrics(noise, mask, settings["histogram_bins"])
+        scores.update(source_chamfer=chamfer_distance(noise, target).item(),
+                      source_leakage=source_leakage, source_histogram_js=source_js)
+        scores.update({"source_" + key: value for key, value in regions.score(noise).items()})
     roi_definition = regions.definition()
     output = save_evaluation(config_path, config, checkpoint, metadata, "horse", steps, seconds, scores,
                              metric_metadata={"horse_roi_definition": roi_definition})

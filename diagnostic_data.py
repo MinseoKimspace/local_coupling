@@ -1,4 +1,4 @@
-"""Shared, coupling-independent draws for read-only 2D diagnostics."""
+"""Shared, indexed draws from each configured source law for read-only 2D diagnostics."""
 
 import hashlib
 from pathlib import Path
@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from anchor_flow import sample_source
 from data import sample_checkerboard
 from experiment import load_model
 from model import PointSetTransformer
@@ -54,7 +55,7 @@ class DiagnosticData:
 
     def source(self, index, purpose="evaluation"):
         generator = torch.Generator(device=self.device).manual_seed(self.draw_seed(purpose + ":source", index))
-        return torch.randn(self.n, 2, device=self.device, dtype=self.dtype, generator=generator)
+        return sample_source(self.config, 1, device=self.device, dtype=self.dtype, generator=generator)[0]
 
     def target(self, index, purpose="evaluation"):
         cuda_devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()] \

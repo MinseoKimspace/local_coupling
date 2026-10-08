@@ -117,6 +117,12 @@ def main(config_path="checkerboard_experiments/independent.yaml", num_steps=100,
     leakage, mass, js = checkerboard_metrics(prediction, data["grid_size"], settings["histogram_bins"])
     scores = {"chamfer": chamfer_distance(prediction, target).item(), "leakage": leakage,
               "cell_mass_error": mass, "histogram_js": js}
+    if config.get("anchor_flow") is not None:
+        source_leakage, source_mass, source_js = checkerboard_metrics(noise, data["grid_size"],
+                                                                     settings["histogram_bins"])
+        scores.update(source_chamfer=chamfer_distance(noise, target).item(),
+                      source_leakage=source_leakage, source_cell_mass_error=source_mass,
+                      source_histogram_js=source_js)
     output = save_evaluation(config_path, config, checkpoint, metadata, "checkerboard",
                              steps, seconds, scores, render=render)
     if render:

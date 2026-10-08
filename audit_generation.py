@@ -1,6 +1,6 @@
 """Joint generation-quality, integration and optional FM-residual diagnostics.
 
-All NFE levels share a fixed raw Gaussian bank and a fixed fresh target bank.
+All NFE levels share a fixed bank from the configured source prior and a fixed fresh target bank.
 Reference refinement is an empirical check, not a proof of ODE convergence.
 """
 
@@ -106,6 +106,8 @@ def convergence_checks(predictions, quality, levels, endpoint_tolerance, quality
 
 @torch.no_grad()
 def fm_summary(model, config, data, batches, batch_size, seed):
+    if batches > 0 and (config.get("anchor_flow") or {}).get("mode") == "anchor_waypoint":
+        raise ValueError("Linear-path FM residuals are invalid for anchor_waypoint; use --skip-fm")
     cloud_coupling = config["coupling"] in CLOUD_METHODS
     if batch_size is None:
         batch_size = config["data"]["batch_size"] if cloud_coupling else 16
@@ -142,14 +144,14 @@ def fm_summary(model, config, data, batches, batch_size, seed):
                 paired_source, paired_target = pair_sampler.sample(batch_size, generator=generator)
             for j, t in enumerate(TIMES):
                 residual, baseline = fm_errors(model, paired_source, paired_target,
-                                               source.new_full((batch_size, 1, 1), t))
+                                               source.new_full((batch_size, 1, 1), t), config=config)
                 errors[j].extend(residual.tolist())
                 if j == 0:
                     energy.extend(baseline.tolist())
             for j, (lo, hi) in enumerate(BINS):
                 times = torch.rand(batch_size, 1, 1, device=source.device, dtype=source.dtype,
                                    generator=time_generator) * (hi - lo) + lo
-                residual, _ = fm_errors(model, paired_source, paired_target, times)
+                residual, _ = fm_errors(model, paired_source, paired_target, times, config=config)
                 bins[j].extend(residual.tolist())
             print(f"quality_fm_batch={batch + 1}/{batches}", flush=True)
     finally:
@@ -223,6 +225,9 @@ def audit(config_path, dataset, *, clouds=32, batch_size=16, nfes=NFES, referenc
     if max(requested) > max_reference_nfe:
         raise ValueError("Requested NFEs must not exceed max_reference_nfe")
     model, config, checkpoint, metadata = load_verified_model(config_path, dataset)
+    if fm_batches > 0 and (config.get("anchor_flow") or {}).get("mode") == "anchor_waypoint":
+        raise ValueError("This audit's optional FM residual assumes a linear path, not anchor_waypoint; "
+                         "add --skip-fm to evaluate generation and integration only")
     if (matching_batch_size is not None and config["coupling"] in CLOUD_METHODS
             and matching_batch_size != config["data"]["batch_size"] and fm_batches > 0):
         raise ValueError("Cloud OT diagnostics require training data.batch_size")
@@ -262,7 +267,7 @@ def audit(config_path, dataset, *, clouds=32, batch_size=16, nfes=NFES, referenc
                                    "primary_quality_absolute_change": quality_tolerance},
         "noise_sha256": tensor_sha256(noise), "target_sha256": tensor_sha256(target),
         "definitions": {
-            "draws": "fixed raw Gaussian and fresh target banks, indexed by cloud; independent of coupling and FM matching batch",
+            "draws": "fixed configured-source-prior and fresh target banks, indexed by cloud; independent of FM matching batch; source hashes differ when the prior changes",
             "endpoint": "same INDEXED particles vs finest finite Euler reference; NOT target correspondence or mean-field approximation error",
             "reference": "finest requested refinement, even if checks fail; two successive endpoint+quality checks, NOT a proof of exact integration",
             "quality": "Chamfer sum of directional squared-distance means, averaged across clouds; other metrics POOLED across all generated points",
@@ -283,6 +288,10 @@ def audit(config_path, dataset, *, clouds=32, batch_size=16, nfes=NFES, referenc
         "example_trajectory": {"times": [i / max_reference_nfe for i in range(max_reference_nfe + 1)],
                                "points": reference_path.tolist()},
     }
+    if config.get("anchor_flow") is not None:
+        payload["initial_source_quality"] = quality_scores(noise, target, config, dataset, data.mask, regions)
+        payload["definitions"]["initial_source_quality"] = (
+            "no-flow prior baseline before any model step, scored against the SAME fixed target bank")
     directory = output_directory(Path(output) / dataset, checkpoint.stem + "_quality_diagnostic")
     save_json(directory / "diagnostics.json", payload)
     render(payload, directory)

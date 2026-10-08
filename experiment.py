@@ -14,6 +14,7 @@ import scipy
 import torch
 import yaml
 
+from anchor_flow import experiment_details, sample_source, settings as anchor_flow_settings, variant_suffix
 from coupling import canonical_method, coupling_info
 from sample import integrate_velocity
 
@@ -22,6 +23,7 @@ def read_config(path):
     with Path(path).open(encoding="utf-8") as file:
         config = yaml.safe_load(file)
     config["coupling"] = canonical_method(config["coupling"])
+    anchor_flow_settings(config)  # Validate templates without resolving or fitting a source prior.
     return config
 
 
@@ -50,6 +52,9 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     now = datetime.now(timezone.utc)
     method = canonical_method(config["coupling"])
     name = f"{dataset}_{method}_k{config.get('num_regions', 'na')}_n{config['data']['n_points']}_seed{config['seed']}"
+    variant = variant_suffix(config)
+    if variant:
+        name += f"_{variant}"
     run_dir = Path("runs") / dataset / f"{name}_{now:%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     snapshot = copy.deepcopy(config)
@@ -64,6 +69,8 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     }
     if coupling_metadata is not None:
         metadata["coupling_details"].update(coupling_metadata)
+    # Apply last: baseline TG metadata assumes a Gaussian source and linear path.
+    metadata["coupling_details"].update(experiment_details(config))
     checkpoint = run_dir / snapshot["checkpoint"]
     torch.save({**metadata, "model_state_dict": model.state_dict()}, checkpoint)
     with (run_dir / "config.yaml").open("x", encoding="utf-8") as file:
@@ -78,6 +85,10 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
 
 def load_model(config_path, model_class, dataset, *, device=None):
     config = read_config(config_path)
+    if ((config.get("anchor_flow") or {}).get("mode") == "anchor_prior"
+            and "centers" not in config["anchor_flow"]):
+        raise ValueError("Anchor-prior inference requires resolved fixed centers in the saved runs/.../config.yaml; "
+                         "do not evaluate an unresolved training-template YAML")
     if device is not None:
         config["device"] = str(torch.device(device))
     checkpoint = Path(config["checkpoint"])
@@ -121,8 +132,7 @@ def evaluation_settings(config):
 def sample_for_evaluation(model, config, steps):
     parameter = next(model.parameters())
     batch = evaluation_settings(config)["batch_size"]
-    noise = torch.randn(batch, config["data"]["n_points"], config["model"]["point_dim"],
-                        device=parameter.device, dtype=parameter.dtype)
+    noise = sample_source(config, batch, device=parameter.device, dtype=parameter.dtype)
     time = parameter.new_zeros(batch, 1, 1)
     with torch.no_grad():
         for _ in range(10):
@@ -155,6 +165,7 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
         "evaluation_seed": settings["seed"], "evaluation_batch_size": settings["batch_size"],
         "n_points": config["data"]["n_points"], "total_points": settings["batch_size"] * config["data"]["n_points"],
         "euler_steps": steps, "histogram_bins": settings["histogram_bins"], "inference_seconds": seconds,
+        "inference_timing_scope": "integration only; excludes source sampling, warmup, loading, metrics and rendering",
         "metric_definitions": {"chamfer": "sum of directional mean squared distances; then mean over clouds",
                                "leakage": "invalid points / all pooled points",
                                "cell_mass_error": "TV over valid checkerboard cells, conditioned on valid points",
@@ -163,9 +174,15 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
         "image": str(image_path.resolve()) if render else None,
         **scores,
     }
+    if config.get("anchor_flow") is not None:
+        results["metric_definitions"]["source_prefix"] = (
+            "same metrics on initial source before any model step, against the SAME sampled target; "
+            "no-flow prior baseline, not an additional generation run")
     # Undefined conditional TV (no valid points) is recorded as null, not NaN.
     if "cell_mass_error" in results and not np.isfinite(results["cell_mass_error"]):
         results["cell_mass_error"] = None
+    if "source_cell_mass_error" in results and not np.isfinite(results["source_cell_mass_error"]):
+        results["source_cell_mass_error"] = None
     json_path = output_dir / f"{name}.json"
     with json_path.open("x", encoding="utf-8") as file:
         json.dump(results, file, indent=2, allow_nan=False)
@@ -177,5 +194,7 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 
 def evaluation_title(config):
-    return (f"{config['coupling']} | K={config.get('num_regions', 'na')} | "
+    variant = variant_suffix(config)
+    name = config['coupling'] + (f" / {variant}" if variant else "")
+    return (f"{name} | K={config.get('num_regions', 'na')} | "
             f"N={config['data']['n_points']} | seed={config['seed']}")

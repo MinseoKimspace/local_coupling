@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from anchor_flow import sample_source
 from experiment import evaluation_title
 from summarize_results import output_directory, save_json, save_table, statistics, formatted, plt
 
@@ -15,7 +16,10 @@ NFES = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
 @torch.no_grad()
-def fm_errors(model, source, target, time):
+def fm_errors(model, source, target, time, *, config=None):
+    if config is not None and (config.get("anchor_flow") or {}).get("mode") == "anchor_waypoint":
+        raise ValueError("Linear-path FM residuals do not apply to anchor_waypoint; "
+                         "use audit_generation.py --skip-fm for generation/integration diagnostics")
     velocity = target - source
     prediction = model((1 - time) * source + time * target, time)
     return ((prediction - velocity).square().mean((1, 2)), velocity.square().mean((1, 2)))
@@ -85,6 +89,9 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
         raise ValueError("batches/batch_size must be positive; reference_nfe must be >=128")
     model_class = HorsePointSetTransformer if dataset == "horse" else PointSetTransformer
     model, config, checkpoint, metadata = load_model(config_path, model_class, dataset)
+    if (config.get("anchor_flow") or {}).get("mode") == "anchor_waypoint":
+        raise ValueError("diagnose.py includes linear-path FM residuals, which are invalid for anchor_waypoint; "
+                         "use audit_generation.py --skip-fm instead")
     if not metadata["training_config_verified"]:
         raise ValueError("Diagnostics require a verified checkpoint and its matching run config.yaml")
     cloud_coupling = config["coupling"] in CLOUD_METHODS
@@ -121,7 +128,7 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
     first_path = None
     for batch in range(batches):
         target = sample_target()
-        noise = torch.randn_like(target)
+        noise = sample_source(config, batch_size, device=device, dtype=dtype)
         if pair_sampler is None:
             paired_noise, target = coupled_points(noise, target, coupling=config["coupling"],
                 num_regions=config.get("num_regions"), target_centers=centers,

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import anchor_flow
 from coupling import OFFLINE_METHODS, TG_CACHED_METHODS, coupled_points
 from data import checkerboard_centers, sample_checkerboard
 from experiment import read_config, save_training, synchronize
@@ -21,13 +22,24 @@ def linear_path(x_data, x_noise, t):
     return (1.0 - t) * x_noise + t * x_data
 
 
-def flow_matching_loss(model, x_data, x_noise, t):
-    return F.mse_loss(model(linear_path(x_data, x_noise, t), t), x_data - x_noise)
+def flow_matching_loss(model, x_data, x_noise, t, *, waypoint=None):
+    if waypoint is None:
+        # Preserve the original operation order and RNG when no variant is set.
+        return F.mse_loss(model(linear_path(x_data, x_noise, t), t), x_data - x_noise)
+    state, velocity = anchor_flow.path_and_velocity(x_noise, x_data, t, waypoint=waypoint)
+    return F.mse_loss(model(state, t), velocity)
 
 
 def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, target_centers=None,
                                sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None,
-                               paired_noise=None):
+                               paired_noise=None, anchor_config=None, waypoint_centers=None):
+    flow = anchor_flow.settings(anchor_config) if anchor_config is not None else None
+    if flow is not None and coupling not in TG_CACHED_METHODS:
+        raise ValueError("anchor_flow requires target_guided_cached, including the loss coupling argument")
+    if flow is not None and paired_noise is None:
+        raise ValueError("anchor_flow training requires prepared Hard Bank pairs")
+    if waypoint_centers is not None and (flow is None or flow["mode"] != "anchor_waypoint"):
+        raise ValueError("waypoint_centers requires anchor_flow.mode: anchor_waypoint")
     if paired_noise is None:
         x_noise = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype)
         x_noise, x_data = coupled_points(
@@ -41,15 +53,22 @@ def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, tar
             raise ValueError("Precomputed noise requires an offline coupling and matching [B,N,D] tensors")
         x_noise = paired_noise
     t = sample_time(x_data.shape[0], device=x_data.device, dtype=x_data.dtype)
-    return flow_matching_loss(model, x_data, x_noise, t)
+    waypoint = None
+    if flow is not None and flow["mode"] == "anchor_waypoint":
+        if waypoint_centers is None or waypoint_centers.shape != x_data.shape:
+            raise ValueError("Anchor waypoint training requires per-source-index patch centers")
+        waypoint = anchor_flow.make_waypoint(anchor_config, waypoint_centers, generator=coupling_generator)
+    return flow_matching_loss(model, x_data, x_noise, t, waypoint=waypoint)
 
 
 def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_centers=None,
-               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None, paired_noise=None):
+               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None, paired_noise=None,
+               anchor_config=None, waypoint_centers=None):
     loss = coupled_flow_matching_loss(
         model, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
         sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iterations=sinkhorn_iterations,
         coupling_generator=coupling_generator, paired_noise=paired_noise,
+        anchor_config=anchor_config, waypoint_centers=waypoint_centers,
     )
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -84,17 +103,21 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
     try:
         for step in range(1, training["num_steps"] + 1):
             log_step = step == 1 or step % training["log_every"] == 0
-            paired_noise = None
+            paired_noise, waypoint_centers = None, None
             if pair_sampler is None:
                 target = sample_batch()
             else:
-                paired_noise, target = pair_sampler.sample(config["data"]["batch_size"], generator=generator)
+                pair = pair_sampler.sample(config["data"]["batch_size"], generator=generator)
+                paired_noise, target = pair[:2]
+                if len(pair) == 3:
+                    waypoint_centers = pair[2]
             loss = train_step(
                 model, optimizer, target, coupling=config["coupling"],
                 num_regions=config.get("num_regions"), target_centers=target_centers,
                 sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
                 sinkhorn_iterations=config.get("sinkhorn_iterations", 100), coupling_generator=generator,
                 paired_noise=paired_noise,
+                anchor_config=config if "anchor_flow" in config else None, waypoint_centers=waypoint_centers,
             )
             if log_step:
                 value = loss.item()
@@ -123,7 +146,7 @@ def read_training_config(config_path, *, seed=None, steps=None):
 
 
 def training_arguments(default_config):
-    parser = argparse.ArgumentParser(description="Train with the configured coupling and unchanged FM.")
+    parser = argparse.ArgumentParser(description="Train with the configured coupling and optional explicit anchor path/prior.")
     parser.add_argument("config_path", nargs="?", default=default_config)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--steps", type=int, default=None, help="Override update count; saved in the run config")
