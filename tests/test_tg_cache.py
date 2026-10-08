@@ -71,6 +71,21 @@ class TGCacheTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return tg_cache.prepare(config, dataset)
 
+    def test_unknown_cache_options_are_rejected_without_preparation(self):
+        config = self.config()
+        config["tg_cache"]["obsolete_experiment"] = True
+        with self.assertRaisesRegex(ValueError, "Unsupported tg_cache settings"):
+            tg_cache.prepare(config, "checkerboard")
+        self.assertFalse(Path(config["tg_cache"]["path"]).exists())
+
+    def test_unsupported_cache_format_is_not_silently_reinterpreted(self):
+        config = self.config()
+        path, meta = self.prepare(config)
+        meta["format_version"] = tg_cache.FORMAT_VERSION + 1
+        (path / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "format_version"):
+            tg_cache.load_cache(config, "checkerboard")
+
     def test_hard_determinism_exact_assignment_and_rng_isolation(self):
         hard = self.config()
         repeated = copy.deepcopy(hard)

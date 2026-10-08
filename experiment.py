@@ -50,9 +50,6 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     now = datetime.now(timezone.utc)
     method = canonical_method(config["coupling"])
     name = f"{dataset}_{method}_k{config.get('num_regions', 'na')}_n{config['data']['n_points']}_seed{config['seed']}"
-    variant = (coupling_metadata or {}).get("fine_pairing_variant")
-    if variant in ("model_guided_pool", "model_guided_random_control"):
-        name += "_" + variant
     run_dir = Path("runs") / dataset / f"{name}_{now:%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     snapshot = copy.deepcopy(config)
@@ -180,11 +177,5 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 
 def evaluation_title(config):
-    variant = ""
-    guided = config.get("tg_cache", {}).get("model_guidance")
-    if isinstance(guided, dict) and guided.get("enabled", True):
-        variant = " | fine=" + ("model_guided_random_control"
-                                  if guided.get("selection", "score") == "random"
-                                  else "model_guided_pool")
-    return (f"{config['coupling']}{variant} | K={config.get('num_regions', 'na')} | "
+    return (f"{config['coupling']} | K={config.get('num_regions', 'na')} | "
             f"N={config['data']['n_points']} | seed={config['seed']}")

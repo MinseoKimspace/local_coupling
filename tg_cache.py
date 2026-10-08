@@ -2,9 +2,7 @@
 
 bank: reuse a finite paired-cloud bank with cached exact coarse assignments.
 stream: prepare the complete training stream; each cloud is used once.
-Neither mode requires online OT. By default fine pairing is resampled on every
-visit. Opt-in frozen-model guidance experiments sample separately
-prepared finite permutation pools without changing the original bank or source.
+Neither mode requires online OT. Fine pairing is resampled on every visit.
 Inference always starts from fresh iid standard Gaussian, without the cache.
 """
 
@@ -20,15 +18,12 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 
 from coupling import assign_regions, balanced_target_partition
 from nsot import dataset_spec, file_sha256
-from tg_model_guidance import normalize_options as normalize_model_guidance
 
 
 METHODS = {"target_guided_cached"}
 FORMAT_VERSION = 1
-MODEL_GUIDANCE_FORMAT_VERSION = 3
-CONFIG_KEYS = {"path", "base_path", "sampling", "num_clouds", "seed",
-               "prepare_batch_size", "num_workers", "model_guidance",
-               "cache_sha256", "teacher_checkpoint_sha256"}
+CONFIG_KEYS = {"path", "sampling", "num_clouds", "seed",
+               "prepare_batch_size", "num_workers", "cache_sha256"}
 
 
 def random_fine_permutation(source_labels, target_labels, k, rng):
@@ -80,17 +75,6 @@ def settings(config):
               "num_clouds": count, "cache_seed": _integer(value.get("seed", 0), "tg_cache.seed", 0),
               "prepare_batch_size": _integer(value.get("prepare_batch_size", 64), "prepare_batch_size"),
               "num_workers": workers, "n_points": n, "num_regions": k}
-    guidance = normalize_model_guidance(value.get("model_guidance"))
-    if guidance["enabled"]:
-        if sampling != "bank":
-            raise ValueError("Model guidance supports Hard bank sampling only")
-        if guidance["neighbors"] >= n:
-            raise ValueError("model_guidance.neighbors must be smaller than n_points")
-        if not isinstance(value.get("base_path"), str) or not value["base_path"]:
-            raise ValueError("Model guidance requires tg_cache.base_path naming the original hard cache")
-        if Path(value["base_path"]).resolve() == Path(value["path"]).resolve():
-            raise ValueError("Model guidance must use a NEW cache path, different from base_path")
-        result.update(model_guidance=guidance, base_path=value["base_path"])
     return result
 
 
@@ -100,9 +84,6 @@ def _spec(config, dataset, opts):
             "cache_seed": opts["cache_seed"], "prepare_batch_size": opts["prepare_batch_size"],
             "n_points": opts["n_points"], "num_regions": opts["num_regions"],
             "dataset_spec": dataset_spec(config, dataset)}
-    if "model_guidance" in opts:
-        result.update(format_version=MODEL_GUIDANCE_FORMAT_VERSION,
-                      model_guidance=opts["model_guidance"])
     return result
 
 
@@ -121,15 +102,6 @@ def _array_shapes(count, opts):
     shapes = {"source": ((count, n, 2), np.float32), "target": ((count, n, 2), np.float32),
               "target_labels": ((count, n), np.int32), "capacities": ((count, k), np.int32)}
     shapes["source_labels"] = ((count, n), np.int32)
-    if "model_guidance" in opts:
-        options = opts["model_guidance"]
-        c, p = options["candidates"], options["keep"]
-        shapes.update(fine_permutations=((count, p, n), np.int32),
-                      guidance_candidates=((count, c, n), np.int32),
-                      guidance_components=((count, c, 3), np.float64),
-                      guidance_scores=((count, c), np.float64),
-                      guidance_normalizers=((count, 3), np.float64),
-                      guidance_selected_indices=((count, p), np.int32))
     return shapes
 
 
@@ -165,43 +137,6 @@ def load_cache(config, dataset):
                 raise ValueError(f"TG cache shape/dtype mismatch: {name}")
         finally:
             array._mmap.close()
-    if "model_guidance" in opts:
-        parent = metadata.get("parent_cache", {})
-        parent_meta = parent.get("metadata", {})
-        if parent.get("sha256") != _fingerprint(parent_meta):
-            raise ValueError("Guided parent cache fingerprint mismatch")
-        base_opts = {k: v for k, v in opts.items()
-                     if k not in ("model_guidance", "base_path")}
-        for key, value in _spec(config, dataset, base_opts).items():
-            if parent_meta.get(key) != value:
-                raise ValueError(f"Guided parent cache/config mismatch: {key}")
-        if parent_meta.get("num_clouds") != count:
-            raise ValueError("Guided parent cache cloud count mismatch")
-        for name in _array_shapes(count, base_opts):
-            if parent_meta.get("array_sha256", {}).get(name) != metadata["array_sha256"][name]:
-                raise ValueError(f"Guided changed original cached array: {name}")
-    if "model_guidance" in opts:
-        # Training and generation need only this immutable, self-contained cache;
-        # a live teacher file is deliberately NOT required after preparation.
-        teacher = metadata.get("teacher", {})
-        teacher_digest = teacher.get("checkpoint_sha256")
-        if (not isinstance(teacher_digest, str) or len(teacher_digest) != 64
-                or any(c not in "0123456789abcdef" for c in teacher_digest)):
-            raise ValueError("Model guidance cache lacks a valid teacher checkpoint SHA256")
-        if config["tg_cache"].get("teacher_checkpoint_sha256", teacher_digest) != teacher_digest:
-            raise ValueError("Model guidance teacher differs from the bound checkpoint")
-        from experiment import training_signature
-        snapshot = teacher.get("config")
-        signature = teacher.get("training_signature")
-        if (teacher.get("format_version") != 2 or teacher.get("training_config_verified") is not True
-                or not isinstance(snapshot, dict) or not isinstance(signature, dict)
-                or teacher.get("training_signature_sha256") != _fingerprint(signature)
-                or training_signature(snapshot) != signature):
-            raise ValueError("Model guidance teacher signature/config integrity mismatch")
-        if (snapshot.get("model") != config["model"] or snapshot.get("dtype") != config["dtype"]
-                or snapshot.get("data", {}).get("n_points") != opts["n_points"]
-                or teacher.get("dataset_spec") != dataset_spec(config, dataset)):
-            raise ValueError("Model guidance teacher dataset/model mismatch")
     digest = _fingerprint(metadata)
     if config["tg_cache"].get("cache_sha256", digest) != digest:
         raise ValueError("TG cache differs from the checkpoint training cache")
@@ -211,9 +146,6 @@ def load_cache(config, dataset):
 def prepare(config, dataset):
     """Exclusive, memory-mapped cache creation; existing caches are never overwritten."""
     opts = settings(config)
-    if "model_guidance" in opts:
-        from tg_model_guidance_cache import prepare_guided
-        return prepare_guided(config, dataset, opts)
     spec = _spec(config, dataset, opts)
     path = Path(opts["path"])
     if path.exists():
@@ -317,12 +249,8 @@ class _CloudDataset(Dataset):
                            for name in self.metadata["array_sha256"]}
         arrays = self.arrays
         source_labels = arrays["source_labels"][index]
-        if "fine_permutations" in arrays:
-            pool = arrays["fine_permutations"][index]
-            permutation = pool[int(rng.integers(len(pool)))]
-        else:
-            permutation = random_fine_permutation(source_labels, arrays["target_labels"][index],
-                                                 self.metadata["num_regions"], rng)
+        permutation = random_fine_permutation(source_labels, arrays["target_labels"][index],
+                                             self.metadata["num_regions"], rng)
         # Copies make writable CPU tensors without modifying read-only caches.
         return torch.from_numpy(arrays["source"][index].copy()), torch.from_numpy(arrays["target"][index][permutation].copy())
 
@@ -408,20 +336,4 @@ class TGCachedPairSampler:
                 "cached_target_sha256": meta["array_sha256"]["target"],
                 "cached_target_partition_sha256": meta["array_sha256"]["target_labels"],
                 "precompute_source_sha256": meta["source_sha256"]}
-        if "model_guidance" in meta:
-            result.update(implementation=meta["implementation"],
-                          local_pairing=meta["local_pairing"],
-                          fine_pairing_variant=meta["fine_pairing_variant"],
-                          fine_pairing_objective=meta["model_guidance_summary"]["objective"],
-                          model_guidance=meta["model_guidance"],
-                          model_guidance_summary=meta["model_guidance_summary"],
-                          model_guidance_seconds=meta["model_guidance_seconds"],
-                          teacher=meta["teacher"],
-                          teacher_load_seconds=meta["teacher_load_seconds"],
-                          teacher_training_cost_included=meta["teacher_training_cost_included"],
-                          parent_cache_sha256=meta["parent_cache"]["sha256"],
-                          parent_precompute_seconds=meta["parent_precompute_seconds"],
-                          parent_cache_prepared_now=meta["parent_cache_prepared_now"],
-                          cached_permutations_sha256=meta["array_sha256"]["fine_permutations"],
-                          one_lipschitz_guaranteed=False)
         return result
