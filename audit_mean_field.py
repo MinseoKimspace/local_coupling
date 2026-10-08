@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 
+import anchor_conditioning
 from coupling import (assign_regions, balanced_partition_solver, balanced_target_partition,
                       canonical_method, coupling_permutation, farthest_point_sample,
                       region_centroids)
@@ -143,6 +144,12 @@ def audit(config_path, dataset, *, clouds=16, targets=128, batch_size=8, seed=20
     if clouds < 1 or targets < 2 or batch_size < 1:
         raise ValueError("clouds/batch_size must be positive; targets must be >=2")
     template = read_config(config_path)
+    if anchor_conditioning.settings(template) is not None:
+        raise ValueError(
+            "Analytic t=0 mean-field audit does not support anchor-ID-conditioned NSOT. "
+            "Its conditional law is defined by the fixed OT bank, original source component ID, "
+            "and hybrid source observation, not independent fresh target clouds. "
+            "Use audit_generation.py for conditioned generation and held-out FM residuals.")
     if canonical_method(template["coupling"]) not in SUPPORTED:
         raise ValueError("Analytic t=0 audit supports " + ", ".join(sorted(SUPPORTED)))
     if prefixes is None:

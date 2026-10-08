@@ -4,6 +4,8 @@ import torch
 from skimage.data import horse
 from torch import nn
 
+import anchor_conditioning
+
 from train import read_training_config, train_model, training_arguments
 
 
@@ -17,6 +19,7 @@ class HorsePointSetTransformer(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         dropout: float,
+        anchor_id_count: int = 0,
     ) -> None:
         super().__init__()
         self.input_proj = nn.Linear(point_dim, d_model)
@@ -44,12 +47,18 @@ class HorsePointSetTransformer(nn.Module):
             enable_nested_tensor=False,
         )
         self.output_proj = nn.Linear(d_model, point_dim)
+        self.anchor_id_count = anchor_conditioning.embedding_count(anchor_id_count)
+        self.anchor_embedding = anchor_conditioning.make_embedding(self.anchor_id_count, d_model)
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor,
+                component_ids: torch.Tensor | None = None) -> torch.Tensor:
         angles = t[:, 0, 0].unsqueeze(-1) * self.time_frequencies.unsqueeze(0)
         time_embedding = torch.cat([angles.sin(), angles.cos()], dim=-1)
         time_embedding = self.time_proj(time_embedding).unsqueeze(1)
         h = self.input_proj(x_t) + time_embedding
+        embedding = anchor_conditioning.embedding_features(self.anchor_embedding, component_ids, x_t)
+        if embedding is not None:
+            h = h + embedding
         h = self.encoder(h)
         return self.output_proj(h)
 

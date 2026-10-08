@@ -23,6 +23,7 @@ from scipy.spatial.distance import cdist
 import torch
 
 import anchor_flow
+import anchor_conditioning
 import nsot_directional
 
 FORMAT_VERSION = 1
@@ -57,6 +58,7 @@ def settings(config):
         raise ValueError("2D NSOT requires point_dim=2 and 1 <= n_points <= superset_size")
     anchor_flow.settings(config)
     nsot_directional.settings(config)
+    anchor_conditioning.settings(config)
     return {"superset_size": size, "cache_seed": seed, "beta": float(beta),
             "cache": str(value["cache"]), "solver": SOLVER}
 
@@ -484,9 +486,13 @@ class NSOTPairSampler:
         self.flow_details = anchor_flow.experiment_details(config)
 
     @torch.no_grad()
-    def sample(self, batch_size, *, generator=None):
+    def sample(self, batch_size, *, generator=None, return_components=False):
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
+        if not isinstance(return_components, bool):
+            raise ValueError("return_components must be a bool")
+        if return_components and self.source_components is None:
+            raise ValueError("Original source components require an anchor-prior NSOT bank")
         # Independent draws WITH replacement: Appendix A.1.2's product law.
         index = torch.randint(len(self.source), (batch_size, self.n_points),
                               device=self.source.device, generator=generator)
@@ -496,11 +502,16 @@ class NSOTPairSampler:
             components = self.source_components[index]
             centers = self.prior_centers[components]
             if self.directional_shrink is not None:
-                return nsot_directional.apply(
+                paired_source = nsot_directional.apply(
                     source, centers, sigma=self.sigma,
                     shrink=self.directional_shrink[components],
-                    refresh=self.directional_refresh[components], noise=noise), target
-            return component_centered_hybrid(source, centers, sigma=self.sigma, beta=self.beta, noise=noise), target
+                    refresh=self.directional_refresh[components], noise=noise)
+            else:
+                paired_source = component_centered_hybrid(source, centers, sigma=self.sigma,
+                                                          beta=self.beta, noise=noise)
+            if return_components:
+                return paired_source, target, components
+            return paired_source, target
         return math.sqrt(1 - self.beta) * source + math.sqrt(self.beta) * noise, target
 
     def details(self):

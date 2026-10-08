@@ -226,6 +226,17 @@ def experiment_details(config):
                 paper_variant="experimental same-anchor-prior directional hybrid; not original NSOT and not model conditioning",
                 limitation="population prior preservation does not guarantee finite-cache marginals, learned output density or thin-structure quality",
             )
+    # Import locally: the optional conditioning module validates this prior.
+    import anchor_conditioning
+    conditioning = anchor_conditioning.settings(config)
+    if conditioning is not None:
+        shared.update(
+            implementation="nsot_anchor_prior_source_id_v1",
+            anchor_flow_implementation="nsot_anchor_prior_source_id_v1",
+            model_conditioning=conditioning,
+            paper_variant="experimental same-anchor-prior isotropic NSOT plus source-component conditioning",
+            limitation="prior plus model conditioning, not a coupling-only comparison or a 1-NFE quality guarantee",
+        )
     return shared
 
 
@@ -236,4 +247,7 @@ def variant_suffix(config):
     suffix = opts["mode"]
     if config.get("nsot", {}).get("directional_hybrid") is not None:
         suffix += "_directional"
+    import anchor_conditioning
+    if anchor_conditioning.settings(config) is not None:
+        suffix += "_id"
     return suffix

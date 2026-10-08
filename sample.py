@@ -2,11 +2,14 @@ import torch
 
 from torch import nn
 
+from anchor_conditioning import velocity
+
 def integrate_velocity(
     model: nn.Module,
     x_noise: torch.Tensor,
     *,
     num_steps: int,
+    component_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if num_steps <= 0:
         raise ValueError("num_steps must be positive")
@@ -24,7 +27,7 @@ def integrate_velocity(
                 device=x.device,
                 dtype=x.dtype,
             )
-            x = x + dt * model(x, t)
+            x = x + dt * velocity(model, x, t, component_ids)
 
     model.train(was_training)
     return x

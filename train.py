@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 import anchor_flow
+import anchor_conditioning
 from coupling import OFFLINE_METHODS, TG_CACHED_METHODS, coupled_points
 from data import checkerboard_centers, sample_checkerboard
 from experiment import read_config, save_training, synchronize
@@ -22,14 +23,21 @@ def linear_path(x_data, x_noise, t):
     return (1.0 - t) * x_noise + t * x_data
 
 
-def flow_matching_loss(model, x_data, x_noise, t):
-    return F.mse_loss(model(linear_path(x_data, x_noise, t), t), x_data - x_noise)
+def flow_matching_loss(model, x_data, x_noise, t, component_ids=None):
+    return F.mse_loss(anchor_conditioning.velocity(model, linear_path(x_data, x_noise, t), t,
+                                                  component_ids), x_data - x_noise)
 
 
 def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, target_centers=None,
                                sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None,
-                               paired_noise=None, anchor_config=None):
+                               paired_noise=None, anchor_config=None, component_ids=None):
     flow = anchor_flow.settings(anchor_config) if anchor_config is not None else None
+    conditioning = anchor_conditioning.settings(anchor_config) if anchor_config is not None else None
+    if conditioning is not None:
+        if component_ids is None:
+            raise ValueError("Anchor ID conditioning requires original paired source component_ids")
+    elif component_ids is not None or getattr(model, "anchor_id_count", 0):
+        raise ValueError("Anchor-conditioned loss requires its configured anchor-prior NSOT experiment")
     if flow is not None and (coupling not in OFFLINE_METHODS or coupling != anchor_config["coupling"]):
         raise ValueError("anchor_flow requires its configured offline coupling, including the loss coupling argument")
     if flow is not None and paired_noise is None:
@@ -47,17 +55,18 @@ def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, tar
             raise ValueError("Precomputed noise requires an offline coupling and matching [B,N,D] tensors")
         x_noise = paired_noise
     t = sample_time(x_data.shape[0], device=x_data.device, dtype=x_data.dtype)
-    return flow_matching_loss(model, x_data, x_noise, t)
+    return flow_matching_loss(model, x_data, x_noise, t, component_ids)
 
 
 def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_centers=None,
                sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None, paired_noise=None,
-               anchor_config=None):
+               anchor_config=None, component_ids=None):
     loss = coupled_flow_matching_loss(
         model, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
         sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iterations=sinkhorn_iterations,
         coupling_generator=coupling_generator, paired_noise=paired_noise,
         anchor_config=anchor_config,
+        component_ids=component_ids,
     )
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -66,6 +75,10 @@ def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_c
 
 
 def train_model(model, config, sample_batch, *, dataset, config_path, target_centers=None):
+    conditioning = anchor_conditioning.settings(config)
+    expected_count = 0 if conditioning is None else conditioning["num_embeddings"]
+    if getattr(model, "anchor_id_count", 0) != expected_count:
+        raise ValueError("Model anchor_id_count differs from its training configuration")
     training = config["training"]
     if training["num_steps"] < 1 or training["log_every"] < 1:
         raise ValueError("num_steps and log_every must be positive")
@@ -92,11 +105,15 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
     try:
         for step in range(1, training["num_steps"] + 1):
             log_step = step == 1 or step % training["log_every"] == 0
-            paired_noise = None
+            paired_noise, component_ids = None, None
             if pair_sampler is None:
                 target = sample_batch()
             else:
-                paired_noise, target = pair_sampler.sample(config["data"]["batch_size"], generator=generator)
+                if conditioning is None:
+                    paired_noise, target = pair_sampler.sample(config["data"]["batch_size"], generator=generator)
+                else:
+                    paired_noise, target, component_ids = pair_sampler.sample(
+                        config["data"]["batch_size"], generator=generator, return_components=True)
             loss = train_step(
                 model, optimizer, target, coupling=config["coupling"],
                 num_regions=config.get("num_regions"), target_centers=target_centers,
@@ -104,6 +121,7 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
                 sinkhorn_iterations=config.get("sinkhorn_iterations", 100), coupling_generator=generator,
                 paired_noise=paired_noise,
                 anchor_config=config if "anchor_flow" in config else None,
+                component_ids=component_ids,
             )
             if log_step:
                 value = loss.item()

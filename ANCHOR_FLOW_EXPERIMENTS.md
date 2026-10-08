@@ -230,3 +230,77 @@ foreach ($directionalJob in $directionalJobs) {
 ```
 
 Inference still draws the same saved isotropic GMM and uses the same network; the directional matrices are a training-coupling mechanism, not an extra inference transform. Compare against the existing isotropic anchor-NSOT runs with the same prior centers, pair cache, beta, architecture and evaluation streams. Report 1-NFE CD together with leakage, density/cell-mass and horse thin/gap ROI metrics, plus accepted/fallback component counts and sidecar fitting time. The covariance identity preserves the source law, **not** the generated endpoint density, thin structures, 1-step quality or superiority over any baseline.
+
+## Source-component ID conditioning: same prior and coupling, additional model input
+
+The optional `model.anchor_id_count: 8` experiment gives each point its original source GMM component ID. It uses the **isotropic** component-centered NSOT hybrid, the same fixed centers, sigma=0.1, beta=0.2, K=8, N=256, M=10,000, cache paths, seed, optimizer and 10,000 updates as the existing ID-free anchor-NSOT templates. It does not enable `nsot.directional_hybrid` or change the paired targets, FM loss or source distribution.
+
+The network adds a learned per-point `Embedding(K, d_model)` vector to the projected input features. The embedding weights start at zero, so the added ID feature initially contributes zero. The checkerboard embedding adds 8*128=1024 parameters; the horse embedding adds 8*256=2048 parameters. This is a small **model-conditioning** change, not a coupling-only upgrade.
+
+During training, the component IDs are taken from exactly the same bank indices as the sampled source-target pairs. Hybrid noise stays centered on that original component, and the FM target remains `paired_target - actual_hybrid_source`. There are no target component labels, nearest-anchor reassignment, additional OT computations or auxiliary losses.
+
+During inference, sample the original GMM component ID together with each source coordinate, and hold that ID fixed throughout the rollout. All NFE settings therefore use the point's sampled source identity, not its closest center after movement. The saved configuration/checkpoint contains the resolved centers and ID-conditioned model settings, so generation needs neither the training bank nor a directional sidecar.
+
+Giving the model a source ID may reduce ambiguity when different source components' intermediate paths overlap. It does not guarantee improved 1-NFE quality: at t=0, well-separated Gaussian components may already be identifiable from the coordinates, making the extra ID largely redundant. Compare the ID-free isotropic anchor-NSOT control with identical prior, coupling and evaluation streams; do not attribute gains to coupling alone.
+
+### Prepare and train the two ID-conditioned experiments
+
+Run from the project root. An existing matching anchor-NSOT bank is verified and reused; do not delete it or replace it with a different-prior cache.
+
+```powershell
+python prepare_nsot.py checkerboard_experiments/nsot_anchor_prior_id_k8_n256_seed0.yaml --dataset checkerboard
+python train.py checkerboard_experiments/nsot_anchor_prior_id_k8_n256_seed0.yaml
+python prepare_nsot.py horse_experiments/horse_nsot_anchor_prior_id_k8_n256_seed0.yaml --dataset horse
+python train_horse.py horse_experiments/horse_nsot_anchor_prior_id_k8_n256_seed0.yaml
+```
+
+The distinct run-name suffix is `anchor_prior_id`; the checkpoint filenames are `nsot_anchor_prior_id_k8_n256_seed0.pt` and `horse_nsot_anchor_prior_id_k8_n256_seed0.pt`.
+
+### Evaluate and audit saved ID-conditioned runs safely
+
+The block below contains no placeholder paths. It discovers one matching run per dataset and refuses to guess if none or multiple exist. If multiple candidates are printed, select the intended saved `config.yaml` deliberately before evaluating. It validates both completed runs before starting, and passes each command's arguments as an array to avoid an empty config path being interpreted as an NFE.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$anchorIdJobs = @(
+    [pscustomobject]@{ Dataset='checkerboard'; Root='runs/checkerboard'; Script='eval.py'; Checkpoint='nsot_anchor_prior_id_k8_n256_seed0.pt'; Config=$null },
+    [pscustomobject]@{ Dataset='horse'; Root='runs/horse'; Script='eval_horse.py'; Checkpoint='horse_nsot_anchor_prior_id_k8_n256_seed0.pt'; Config=$null }
+)
+foreach ($anchorIdJob in $anchorIdJobs) {
+    if (-not (Test-Path -LiteralPath $anchorIdJob.Root -PathType Container)) {
+        throw ('Run directory not found: ' + $anchorIdJob.Root)
+    }
+    $anchorIdRuns = @(Get-ChildItem -LiteralPath $anchorIdJob.Root -Directory |
+        Where-Object { $_.Name -like '*nsot*anchor_prior_id*' })
+    if ($anchorIdRuns.Count -ne 1) {
+        $anchorIdRuns | Select-Object FullName
+        throw ('Expected exactly one ID-conditioned run in ' + $anchorIdJob.Root + '; found ' + $anchorIdRuns.Count)
+    }
+    $anchorIdRun = $anchorIdRuns[0]
+    foreach ($anchorIdRequired in @('config.yaml', 'training.json', $anchorIdJob.Checkpoint)) {
+        $anchorIdRequiredPath = Join-Path $anchorIdRun.FullName $anchorIdRequired
+        if (-not (Test-Path -LiteralPath $anchorIdRequiredPath -PathType Leaf)) {
+            throw ('Completed run file not found: ' + $anchorIdRequiredPath)
+        }
+    }
+    $anchorIdJob.Config = Join-Path $anchorIdRun.FullName 'config.yaml'
+}
+foreach ($anchorIdJob in $anchorIdJobs) {
+    Write-Host ('Evaluating: ' + $anchorIdJob.Config)
+    foreach ($anchorIdNfe in @(1,2,4,8,16,32,64,128)) {
+        $anchorIdEvalArgs = @($anchorIdJob.Script, $anchorIdJob.Config, [string]$anchorIdNfe)
+        & python @anchorIdEvalArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw ('Evaluation failed: ' + $anchorIdJob.Config + ' / NFE=' + $anchorIdNfe)
+        }
+    }
+    $anchorIdAuditArgs = @('audit_generation.py', $anchorIdJob.Config,
+        '--dataset', $anchorIdJob.Dataset, '--clouds', '32', '--skip-fm', '--seed', '2026',
+        '--nfes', '1', '2', '4', '8', '16', '32', '64', '128',
+        '--reference-nfe', '128', '--max-reference-nfe', '512')
+    & python @anchorIdAuditArgs
+    if ($LASTEXITCODE -ne 0) { throw ('Generation audit failed: ' + $anchorIdJob.Config) }
+}
+```
+
+Prioritize 1-NFE CD together with background leakage, cell-mass/density and horse thin-structure/gap ROI scores; also report no-flow prior quality and higher-NFE results. Keep preparation, training and inference timing scopes separate. The ID embedding adds no online OT or extra model evaluations, but its small runtime cost should be measured rather than assumed to be zero.
