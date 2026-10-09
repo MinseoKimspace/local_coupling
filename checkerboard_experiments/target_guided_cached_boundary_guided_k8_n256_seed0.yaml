@@ -1,0 +1,49 @@
+seed: 0
+device: cuda
+dtype: float32
+coupling: target_guided_cached
+num_regions: 8
+
+tg_cache:
+  path: coupling_cache/checkerboard_tg_hard_k8_n256_seed0_boundary_guided
+  sampling: bank
+  num_clouds: 4096
+  seed: 0
+  prepare_batch_size: 64
+  num_workers: 2
+  coarse_mode: boundary_guided
+  boundary:
+    num_tables: 4
+    source_neighbors: 8
+    max_swaps: 16
+    tau: 2.0
+    distance_epsilon: 0.001
+    max_cost_increase: 0.02
+    cost_match_tolerance: 0.005
+    destination_budget: 0.5
+    target_neighbors: 2
+    max_target_distance_factor: 2.0
+
+data:
+  batch_size: 64
+  n_points: 256
+  grid_size: 4
+
+model:
+  point_dim: 2
+  d_model: 128
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 256
+  dropout: 0.0
+
+training:
+  num_steps: 10000
+  learning_rate: 0.001
+  weight_decay: 0.01
+  log_every: 100
+
+evaluation:
+  batch_size: 64
+
+checkpoint: target_guided_cached_boundary_guided_k8_n256_seed0.pt

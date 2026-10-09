@@ -78,8 +78,10 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
         pair_sampler = TGCachedPairSampler(config, dataset, device, next(model.parameters()).dtype, training=True)
         config["tg_cache"]["cache_sha256"] = pair_sampler.cache_sha256
         print(f"tg_cache_sha256={pair_sampler.cache_sha256} "
-              f"sampling={pair_sampler.metadata['sampling']} clouds={pair_sampler.metadata['num_clouds']} "
-              f"fine={pair_sampler.metadata.get('fine_pairing_mode', 'random')}", flush=True)
+              f"sampling={pair_sampler.metadata['sampling']} clouds={pair_sampler.metadata['num_clouds']}", flush=True)
+        if "coarse_mode" in pair_sampler.metadata:
+            print(f"coarse_mode={pair_sampler.metadata['coarse_mode']} fine=fresh_random "
+                  f"tables={pair_sampler.metadata['boundary_options']['num_tables']}", flush=True)
     model.train()
     synchronize(device)
     start = perf_counter()

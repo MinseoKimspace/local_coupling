@@ -1,9 +1,10 @@
-"""Offline 2D hard TG, with random or cached exact within-patch bijections.
+"""Offline 2D hard TG, with fresh random within-patch bijections.
 
 bank: reuse a finite paired-cloud bank with cached exact coarse assignments.
 stream: prepare the complete training stream; each cloud is used once.
-Neither mode requires online OT. Random fine pairing is resampled on each
-visit; exact fine pairing is solved offline once and reused without shuffling.
+Neither mode requires online OT. Fine pairing is resampled on every visit.
+Optional boundary-guided/control experiments choose a cached hard coarse
+table uniformly per visit, then use the SAME fresh random fine pairing.
 Inference starts from fresh iid standard Gaussian, without the cache.
 """
 
@@ -14,7 +15,6 @@ import shutil
 from time import perf_counter
 
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 import torch
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 
@@ -25,9 +25,10 @@ from nsot import dataset_spec, file_sha256
 
 METHODS = {"target_guided_cached"}
 FORMAT_VERSION = 1
-EXACT_FORMAT_VERSION = 2
+BOUNDARY_FORMAT_VERSION = 3
+COARSE_MODES = ("baseline", "boundary_guided", "random_swap_control")
 CONFIG_KEYS = {"path", "sampling", "num_clouds", "seed",
-               "prepare_batch_size", "num_workers", "cache_sha256", "fine_pairing"}
+               "prepare_batch_size", "num_workers", "cache_sha256", "coarse_mode", "boundary"}
 
 
 def random_fine_permutation(source_labels, target_labels, k, rng):
@@ -39,38 +40,6 @@ def random_fine_permutation(source_labels, target_labels, k, rng):
         if len(source) != len(target):
             raise ValueError("Source and target patch counts differ")
         permutation[source] = rng.permutation(target)
-    return permutation
-
-
-def exact_fine_permutation(source, target, source_labels, target_labels, k):
-    """Minimize squared endpoint distance, keeping both TG patch labels fixed.
-
-    This is a bijection, not independent nearest-neighbor selection. Solve in
-    float64 without consuming any RNG, so preparation draws/coarse assignments
-    remain identical to the random-fine control with the same configuration.
-    """
-    source, target = np.asarray(source, dtype=np.float64), np.asarray(target, dtype=np.float64)
-    source_labels, target_labels = np.asarray(source_labels), np.asarray(target_labels)
-    k = _integer(k, "num_regions")
-    if (source.ndim != 2 or source.shape[1] != 2 or target.shape != source.shape
-            or len(source) == 0 or not np.isfinite(source).all() or not np.isfinite(target).all()):
-        raise ValueError("Exact fine pairing requires matching nonempty finite [N,2] arrays")
-    for labels in (source_labels, target_labels):
-        if (labels.shape != (len(source),) or not np.issubdtype(labels.dtype, np.integer)
-                or np.any(labels < 0) or np.any(labels >= k)):
-            raise ValueError("Exact fine pairing requires integer patch labels in [0,K)")
-    permutation = np.empty(len(source), dtype=np.int64)
-    for patch in range(k):
-        src = np.flatnonzero(source_labels == patch)
-        dst = np.flatnonzero(target_labels == patch)
-        if len(src) != len(dst):
-            raise ValueError("Source and target patch counts differ")
-        if not len(src):
-            continue
-        differences = source[src, None, :] - target[None, dst, :]
-        cost = np.sum(differences * differences, axis=-1)
-        rows, columns = linear_sum_assignment(cost)
-        permutation[src[rows]] = dst[columns]
     return permutation
 
 
@@ -99,11 +68,18 @@ def settings(config):
     sampling = value.get("sampling", "bank")
     if sampling not in ("bank", "stream"):
         raise ValueError("tg_cache.sampling must be bank or stream")
-    fine_pairing = value.get("fine_pairing", "random")
-    if fine_pairing not in ("random", "exact"):
-        raise ValueError("tg_cache.fine_pairing must be random or exact")
-    if fine_pairing == "exact" and n > np.iinfo(np.int32).max:
-        raise ValueError("Exact fine cache uses int32 point indices; n_points is too large")
+    coarse_mode = value.get("coarse_mode", "baseline")
+    if coarse_mode not in COARSE_MODES:
+        raise ValueError("tg_cache.coarse_mode must be baseline, boundary_guided or random_swap_control")
+    boundary = None
+    if coarse_mode == "baseline":
+        if "boundary" in value:
+            raise ValueError("tg_cache.boundary requires a non-baseline coarse_mode")
+    else:
+        from tg_boundary import settings as boundary_settings
+        boundary = boundary_settings(value.get("boundary", {}))
+        if n > np.iinfo(np.int32).max:
+            raise ValueError("Boundary coarse tables require int32 patch indices")
     count = value.get("num_clouds")
     if count is not None:
         count = _integer(count, "tg_cache.num_clouds")
@@ -114,7 +90,7 @@ def settings(config):
     workers = _integer(value.get("num_workers", 0), "tg_cache.num_workers", 0)
     validate_gaussian_source(config)
     result = {"method": method, "path": value["path"], "sampling": sampling,
-              "fine_pairing": fine_pairing,
+              "coarse_mode": coarse_mode, "boundary": boundary,
               "num_clouds": count, "cache_seed": _integer(value.get("seed", 0), "tg_cache.seed", 0),
               "prepare_batch_size": _integer(value.get("prepare_batch_size", 64), "prepare_batch_size"),
               "num_workers": workers, "n_points": n, "num_regions": k}
@@ -122,16 +98,15 @@ def settings(config):
 
 
 def _spec(config, dataset, opts):
-    version = EXACT_FORMAT_VERSION if opts["fine_pairing"] == "exact" else FORMAT_VERSION
-    result = {"format_version": version, "method": opts["method"],
+    variant = opts["coarse_mode"] != "baseline"
+    result = {"format_version": BOUNDARY_FORMAT_VERSION if variant else FORMAT_VERSION, "method": opts["method"],
             "sampling": opts["sampling"], "configured_num_clouds": opts["num_clouds"],
             "cache_seed": opts["cache_seed"], "prepare_batch_size": opts["prepare_batch_size"],
             "n_points": opts["n_points"], "num_regions": opts["num_regions"],
             "dataset_spec": dataset_spec(config, dataset)}
-    # Leave the original random-fine v1 spec unchanged: old cache fingerprints
-    # and saved checkpoint configurations must continue to validate.
-    if opts["fine_pairing"] == "exact":
-        result["fine_pairing_mode"] = "exact"
+    # Do not alter the v1 spec: existing random-TG caches/checkpoints still work.
+    if variant:
+        result.update(coarse_mode=opts["coarse_mode"], boundary_options=opts["boundary"])
     return result
 
 
@@ -150,8 +125,8 @@ def _array_shapes(count, opts):
     shapes = {"source": ((count, n, 2), np.float32), "target": ((count, n, 2), np.float32),
               "target_labels": ((count, n), np.int32), "capacities": ((count, k), np.int32)}
     shapes["source_labels"] = ((count, n), np.int32)
-    if opts["fine_pairing"] == "exact":
-        shapes["fine_permutation"] = ((count, n), np.int32)
+    if opts["coarse_mode"] != "baseline":
+        shapes["coarse_tables"] = ((count, opts["boundary"]["num_tables"], n), np.int32)
     return shapes
 
 
@@ -169,7 +144,7 @@ def load_cache(config, dataset):
     for key, value in _spec(config, dataset, opts).items():
         if metadata.get(key) != value:
             raise ValueError(f"TG cache/config mismatch: {key}")
-    implementation = "tg_offline_fine_exact_v2" if opts["fine_pairing"] == "exact" else "tg_offline_v1"
+    implementation = "tg_offline_v1" if opts["coarse_mode"] == "baseline" else "tg_offline_boundary_v3"
     if (metadata.get("implementation") != implementation
             or metadata.get("source_coordinates") != "unmodified iid standard Gaussian draws"):
         raise ValueError("Unsupported TG cache source/implementation; only standard-Gaussian caches are supported")
@@ -197,6 +172,30 @@ def load_cache(config, dataset):
     return path, metadata, digest
 
 
+def _accumulate_boundary(summary, record):
+    """Streaming summaries only; do not keep per-cloud reports in RAM."""
+    summary["clouds"] += 1
+    summary["noop_clouds"] += int(record["accepted_swaps"] == 0)
+
+    def visit(value, prefix=""):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit(item, f"{prefix}.{key}" if prefix else key)
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                visit(item, f"{prefix}.{index}")
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not np.isfinite(value):
+                raise FloatingPointError(f"Nonfinite boundary diagnostic: {prefix}")
+            item = summary["metrics"].setdefault(
+                prefix, {"count": 0, "sum": 0., "min": float(value), "max": float(value)})
+            item["count"] += 1
+            item["sum"] += value
+            item["min"], item["max"] = min(item["min"], value), max(item["max"], value)
+
+    visit(record)
+
+
 def prepare(config, dataset):
     """Exclusive, memory-mapped cache creation; existing caches are never overwritten."""
     opts = settings(config)
@@ -209,8 +208,7 @@ def prepare(config, dataset):
     count = _cloud_count(config, opts)
     shapes = _array_shapes(count, opts)
     storage = sum(int(np.prod(shape)) * np.dtype(dtype).itemsize for shape, dtype in shapes.values())
-    print(f"TG prepare {opts['method']} {opts['sampling']} fine={opts['fine_pairing']} "
-          f"clouds={count} K={opts['num_regions']} "
+    print(f"TG prepare {opts['method']} {opts['sampling']} clouds={count} K={opts['num_regions']} "
           f"N={opts['n_points']} storage_GiB={storage / 2**30:.3f}", flush=True)
     ancestor = path.resolve().parent
     while not ancestor.exists():
@@ -222,7 +220,9 @@ def prepare(config, dataset):
     path.mkdir(exist_ok=False)
     arrays = {name: np.lib.format.open_memmap(path / f"{name}.npy", mode="w+", dtype=dtype, shape=shape)
               for name, (shape, dtype) in shapes.items()}
-    draw_seconds = partition_seconds = assignment_seconds = fine_assignment_seconds = 0.
+    draw_seconds = partition_seconds = assignment_seconds = 0.
+    guidance_seconds = 0.
+    boundary_summary = {"clouds": 0, "noop_clouds": 0, "metrics": {}}
     threads = torch.get_num_threads()
     try:
         # Small CPU N x K solves; avoid large thread-pool overhead. Restore the
@@ -254,13 +254,20 @@ def prepare(config, dataset):
                 source_labels = assign_regions(source, centers, capacities, solver="exact_batched").numpy()
                 arrays["source_labels"][begin:end] = source_labels
                 assignment_seconds += perf_counter() - tick
-                if opts["fine_pairing"] == "exact":
+                if opts["coarse_mode"] != "baseline":
+                    from tg_boundary import build_tables
                     tick = perf_counter()
                     for offset in range(end - begin):
-                        arrays["fine_permutation"][begin + offset] = exact_fine_permutation(
+                        index = begin + offset
+                        seed = int(np.random.SeedSequence([opts["cache_seed"], index, 0x5447]).generate_state(
+                            1, dtype=np.uint64)[0])
+                        guided, control, record = build_tables(
                             source[offset].numpy(), target[offset].numpy(), source_labels[offset],
-                            labels[offset].numpy(), opts["num_regions"])
-                    fine_assignment_seconds += perf_counter() - tick
+                            labels[offset].numpy(), opts["num_regions"], opts["boundary"], seed)
+                        arrays["coarse_tables"][index] = (guided if opts["coarse_mode"] == "boundary_guided"
+                                                          else control)
+                        _accumulate_boundary(boundary_summary, record)
+                    guidance_seconds += perf_counter() - tick
                 print(f"tg_prepared={end}/{count}", flush=True)
     finally:
         torch.set_num_threads(threads)
@@ -269,15 +276,12 @@ def prepare(config, dataset):
             array._mmap.close()
         arrays.clear()
     hashes = {name: file_sha256(path / f"{name}.npy") for name in shapes}
-    exact = opts["fine_pairing"] == "exact"
     metadata = {**spec, "num_clouds": count, "array_sha256": hashes,
-                "implementation": "tg_offline_fine_exact_v2" if exact else "tg_offline_v1",
-                "source_coordinates": "unmodified iid standard Gaussian draws",
+                "implementation": "tg_offline_v1", "source_coordinates": "unmodified iid standard Gaussian draws",
                 "target_partition": "balanced FPS, exact POT transportation; actual patch centroids",
                 "source_assignment": "exact POT",
                 "coarse_resampling": "cached labels",
-                "fine_pairing": ("cached exact squared-Euclidean bijection per patch; no online resampling"
-                                 if exact else "fresh uniform random bijection per patch per visit"),
+                "fine_pairing": "fresh uniform random bijection per patch per visit",
                 "marginals": "finite empirical paired-cloud bank" if opts["sampling"] == "bank" else "pre-drawn iid cloud stream; each cloud used at most once",
                 "inference_source": "fresh iid standard Gaussian; no cache, anchors or patches",
                 "draw_seconds": draw_seconds, "target_partition_seconds": partition_seconds,
@@ -288,12 +292,22 @@ def prepare(config, dataset):
                 "environment": {"torch": str(torch.__version__), "numpy": np.__version__},
                 "source_sha256": {name: file_sha256(Path(__file__).parent / name)
                                   for name in ("tg_cache.py", "coupling.py", "data.py", "train_horse.py")}}
-    if exact:
-        import scipy
-        metadata.update(fine_assignment_seconds=fine_assignment_seconds,
-                        fine_assignment_solver="SciPy/linear_sum_assignment",
-                        fine_assignment_cost="squared Euclidean in float64; fixed TG patch memberships")
-        metadata["environment"]["scipy"] = scipy.__version__
+    if opts["coarse_mode"] != "baseline":
+        for values in boundary_summary["metrics"].values():
+            values["mean"] = values["sum"] / values["count"]
+        metadata.update(
+            implementation="tg_offline_boundary_v3",
+            source_assignment="exact POT baseline followed by offline capacity-preserving coarse swaps",
+            coarse_resampling="uniform hard table per visit; table zero is the unchanged TG baseline",
+            coarse_guidance_seconds=guidance_seconds,
+            boundary_summary=boundary_summary,
+            boundary_score_definition="source-kNN graph hinge of ensemble-mean velocity differences at t=0; NOT a neural Jacobian",
+            boundary_matching="both variants constructed together per cloud; equal accepted swaps per table and bounded coarse-cost gap",
+            boundary_guard_definition="per-table centroid cost budget, target adjacency/distance, per-source ensemble centroid-drift budget; NOT topology guarantees",
+            precompute_timing_scope="draws, coarse solves, paired guided/control construction, array IO and hashing; excludes final metadata write")
+        metadata["source_sha256"]["tg_boundary.py"] = file_sha256(Path(__file__).parent / "tg_boundary.py")
+        print(f"boundary_mode={opts['coarse_mode']} noop_clouds={boundary_summary['noop_clouds']}/{count} "
+              f"guidance_seconds={guidance_seconds:.3f}", flush=True)
     # Written last: interruption leaves an explicitly incomplete cache, never a
     # apparently valid one. No overwrite/automatic deletion of existing data.
     with (path / "metadata.json").open("x", encoding="utf-8") as stream:
@@ -319,11 +333,13 @@ class _CloudDataset(Dataset):
             self.arrays = {name: np.load(Path(self.path) / f"{name}.npy", mmap_mode="r", allow_pickle=False)
                            for name in self.metadata["array_sha256"]}
         arrays = self.arrays
-        if self.metadata.get("fine_pairing_mode", "random") == "exact":
-            permutation = arrays["fine_permutation"][index]
+        if "coarse_tables" in arrays:
+            table = int(rng.integers(self.metadata["boundary_options"]["num_tables"]))
+            source_labels = arrays["coarse_tables"][index, table]
         else:
-            permutation = random_fine_permutation(arrays["source_labels"][index], arrays["target_labels"][index],
-                                                 self.metadata["num_regions"], rng)
+            source_labels = arrays["source_labels"][index]
+        permutation = random_fine_permutation(source_labels, arrays["target_labels"][index],
+                                             self.metadata["num_regions"], rng)
         # Copies make writable CPU tensors without modifying read-only caches.
         return (torch.from_numpy(arrays["source"][index].copy()),
                 torch.from_numpy(arrays["target"][index][permutation].copy()))
@@ -398,10 +414,7 @@ class TGCachedPairSampler:
 
     def details(self):
         meta = self.metadata
-        mode = meta.get("fine_pairing_mode", "random")
-        result = {"implementation": meta["implementation"], "fine_pairing_mode": mode,
-                "local_pairing": "cached_exact_bijection" if mode == "exact" else "fresh_uniform_random_bijection",
-                "cache_sha256": self.cache_sha256, "cache_seed": meta["cache_seed"],
+        result = {"cache_sha256": self.cache_sha256, "cache_seed": meta["cache_seed"],
                 "cache_clouds": meta["num_clouds"], "cache_sampling": meta["sampling"],
                 "cache_setup_seconds": self.setup_seconds, "precompute_seconds": meta["precompute_seconds"],
                 "precompute_timing_scope": meta["precompute_timing_scope"],
@@ -411,11 +424,15 @@ class TGCachedPairSampler:
                 "cached_source_sha256": meta["array_sha256"]["source"],
                 "cached_target_sha256": meta["array_sha256"]["target"],
                 "cached_target_partition_sha256": meta["array_sha256"]["target_labels"],
-                "cached_source_assignment_sha256": meta["array_sha256"]["source_labels"],
                 "precompute_source_sha256": meta["source_sha256"]}
-        if mode == "exact":
-            result.update(point_solver=meta["fine_assignment_solver"],
-                          fine_assignment_seconds=meta["fine_assignment_seconds"],
-                          fine_assignment_cost=meta["fine_assignment_cost"],
-                          cached_fine_permutation_sha256=meta["array_sha256"]["fine_permutation"])
+        if "coarse_mode" in meta:
+            result.update(implementation=meta["implementation"], coarse_mode=meta["coarse_mode"],
+                          source_assignment=meta["source_assignment"],
+                          boundary_options=meta["boundary_options"], boundary_summary=meta["boundary_summary"],
+                          coarse_guidance_seconds=meta["coarse_guidance_seconds"],
+                          boundary_score_definition=meta["boundary_score_definition"],
+                          boundary_guard_definition=meta["boundary_guard_definition"],
+                          boundary_matching=meta["boundary_matching"],
+                          cached_source_assignment_sha256=meta["array_sha256"]["source_labels"],
+                          cached_coarse_tables_sha256=meta["array_sha256"]["coarse_tables"])
         return result
