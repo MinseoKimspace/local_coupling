@@ -1,6 +1,5 @@
-# Equal-weight, fixed-isotropic-sigma GMM fitted by EM on training references.
-# Same NSOT, backbone, sampling and training settings as the balanced-anchor prior.
-# This is a constrained source-prior ablation, not a learned full-covariance GMM.
+# Ordinary fitted GMM: learned weights, means and full 2D covariances.
+# Experimental prior-changing NSOT extension; not original Gaussian-prior NSOT.
 seed: 0
 device: cuda
 dtype: float32
@@ -8,17 +7,16 @@ coupling: nsot
 num_regions: 8
 
 anchor_flow:
-  mode: anchor_prior
-  sigma: 0.1
+  mode: gmm_prior
   reference_points: 4096
   seed: 0
-  center_fit: gmm_em
-  gmm_n_init: 5
-  gmm_max_iter: 100
-  gmm_tol: 1.0e-6
+  n_init: 5
+  max_iter: 300
+  tol: 0.0001
+  reg_covar: 0.000001
 
 nsot:
-  cache: coupling_cache/nsot/checkerboard_gmm_em_k8_m10000_seed0.npz
+  cache: coupling_cache/nsot/checkerboard_gmm_full_prior_k8_m10000_seed0.npz
   superset_size: 10000
   cache_seed: 0
   beta: 0.2
@@ -46,4 +44,4 @@ training:
 evaluation:
   batch_size: 64
 
-checkpoint: nsot_gmm_prior_k8_n256_seed0.pt
+checkpoint: nsot_gmm_full_prior_k8_n256_seed0.pt

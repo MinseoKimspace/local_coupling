@@ -8,6 +8,7 @@ Fixed finite caches approximate, rather than exactly equal, population marginals
 Baseline inference starts from fresh iid standard Gaussian, without this cache.
 Optional anchor_prior uses a GMM BEFORE OT and a component-centered hybrid
 kernel; its population GMM is preserved, not the original NSOT Gaussian prior.
+The separate gmm_prior mode learns weights, means and full covariances by EM.
 """
 
 import copy
@@ -26,6 +27,7 @@ import anchor_flow
 
 FORMAT_VERSION = 1
 PRIOR_FORMAT_VERSION = 2
+GMM_FORMAT_VERSION = 3
 SOLVER = "scipy_linear_sum_assignment"
 
 
@@ -110,8 +112,15 @@ def _draw_prior_supersets(config, dataset):
     opts = settings(config)
     source_config = copy.deepcopy(config)
     tick = perf_counter()
-    centers = anchor_flow.fit_prior_centers(source_config, dataset)
-    anchor_flow.bind_prior_centers(source_config, centers)
+    flow = anchor_flow.settings(source_config)
+    fit_details = {}
+    if flow["mode"] == "gmm_prior":
+        import gmm_prior
+        centers, fit_details = gmm_prior.fit(source_config, dataset)
+        gmm_prior.bind(source_config, centers)
+    else:
+        centers = anchor_flow.fit_prior_centers(source_config, dataset)
+        anchor_flow.bind_prior_centers(source_config, centers)
     fit_seconds = perf_counter() - tick
     source_config["data"]["n_points"] = opts["superset_size"]
     source_generator = torch.Generator(device="cpu").manual_seed(opts["cache_seed"])
@@ -130,10 +139,13 @@ def _draw_prior_supersets(config, dataset):
             target = sample_horse(load_horse_mask("cpu", torch.float32), 1, opts["superset_size"])[0]
         else:
             raise ValueError("Expected checkerboard or horse")
-    return source[0].numpy(), target.numpy(), components[0].numpy(), centers, {
+    draw_details = {
         "prior_fit_seconds": fit_seconds, "source_draw_seed": opts["cache_seed"],
         "target_draw_seed": target_seed,
         "draw_rng": "isolated CPU source generator and separate hashed target seed; independent of prior fitting"}
+    if fit_details:
+        draw_details["gmm_fit_details"] = fit_details
+    return source[0].numpy(), target.numpy(), components[0].numpy(), centers, draw_details
 
 
 def _component_sha256(components):
@@ -165,6 +177,7 @@ def source_moments(source):
 def _load_cache(config, dataset):
     opts = settings(config)
     prior_spec = anchor_flow.cache_spec(config)
+    is_gmm = prior_spec is not None and prior_spec["mode"] == "gmm_prior"
     path = Path(opts["cache"])
     if not path.is_file():
         raise FileNotFoundError(f"NSOT cache missing: {path}; run python prepare_nsot.py CONFIG --dataset {dataset}")
@@ -181,15 +194,18 @@ def _load_cache(config, dataset):
         metadata = json.loads(str(archive["metadata"].item()))
         source, target, permutation = archive["source"], archive["target"], archive["permutation"]
         components = archive["source_components"] if prior_spec is not None else None
-    expected = {"format_version": PRIOR_FORMAT_VERSION if prior_spec is not None else FORMAT_VERSION,
+    version = GMM_FORMAT_VERSION if is_gmm else (PRIOR_FORMAT_VERSION if prior_spec is not None else FORMAT_VERSION)
+    expected = {"format_version": version,
                 "solver": SOLVER,
                 "superset_size": opts["superset_size"], "cache_seed": opts["cache_seed"],
                 "dataset_spec": dataset_spec(config, dataset)}
     for key, value in expected.items():
         if metadata.get(key) != value:
             raise ValueError(f"NSOT cache/config mismatch: {key}")
-    if metadata.get("anchor_prior") != prior_spec:
+    if metadata.get("anchor_prior") != (None if is_gmm else prior_spec):
         raise ValueError("NSOT cache/config mismatch: anchor_prior")
+    if metadata.get("gmm_prior") != (prior_spec if is_gmm else None):
+        raise ValueError("NSOT cache/config mismatch: gmm_prior")
     if prior_spec is None and "prior_centers" in metadata:
         raise ValueError("A Gaussian NSOT cache must not contain prior_centers")
     count = opts["superset_size"]
@@ -208,7 +224,13 @@ def _load_cache(config, dataset):
             raise ValueError("NSOT cache source_components SHA256 mismatch")
         # Bind only after every stored array and prior setting has validated.
         # This rejects replacing an explicitly saved center configuration.
-        anchor_flow.bind_prior_centers(config, metadata.get("prior_centers"))
+        if is_gmm:
+            import gmm_prior
+            if "prior_centers" in metadata:
+                raise ValueError("General GMM cache must not contain anchor-prior centers")
+            gmm_prior.bind(config, metadata.get("gmm_parameters"))
+        else:
+            anchor_flow.bind_prior_centers(config, metadata.get("prior_centers"))
     return source, target, permutation, metadata, cache_hash, components
 
 
@@ -227,6 +249,7 @@ def prepare(config, dataset):
     """Prepare once; existing files are validated/reused, NEVER overwritten."""
     opts = settings(config)
     prior_spec = anchor_flow.cache_spec(config)
+    is_gmm = prior_spec is not None and prior_spec["mode"] == "gmm_prior"
     spec = dataset_spec(config, dataset)
     path = Path(opts["cache"])
     if path.exists():
@@ -241,7 +264,10 @@ def prepare(config, dataset):
         source, target, components, centers, prior_draw = _draw_prior_supersets(config, dataset)
     size = opts["superset_size"]
     print(f"NSOT exact OT M={size}; dense float64 cost={8 * size * size / 2**20:.1f} MiB CPU RAM", flush=True)
+    sampling_and_fit_seconds = perf_counter() - start
+    ot_start = perf_counter()
     permutation, optimal_cost = exact_superset_permutation(source, target)
+    ot_seconds = perf_counter() - ot_start
     metadata = {
         "format_version": FORMAT_VERSION, "solver": SOLVER,
         "implementation": "paper_based_2d_exact_superset_v1",
@@ -251,6 +277,7 @@ def prepare(config, dataset):
         "cost_before": float(np.square(source.astype(np.float64) - target).sum(1).mean()),
         "cost_after": optimal_cost, "source_moments": source_moments(source),
         "precompute_seconds": perf_counter() - start,
+        "sampling_and_fit_seconds": sampling_and_fit_seconds, "ot_seconds": ot_seconds,
         "precompute_timing_scope": "sampling and exact OT compute; excludes cache file IO and training-time loading",
         "environment": {"torch": str(torch.__version__), "numpy": np.__version__},
         "source_sha256": {name: file_sha256(Path(__file__).parent / name)
@@ -260,12 +287,16 @@ def prepare(config, dataset):
     }
     if prior_spec is not None:
         resolved = copy.deepcopy(config)
-        anchor_flow.bind_prior_centers(resolved, centers)
+        if is_gmm:
+            import gmm_prior
+            gmm_prior.bind(resolved, centers)
+        else:
+            anchor_flow.bind_prior_centers(resolved, centers)
         metadata.update(
-            format_version=PRIOR_FORMAT_VERSION,
-            implementation="nsot_anchor_prior_component_hybrid_v1",
-            paper_setting="experimental anchor-GMM/component-centered extension; NOT the original NSOT prior/kernel",
-            anchor_prior=prior_spec, prior_centers=centers,
+            format_version=GMM_FORMAT_VERSION if is_gmm else PRIOR_FORMAT_VERSION,
+            implementation="nsot_full_gmm_component_hybrid_v1" if is_gmm else "nsot_anchor_prior_component_hybrid_v1",
+            paper_setting=("experimental full-GMM/component-centered extension; NOT the original NSOT prior/kernel" if is_gmm
+                           else "experimental anchor-GMM/component-centered extension; NOT the original NSOT prior/kernel"),
             source_components_sha256=_component_sha256(components),
             source_component_counts=np.bincount(components, minlength=config["num_regions"]).tolist(),
             component_label_origin="sampled categorical BEFORE exact OT; never reassigned by nearest centroid",
@@ -274,11 +305,12 @@ def prepare(config, dataset):
             marginals="finite point-superset plus component-centered jitter approximates the saved population GMM",
             source_prior=anchor_flow.experiment_details(resolved), **prior_draw)
         metadata["source_sha256"]["anchor_flow.py"] = file_sha256(Path(__file__).parent / "anchor_flow.py")
-        if prior_spec.get("center_fit") == "gmm_em":
-            metadata.update(
-                implementation="nsot_fixed_isotropic_gmm_em_v1",
-                paper_setting="experimental equal-weight fixed-sigma GMM-EM/component-centered extension; NOT original NSOT",
-            )
+        if is_gmm:
+            metadata.update(gmm_prior=prior_spec, gmm_parameters=centers)
+            metadata["precompute_timing_scope"] = "prior fitting, sampling and exact OT compute; excludes cache file IO and training-time loading"
+            metadata["source_sha256"]["gmm_prior.py"] = file_sha256(Path(__file__).parent / "gmm_prior.py")
+        else:
+            metadata.update(anchor_prior=prior_spec, prior_centers=centers)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation prevents accidental destruction of an existing cache.
     # If interrupted during writing, the partial file fails load_cache validation.
@@ -317,6 +349,24 @@ def component_centered_hybrid(source, centers, *, sigma, beta, noise):
     return centers + math.sqrt(1 - beta) * (source - centers) + sigma * math.sqrt(beta) * noise
 
 
+def full_covariance_hybrid(source, means, cholesky, *, beta, noise):
+    """Preserve N(mean_k, covariance_k) using the ORIGINAL cached component.
+
+    cholesky has [...,2,2] shape and maps iid standard noise into that component.
+    Cov = (1-beta)*Sigma + beta*Sigma. Finite caches approximate this identity.
+    """
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or not math.isfinite(beta) or not 0 <= beta <= 1:
+        raise ValueError("Full-covariance hybrid beta must be finite and in [0,1]")
+    if (not isinstance(source, torch.Tensor) or not source.is_floating_point()
+            or not all(isinstance(value, torch.Tensor) for value in (means, cholesky, noise))
+            or means.shape != source.shape or noise.shape != source.shape
+            or cholesky.shape != (*source.shape[:-1], source.shape[-1], source.shape[-1])
+            or any(value.device != source.device or value.dtype != source.dtype for value in (means, cholesky, noise))):
+        raise ValueError("Full-covariance hybrid requires matching floating tensors and [...,D,D] Cholesky factors")
+    colored_noise = torch.matmul(cholesky, noise.unsqueeze(-1)).squeeze(-1)
+    return means + math.sqrt(1 - beta) * (source - means) + math.sqrt(beta) * colored_noise
+
+
 class NSOTPairSampler:
     def __init__(self, config, dataset, device, dtype):
         opts = settings(config)
@@ -326,10 +376,16 @@ class NSOTPairSampler:
         self.beta, self.n_points = opts["beta"], config["data"]["n_points"]
         flow = anchor_flow.settings(config)
         self.source_components, self.prior_centers, self.sigma = None, None, None
+        self.prior_cholesky = None
         if flow is not None:
             self.source_components = torch.as_tensor(components, device=device, dtype=torch.long)
-            self.prior_centers = torch.tensor(flow["centers"], device=device, dtype=dtype)
-            self.sigma = flow["sigma"]
+            if flow["mode"] == "gmm_prior":
+                self.prior_centers = torch.tensor(flow["means"], device=device, dtype=dtype)
+                covariance = torch.tensor(flow["covariances"], device=device, dtype=dtype)
+                self.prior_cholesky = torch.linalg.cholesky(covariance)
+            else:
+                self.prior_centers = torch.tensor(flow["centers"], device=device, dtype=dtype)
+                self.sigma = flow["sigma"]
         self.flow_details = anchor_flow.experiment_details(config)
 
     @torch.no_grad()
@@ -344,6 +400,10 @@ class NSOTPairSampler:
         if self.source_components is not None:
             components = self.source_components[index]
             centers = self.prior_centers[components]
+            if self.prior_cholesky is not None:
+                paired_source = full_covariance_hybrid(source, centers, self.prior_cholesky[components],
+                                                       beta=self.beta, noise=noise)
+                return paired_source, target
             paired_source = component_centered_hybrid(source, centers, sigma=self.sigma,
                                                       beta=self.beta, noise=noise)
             return paired_source, target
@@ -357,6 +417,9 @@ class NSOTPairSampler:
                 "source_moments": self.metadata["source_moments"], "dataset_spec": self.metadata["dataset_spec"],
                 "precompute_source_sha256": self.metadata["source_sha256"]}
         result.update(self.flow_details)
+        for key in ("ot_seconds", "sampling_and_fit_seconds", "gmm_fit_details"):
+            if key in self.metadata:
+                result[key] = self.metadata[key]
         if self.source_components is not None:
             result.update(prior_fit_seconds=self.metadata["prior_fit_seconds"],
                           source_components_sha256=self.metadata["source_components_sha256"],

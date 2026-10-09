@@ -86,6 +86,13 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
         config["tg_cache"]["cache_sha256"] = pair_sampler.cache_sha256
         print(f"tg_cache_sha256={pair_sampler.cache_sha256} "
               f"sampling={pair_sampler.metadata['sampling']} clouds={pair_sampler.metadata['num_clouds']}", flush=True)
+    loss_config = config if "anchor_flow" in config else None
+    if (config.get("anchor_flow") or {}).get("mode") == "gmm_prior":
+        # read_config and NSOTPairSampler already validated the saved SPD
+        # parameters. The loss uses only mode/coupling, not mixture parameters;
+        # avoid CPU tensor creation and Cholesky checks on every GPU update.
+        # Keep the authoritative resolved config untouched for saving/inference.
+        loss_config = {**config, "anchor_flow": anchor_flow.cache_spec(config)}
     model.train()
     synchronize(device)
     start = perf_counter()
@@ -103,7 +110,7 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
                 sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
                 sinkhorn_iterations=config.get("sinkhorn_iterations", 100), coupling_generator=generator,
                 paired_noise=paired_noise,
-                anchor_config=config if "anchor_flow" in config else None,
+                anchor_config=loss_config,
             )
             if log_step:
                 value = loss.item()

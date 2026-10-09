@@ -92,6 +92,10 @@ def load_model(config_path, model_class, dataset, *, device=None):
             and "centers" not in config["anchor_flow"]):
         raise ValueError("Anchor-prior inference requires resolved fixed centers in the saved runs/.../config.yaml; "
                          "do not evaluate an unresolved training-template YAML")
+    if (config.get("anchor_flow") or {}).get("mode") == "gmm_prior":
+        from gmm_prior import settings as gmm_settings
+        if not {"weights", "means", "covariances"} <= gmm_settings(config).keys():
+            raise ValueError("GMM inference requires saved weights, means and covariances in runs/.../config.yaml")
     if device is not None:
         config["device"] = str(torch.device(device))
     checkpoint = Path(config["checkpoint"])
@@ -132,11 +136,17 @@ def evaluation_settings(config):
     return settings
 
 
-def sample_for_evaluation(model, config, steps):
+def sample_for_evaluation(model, config, steps, *, timing_details=None):
     parameter = next(model.parameters())
     batch = evaluation_settings(config)["batch_size"]
+    if timing_details is not None:
+        synchronize(parameter.device)
+        source_start = perf_counter()
     noise = sample_source(
         config, batch, device=parameter.device, dtype=parameter.dtype)
+    if timing_details is not None:
+        synchronize(parameter.device)
+        timing_details["source_sampling_seconds"] = perf_counter() - source_start
     time = parameter.new_zeros(batch, 1, 1)
     with torch.no_grad():
         for _ in range(10):
@@ -149,8 +159,47 @@ def sample_for_evaluation(model, config, steps):
     return noise, prediction, seconds
 
 
+def sample_evaluation_target(config, dataset, batch_size, *, device, dtype, seed=None):
+    """Optional isolated target stream for matched prior-family comparisons.
+
+    With seed=None, preserve the existing evaluators' global RNG draw exactly.
+    An explicit seed makes targets independent of each prior's sampling method,
+    model initialization, and NFE. The caller's CPU/CUDA RNG states are restored.
+    """
+    from data import sample_checkerboard
+    from train_horse import load_horse_mask, sample_horse
+
+    device = torch.device(device)
+    if dataset not in ("checkerboard", "horse"):
+        raise ValueError("Expected checkerboard or horse evaluation target")
+
+    def draw():
+        if dataset == "horse":
+            return sample_horse(load_horse_mask(device, dtype), batch_size, config["data"]["n_points"])
+        return sample_checkerboard(batch_size, config["data"]["n_points"], device, dtype,
+                                   config["data"]["grid_size"])
+
+    if seed is None:
+        return draw()
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**63:
+        raise ValueError("Evaluation target seed must be an integer in [0,2**63)")
+    cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] \
+        if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.set_rng_state(torch.Generator(device="cpu").manual_seed(seed).get_state())
+        if cuda_devices:
+            torch.cuda.set_rng_state(torch.Generator(device=device).manual_seed(seed).get_state(), device)
+        return draw()
+
+
+def evaluation_target_hash(target):
+    """Record exact held-out coordinates so comparison equality is auditable."""
+    values = target.detach().cpu().contiguous().numpy()
+    return hashlib.sha256(values.tobytes()).hexdigest()
+
+
 def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, seconds, scores, *,
-                    render=True, metric_metadata=None):
+                    render=True, metric_metadata=None, target_seed=None, target_hash=None, source_sampling_seconds=None):
     now = datetime.now(timezone.utc)
     settings = evaluation_settings(config)
     checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
@@ -168,8 +217,14 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
         "training_seconds": metadata.get("training_seconds"),
         "training_environment": metadata.get("environment"), "evaluation_environment": environment(config["device"]),
         "evaluation_seed": settings["seed"], "evaluation_batch_size": settings["batch_size"],
+        "evaluation_target_seed": target_seed,
+        "evaluation_target_sha256": target_hash,
+        "evaluation_target_rng": "isolated shared target stream" if target_seed is not None else "legacy global RNG after source sampling",
         "n_points": config["data"]["n_points"], "total_points": settings["batch_size"] * config["data"]["n_points"],
         "euler_steps": steps, "histogram_bins": settings["histogram_bins"], "inference_seconds": seconds,
+        "source_sampling_seconds": source_sampling_seconds,
+        "sampling_plus_inference_seconds": seconds + source_sampling_seconds if source_sampling_seconds is not None else None,
+        "source_sampling_timing_scope": "actual fresh source draw, including prior validation and Cholesky; no sampler warmup; first-use overhead possible",
         "inference_timing_scope": "integration only; excludes source sampling, warmup, loading, metrics and rendering",
         "metric_definitions": {"chamfer": "sum of directional mean squared distances; then mean over clouds",
                                "leakage": "invalid points / all pooled points",
