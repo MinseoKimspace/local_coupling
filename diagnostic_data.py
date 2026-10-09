@@ -7,7 +7,6 @@ import numpy as np
 import torch
 
 from anchor_flow import sample_source
-import anchor_conditioning
 from data import sample_checkerboard
 from experiment import load_model
 from model import PointSetTransformer
@@ -58,17 +57,6 @@ class DiagnosticData:
         generator = torch.Generator(device=self.device).manual_seed(self.draw_seed(purpose + ":source", index))
         return sample_source(self.config, 1, device=self.device, dtype=self.dtype, generator=generator)[0]
 
-    def source_with_components(self, index, purpose="evaluation"):
-        """Same indexed source draw, retaining its original sampling labels.
-
-        Labels are never inferred from a particle's current/nearest center. An
-        unconditioned checkpoint returns None without changing the RNG draws.
-        """
-        generator = torch.Generator(device=self.device).manual_seed(self.draw_seed(purpose + ":source", index))
-        source, components = anchor_conditioning.sample_source_for_model(
-            self.config, 1, device=self.device, dtype=self.dtype, generator=generator)
-        return source[0], components[0] if components is not None else None
-
     def target(self, index, purpose="evaluation"):
         cuda_devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()] \
             if self.device.type == "cuda" else []
@@ -89,16 +77,6 @@ class DiagnosticData:
             raise ValueError("Cloud count must be positive")
         return (torch.stack([self.source(i, purpose) for i in range(count)]),
                 torch.stack([self.target(i, purpose) for i in range(count)]))
-
-    def bank_with_components(self, count, purpose="evaluation"):
-        """Fixed common source/target bank and optional original source IDs."""
-        if count < 1:
-            raise ValueError("Cloud count must be positive")
-        draws = [self.source_with_components(i, purpose) for i in range(count)]
-        sources = torch.stack([draw[0] for draw in draws])
-        components = torch.stack([draw[1] for draw in draws]) if draws[0][1] is not None else None
-        targets = torch.stack([self.target(i, purpose) for i in range(count)])
-        return sources, targets, components
 
 
 def diagnostic_metadata(config_path, config, checkpoint, metadata, dataset, device):

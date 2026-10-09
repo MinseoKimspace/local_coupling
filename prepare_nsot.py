@@ -14,10 +14,6 @@ cache-free inference. Changing the prior requires a NEW cache path. Gaussian
 baseline caches remain format 1; anchor-prior caches use separate format 2.
 No GeomLoss, KeOps, custom CUDA extension, author-code claim or 100K approximation.
 
-With nsot.directional_hybrid, this also fits/validates a small JSON sidecar from
-the original component-labelled OT pairs. An existing pair bank is reused byte
-for byte; directional matrices are fixed before training. Inference needs only
-the same saved prior and model, not either cache or the sidecar.
 """
 
 import argparse

@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-import anchor_conditioning
+from anchor_flow import sample_source
 from experiment import evaluation_title
 from summarize_results import output_directory, save_json, save_table, statistics, formatted, plt
 
@@ -16,21 +16,20 @@ NFES = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
 @torch.no_grad()
-def fm_errors(model, source, target, time, *, config=None, component_ids=None):
+def fm_errors(model, source, target, time, *, config=None):
     target_velocity = target - source
-    prediction = anchor_conditioning.velocity(
-        model, (1 - time) * source + time * target, time, component_ids)
+    prediction = model((1 - time) * source + time * target, time)
     return ((prediction - target_velocity).square().mean((1, 2)), target_velocity.square().mean((1, 2)))
 
 
 @torch.no_grad()
-def rollout(model, noise, steps, keep_path=False, *, component_ids=None):
+def rollout(model, noise, steps, keep_path=False):
     x = noise.clone()
     lengths = noise.new_zeros(noise.shape[:2])
     path = [x[0, :24].cpu().clone()] if keep_path else []
     for step in range(steps):
         t = noise.new_full((noise.shape[0], 1, 1), step / steps)
-        dx = anchor_conditioning.velocity(model, x, t, component_ids) / steps
+        dx = model(x, t) / steps
         x = x + dx
         lengths += dx.norm(dim=-1)
         if keep_path:
@@ -101,7 +100,6 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
     generator = torch.Generator(device=device).manual_seed(seed + 1)
     time_generator = torch.Generator(device=device).manual_seed(seed + 2)
     n = config["data"]["n_points"]
-    conditioned = anchor_conditioning.settings(config) is not None
     pair_sampler = None
     if config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
@@ -124,41 +122,31 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
     first_path = None
     for batch in range(batches):
         target = sample_target()
-        noise, noise_components = anchor_conditioning.sample_source_for_model(
-            config, batch_size, device=device, dtype=dtype)
-        pair_components = None
+        noise = sample_source(config, batch_size, device=device, dtype=dtype)
         if pair_sampler is None:
             paired_noise, target = coupled_points(noise, target, coupling=config["coupling"],
                 num_regions=config.get("num_regions"), target_centers=centers,
                 sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
                 sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator)
         else:
-            if conditioned:
-                paired_noise, target, pair_components = pair_sampler.sample(
-                    batch_size, generator=generator, return_components=True)
-            else:
-                paired_noise, target = pair_sampler.sample(batch_size, generator=generator)
-        fm_options = {"component_ids": pair_components} if conditioned else {}
-        rollout_options = {"component_ids": noise_components} if conditioned else {}
+            paired_noise, target = pair_sampler.sample(batch_size, generator=generator)
         for index, t in enumerate(TIMES):
-            error, baseline = fm_errors(model, paired_noise, target, noise.new_full((batch_size, 1, 1), t),
-                                        **fm_options)
+            error, baseline = fm_errors(model, paired_noise, target, noise.new_full((batch_size, 1, 1), t))
             errors[index].extend(error.tolist())
             if index == 0:
                 energy.extend(baseline.tolist())
         for index, (lo, hi) in enumerate(BINS):
             t = torch.rand(batch_size, 1, 1, device=device, dtype=dtype, generator=time_generator) * (hi - lo) + lo
-            error, _ = fm_errors(model, paired_noise, target, t, **fm_options)
+            error, _ = fm_errors(model, paired_noise, target, t)
             bin_errors[index].extend(error.tolist())
-        reference, ratio, path = rollout(model, noise, reference_nfe, keep_path=batch == 0,
-                                         **rollout_options)
+        reference, ratio, path = rollout(model, noise, reference_nfe, keep_path=batch == 0)
         ratios.extend(ratio.tolist())
         if batch == 0:
             first_path = path.numpy()
-        doubled_reference, _, _ = rollout(model, noise, 2 * reference_nfe, **rollout_options)
+        doubled_reference, _, _ = rollout(model, noise, 2 * reference_nfe)
         reference_errors.extend((reference - doubled_reference).square().mean((1, 2)).tolist())
         for nfe in NFES:
-            prediction = reference if nfe == reference_nfe else rollout(model, noise, nfe, **rollout_options)[0]
+            prediction = reference if nfe == reference_nfe else rollout(model, noise, nfe)[0]
             endpoint_errors[nfe].extend((prediction - reference).square().mean((1, 2)).tolist())
         print(f"diagnostic_batch={batch + 1}/{batches}", flush=True)
     all_values = energy + ratios + reference_errors + sum(errors, []) + sum(bin_errors, []) + sum(endpoint_errors.values(), [])
@@ -193,11 +181,6 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
         "example_trajectory": {"times": [i / reference_nfe for i in range(reference_nfe + 1)],
                                "points": first_path.tolist()},
     }
-    if conditioned:
-        payload["definitions"]["model_conditioning"] = (
-            "original pointwise source Gaussian component ID, fixed throughout each trajectory; "
-            "FM uses the cached source's original ID and generation uses its own fresh draw's ID; "
-            "never nearest-center reassignment or target labels")
     directory = output_directory(Path(output) / dataset, checkpoint.stem + "_diagnostic")
     save_json(directory / "diagnostics.json", payload)
     render(payload, first_path, directory)

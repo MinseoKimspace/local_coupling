@@ -8,8 +8,6 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 import torch
 
-import anchor_conditioning
-
 from data import sample_checkerboard
 from experiment import (evaluation_settings, evaluation_title, load_model,
                         sample_for_evaluation, save_evaluation)
@@ -22,8 +20,6 @@ def sample_snapshots(
     x_noise: torch.Tensor,
     num_steps: int,
     snapshot_steps: tuple[int, ...],
-    *,
-    component_ids: torch.Tensor | None = None,
 ) -> dict[int, torch.Tensor]:
     x = x_noise
     dt = 1.0 / num_steps
@@ -39,7 +35,7 @@ def sample_snapshots(
                 device=x.device,
                 dtype=x.dtype,
             )
-            x = x + dt * anchor_conditioning.velocity(model, x, t, component_ids)
+            x = x + dt * model(x, t)
 
             if step in snapshot_steps:
                 snapshots[step] = x.cpu()
@@ -115,8 +111,7 @@ def main(config_path="checkerboard_experiments/independent.yaml", num_steps=100,
     model, config, checkpoint, metadata = load_model(config_path, PointSetTransformer, "checkerboard")
     settings, data = evaluation_settings(config), config["data"]
     print(f"nfe={steps}")
-    noise, prediction, seconds, component_ids = sample_for_evaluation(model, config, steps,
-                                                                     return_components=True)
+    noise, prediction, seconds = sample_for_evaluation(model, config, steps)
     target = sample_checkerboard(settings["batch_size"], data["n_points"], prediction.device,
                                  prediction.dtype, data["grid_size"])
     leakage, mass, js = checkerboard_metrics(prediction, data["grid_size"], settings["histogram_bins"])
@@ -133,7 +128,7 @@ def main(config_path="checkerboard_experiments/independent.yaml", num_steps=100,
     if render:
         snapshot_steps = tuple(sorted({round(t * steps) for t in (0.78, 0.89, 1.0)}))
         times = tuple(step / steps for step in snapshot_steps)
-        snapshots = sample_snapshots(model, noise, steps, snapshot_steps, component_ids=component_ids)
+        snapshots = sample_snapshots(model, noise, steps, snapshot_steps)
         render_density([snapshots[i] for i in snapshot_steps], times,
                        f"{evaluation_title(config)}\nNFE: {steps} (Euler)", output)
         print(f"saved={output}")

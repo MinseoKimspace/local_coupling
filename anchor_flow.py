@@ -18,7 +18,8 @@ import torch
 
 MODES = {"anchor_prior"}
 _COMMON_KEYS = {"mode", "sigma"}
-_PRIOR_KEYS = {"reference_points", "seed", "centers"}
+_PRIOR_KEYS = {"reference_points", "seed", "centers", "center_fit",
+               "gmm_n_init", "gmm_max_iter", "gmm_tol"}
 
 
 def _integer(value, name, minimum=1):
@@ -77,6 +78,24 @@ def settings(config):
     result.update(reference_points=_integer(value.get("reference_points", 4096),
                                             "anchor_flow.reference_points", k),
                   seed=_integer(value.get("seed", 0), "anchor_flow.seed", 0))
+    center_fit = value.get("center_fit", "balanced_fps_ot")
+    if center_fit not in ("balanced_fps_ot", "gmm_em"):
+        raise ValueError("anchor_flow.center_fit must be balanced_fps_ot or gmm_em")
+    if center_fit == "gmm_em":
+        if config["coupling"] != "nsot":
+            raise ValueError("GMM center fitting currently requires nsot coupling")
+        tolerance = value.get("gmm_tol", 1e-6)
+        if (isinstance(tolerance, bool) or not isinstance(tolerance, Real)
+                or not math.isfinite(tolerance) or tolerance <= 0):
+            raise ValueError("anchor_flow.gmm_tol must be positive and finite")
+        result.update(center_fit=center_fit,
+                      gmm_n_init=_integer(value.get("gmm_n_init", 5), "anchor_flow.gmm_n_init"),
+                      gmm_max_iter=_integer(value.get("gmm_max_iter", 100), "anchor_flow.gmm_max_iter"),
+                      gmm_tol=float(tolerance))
+    elif any(key in value for key in ("gmm_n_init", "gmm_max_iter", "gmm_tol")):
+        raise ValueError("GMM fit settings require center_fit: gmm_em")
+    # Do not add the balanced default to normalized settings: existing caches
+    # compare this dictionary exactly and must remain reusable byte for byte.
     if "centers" in value:
         result["centers"] = _centers(value["centers"], k)
     return result
@@ -89,11 +108,65 @@ def cache_spec(config):
 
 
 @torch.no_grad()
+def _fit_gmm_centers(reference, k, sigma, n_init, max_iter, tol):
+    """Mean-only EM for an equal-weight, fixed-isotropic Gaussian mixture.
+
+    This is a controlled GMM baseline, NOT unrestricted GaussianMixture EM:
+    weights stay 1/K and covariance stays sigma^2 I. K-means++ initialization
+    and multiple restarts use the caller's isolated CPU RNG. No balanced
+    assignments, OT, evaluation data or scikit-learn dependency are involved.
+    The E step is soft; the M step updates only component means. Select the
+    restart with largest training-reference log likelihood.
+    """
+    points = torch.as_tensor(reference, device="cpu", dtype=torch.float64)
+    if (points.ndim != 2 or points.shape[1] != 2 or len(points) < k
+            or not torch.isfinite(points).all().item()):
+        raise ValueError("GMM fitting requires finite [R,2] training points with R >= K")
+    normalizer = math.log(k) + math.log(2 * math.pi * sigma * sigma)
+
+    def evaluate(centers):
+        logits = -((points[:, None] - centers[None]) ** 2).sum(-1) / (2 * sigma * sigma)
+        likelihood = torch.logsumexp(logits, dim=1).mean().item() - normalizer
+        return logits, likelihood
+
+    best_centers, best_likelihood = None, -math.inf
+    for _ in range(n_init):
+        centers = points[torch.randint(len(points), (1,)).item()].unsqueeze(0)
+        distance = ((points - centers[0]) ** 2).sum(-1)
+        for _ in range(1, k):
+            if distance.sum().item() > 0:
+                index = torch.multinomial(distance, 1).item()
+            else:
+                index = torch.randint(len(points), (1,)).item()
+            centers = torch.cat((centers, points[index].unsqueeze(0)))
+            distance = torch.minimum(distance, ((points - points[index]) ** 2).sum(-1))
+        logits, likelihood = evaluate(centers)
+        for _ in range(max_iter):
+            responsibility = logits.softmax(dim=1)
+            mass = responsibility.sum(0)
+            means = responsibility.T @ points / mass.clamp_min(torch.finfo(points.dtype).tiny)[:, None]
+            # An exactly underflowed component has no effective observations;
+            # retaining its old mean avoids inventing a balancing/reseed rule.
+            means = torch.where((mass > 0)[:, None], means, centers)
+            next_logits, next_likelihood = evaluate(means)
+            if not math.isfinite(next_likelihood):
+                raise FloatingPointError("Nonfinite fixed-isotropic GMM likelihood")
+            improvement = next_likelihood - likelihood
+            centers, logits, likelihood = means, next_logits, next_likelihood
+            if abs(improvement) <= tol:
+                break
+        if likelihood > best_likelihood:
+            best_centers, best_likelihood = centers.clone(), likelihood
+    return best_centers
+
+
+@torch.no_grad()
 def fit_prior_centers(config, dataset):
     """Fit K fixed centroids using only the original training distribution.
 
-    A fresh CPU reference sample is partitioned with the existing one-pass
-    balanced FPS/exact-OT rule, followed by actual patch means, NOT refinement.
+    The default uses the existing one-pass balanced FPS/exact-OT rule,
+    followed by actual patch means, NOT refinement. Optional gmm_em uses the
+    SAME reference draw but fits means with soft EM at fixed weights/variance.
     Existing resolved centers are returned unchanged after validation.  Caller
     RNG and CPU thread count are restored, including on failure; CUDA RNG is
     never touched.
@@ -105,8 +178,6 @@ def fit_prior_centers(config, dataset):
         raise ValueError("anchor priors support checkerboard or horse training data")
     if "centers" in opts:
         return opts["centers"]
-    from coupling import balanced_target_partition
-
     threads = torch.get_num_threads()
     try:
         torch.set_num_threads(1)
@@ -120,9 +191,15 @@ def fit_prior_centers(config, dataset):
                 from data import sample_checkerboard
                 reference = sample_checkerboard(1, opts["reference_points"], "cpu", torch.float32,
                                                 config["data"]["grid_size"])
-            _, _, centers, _ = balanced_target_partition(reference, config["num_regions"],
-                                                         solver="exact_batched")
-            return _centers(centers[0].tolist(), config["num_regions"])
+            if opts.get("center_fit") == "gmm_em":
+                centers = _fit_gmm_centers(reference[0], config["num_regions"], opts["sigma"],
+                                           opts["gmm_n_init"], opts["gmm_max_iter"], opts["gmm_tol"])
+            else:
+                from coupling import balanced_target_partition
+                _, _, fitted, _ = balanced_target_partition(reference, config["num_regions"],
+                                                            solver="exact_batched")
+                centers = fitted[0]
+            return _centers(centers.tolist(), config["num_regions"])
     finally:
         torch.set_num_threads(threads)
 
@@ -216,27 +293,15 @@ def experiment_details(config):
             paper_variant="experimental fixed anchor-GMM source plus component-centered hybrid; not the original NSOT Gaussian kernel",
             limitation="changed prior and changed hybrid kernel; experimental NSOT extension, not original-NSOT marginal or quality guarantees",
         )
-        if config.get("nsot", {}).get("directional_hybrid") is not None:
+        if opts.get("center_fit") == "gmm_em":
             shared.update(
-                implementation="nsot_anchor_prior_directional_hybrid_v1",
-                anchor_flow_implementation="nsot_anchor_prior_directional_hybrid_v1",
-                source_coordinates="same fixed anchor GMM and exact OT bank; fixed per-component directional stationary hybrid during training",
-                conditional_velocity="paired_target-actual_directional_hybrid_source",
-                hybrid="c[k]+sqrt(I-S[k])@(cached_source-c[k])+sigma*sqrt(S[k])@fresh_gaussian",
-                paper_variant="experimental same-anchor-prior directional hybrid; not original NSOT and not model conditioning",
-                limitation="population prior preservation does not guarantee finite-cache marginals, learned output density or thin-structure quality",
+                implementation="nsot_fixed_isotropic_gmm_em_v1",
+                anchor_flow_implementation="nsot_fixed_isotropic_gmm_em_v1",
+                prior_center_fit="same original training reference draw; soft EM, k-means++ restarts; NO balanced FPS/OT partition",
+                prior_fit_constraints="only means learned; uniform 1/K weights and shared fixed sigma^2 I; NOT unrestricted EM",
+                paper_variant="controlled fixed-isotropic GMM source plus identical component-centered NSOT hybrid",
+                limitation="center-fitting-only prior ablation; not unrestricted learned-weight/full-covariance GMM or a quality guarantee",
             )
-    # Import locally: the optional conditioning module validates this prior.
-    import anchor_conditioning
-    conditioning = anchor_conditioning.settings(config)
-    if conditioning is not None:
-        shared.update(
-            implementation="nsot_anchor_prior_source_id_v1",
-            anchor_flow_implementation="nsot_anchor_prior_source_id_v1",
-            model_conditioning=conditioning,
-            paper_variant="experimental same-anchor-prior isotropic NSOT plus source-component conditioning",
-            limitation="prior plus model conditioning, not a coupling-only comparison or a 1-NFE quality guarantee",
-        )
     return shared
 
 
@@ -245,9 +310,6 @@ def variant_suffix(config):
     if opts is None:
         return ""
     suffix = opts["mode"]
-    if config.get("nsot", {}).get("directional_hybrid") is not None:
-        suffix += "_directional"
-    import anchor_conditioning
-    if anchor_conditioning.settings(config) is not None:
-        suffix += "_id"
+    if opts.get("center_fit") == "gmm_em":
+        suffix += "_gmm_em"
     return suffix

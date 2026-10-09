@@ -11,7 +11,6 @@ from time import perf_counter
 import numpy as np
 import torch
 
-import anchor_conditioning
 from coupling import CLOUD_METHODS, TG_CACHED_METHODS, coupled_points
 from data import checkerboard_centers
 from diagnose import BINS, NFES, TIMES, fm_errors, rollout
@@ -55,19 +54,14 @@ def quality_scores(prediction, target, config, dataset, mask=None, regions=None)
 
 
 @torch.no_grad()
-def rollout_bank(model, noise, steps, batch_size, keep_path=False, *, component_ids=None):
-    if component_ids is not None and component_ids.shape != noise.shape[:2]:
-        raise ValueError("Original source component IDs must match the full [clouds,points] noise bank")
+def rollout_bank(model, noise, steps, batch_size, keep_path=False):
     parameter = next(model.parameters())
     predictions, ratios, first_path = [], [], None
     synchronize(parameter.device)
     start = perf_counter()
     for begin in range(0, len(noise), batch_size):
         part = noise[begin:begin + batch_size].to(device=parameter.device, dtype=parameter.dtype)
-        options = {}
-        if component_ids is not None:
-            options["component_ids"] = component_ids[begin:begin + batch_size].to(device=parameter.device)
-        prediction, ratio, path = rollout(model, part, steps, keep_path=keep_path and begin == 0, **options)
+        prediction, ratio, path = rollout(model, part, steps, keep_path=keep_path and begin == 0)
         if not torch.isfinite(prediction).all():
             raise FloatingPointError(f"Nonfinite generated points at NFE={steps}")
         predictions.append(prediction.cpu())
@@ -123,7 +117,6 @@ def fm_summary(model, config, data, batches, batch_size, seed):
     generator = torch.Generator(device=parameter.device).manual_seed(seed + 1)
     time_generator = torch.Generator(device=parameter.device).manual_seed(seed + 2)
     pair_sampler = None
-    conditioned = anchor_conditioning.settings(config) is not None
     if config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, data.dataset, parameter.device, parameter.dtype)
@@ -140,29 +133,23 @@ def fm_summary(model, config, data, batches, batch_size, seed):
             indices = range(batch * batch_size, (batch + 1) * batch_size)
             source = torch.stack([data.source(i, "fm") for i in indices])
             target = torch.stack([data.target(i, "fm") for i in indices])
-            pair_components = None
             if pair_sampler is None:
                 paired_source, paired_target = coupled_points(
                     source, target, coupling=config["coupling"], num_regions=config.get("num_regions"),
                     target_centers=centers, sinkhorn_epsilon=config.get("sinkhorn_epsilon", .1),
                     sinkhorn_iterations=config.get("sinkhorn_iterations", 100), generator=generator)
             else:
-                if conditioned:
-                    paired_source, paired_target, pair_components = pair_sampler.sample(
-                        batch_size, generator=generator, return_components=True)
-                else:
-                    paired_source, paired_target = pair_sampler.sample(batch_size, generator=generator)
-            fm_options = {"component_ids": pair_components} if conditioned else {}
+                paired_source, paired_target = pair_sampler.sample(batch_size, generator=generator)
             for j, t in enumerate(TIMES):
                 residual, baseline = fm_errors(model, paired_source, paired_target,
-                                               source.new_full((batch_size, 1, 1), t), config=config, **fm_options)
+                                               source.new_full((batch_size, 1, 1), t), config=config)
                 errors[j].extend(residual.tolist())
                 if j == 0:
                     energy.extend(baseline.tolist())
             for j, (lo, hi) in enumerate(BINS):
                 times = torch.rand(batch_size, 1, 1, device=source.device, dtype=source.dtype,
                                    generator=time_generator) * (hi - lo) + lo
-                residual, _ = fm_errors(model, paired_source, paired_target, times, config=config, **fm_options)
+                residual, _ = fm_errors(model, paired_source, paired_target, times, config=config)
                 bins[j].extend(residual.tolist())
             print(f"quality_fm_batch={batch + 1}/{batches}", flush=True)
     finally:
@@ -176,10 +163,6 @@ def fm_summary(model, config, data, batches, batch_size, seed):
             "time_bins": [{"interval": limits, "mse": statistics(v)} for limits, v in zip(BINS, bins)],
             "target_velocity_energy": statistics(energy),
             "definition": "raw residual under checkpoint's own coupling, NOT mean-field approximation error"}
-    if conditioned:
-        result["model_conditioning"] = (
-            "each cached source point's original Gaussian component ID, retained through hybrid noise "
-            "and interpolation; never reassigned from coordinates or target labels")
     return result
 
 
@@ -246,21 +229,14 @@ def audit(config_path, dataset, *, clouds=32, batch_size=16, nfes=NFES, referenc
         raise ValueError("Cloud OT diagnostics require training data.batch_size")
     parameter = next(model.parameters())
     data = DiagnosticData(config, dataset, parameter.device, parameter.dtype, seed)
-    conditioned = anchor_conditioning.settings(config) is not None
-    if conditioned:
-        noise, target, source_components = data.bank_with_components(clouds)
-        source_components = source_components.cpu()
-    else:
-        noise, target = data.bank(clouds)
-        source_components = None
+    noise, target = data.bank(clouds)
     noise, target = noise.cpu(), target.cpu()
     regions = HorseRegions(data.mask, roi_file) if dataset == "horse" else None
     predictions, quality, inference_times = {}, {}, {}
     all_nfes = sorted(set(requested + levels))
     for nfe in all_nfes:
-        rollout_options = {"component_ids": source_components} if conditioned else {}
         prediction, ratios, path, seconds = rollout_bank(model, noise, nfe, batch_size,
-                                                        keep_path=nfe == max_reference_nfe, **rollout_options)
+                                                        keep_path=nfe == max_reference_nfe)
         predictions[nfe] = prediction
         quality[nfe] = quality_scores(prediction, target, config, dataset, data.mask, regions)
         inference_times[nfe] = seconds
@@ -308,14 +284,6 @@ def audit(config_path, dataset, *, clouds=32, batch_size=16, nfes=NFES, referenc
         "example_trajectory": {"times": [i / max_reference_nfe for i in range(max_reference_nfe + 1)],
                                "points": reference_path.tolist()},
     }
-    if conditioned:
-        payload["source_components_sha256"] = tensor_sha256(source_components)
-        payload["source_component_counts"] = torch.bincount(
-            source_components.flatten(), minlength=int(config["model"]["anchor_id_count"])).tolist()
-        payload["definitions"]["model_conditioning"] = (
-            "original pointwise source Gaussian component IDs from the common evaluation draw; "
-            "the SAME IDs are fixed across every NFE, refinement, and inference microbatch; "
-            "no target labels or nearest-center reassignment")
     if config.get("anchor_flow") is not None:
         payload["initial_source_quality"] = quality_scores(noise, target, config, dataset, data.mask, regions)
         payload["definitions"]["initial_source_quality"] = (

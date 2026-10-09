@@ -13,8 +13,6 @@ import ot
 import scipy
 import torch
 import yaml
-import nsot_directional
-import anchor_conditioning
 
 from anchor_flow import experiment_details, sample_source, settings as anchor_flow_settings, variant_suffix
 from coupling import canonical_method, coupling_info
@@ -26,8 +24,9 @@ def read_config(path):
         config = yaml.safe_load(file)
     config["coupling"] = canonical_method(config["coupling"])
     anchor_flow_settings(config)  # Validate templates without resolving or fitting a source prior.
-    nsot_directional.settings(config)
-    anchor_conditioning.settings(config)
+    if config["coupling"] == "nsot":
+        from nsot import settings as nsot_settings
+        nsot_settings(config)
     return config
 
 
@@ -133,22 +132,20 @@ def evaluation_settings(config):
     return settings
 
 
-def sample_for_evaluation(model, config, steps, *, return_components=False):
+def sample_for_evaluation(model, config, steps):
     parameter = next(model.parameters())
     batch = evaluation_settings(config)["batch_size"]
-    noise, component_ids = anchor_conditioning.sample_source_for_model(
+    noise = sample_source(
         config, batch, device=parameter.device, dtype=parameter.dtype)
     time = parameter.new_zeros(batch, 1, 1)
     with torch.no_grad():
         for _ in range(10):
-            anchor_conditioning.velocity(model, noise, time, component_ids)
+            model(noise, time)
     synchronize(parameter.device)
     start = perf_counter()
-    prediction = integrate_velocity(model, noise, num_steps=steps, component_ids=component_ids)
+    prediction = integrate_velocity(model, noise, num_steps=steps)
     synchronize(parameter.device)
     seconds = perf_counter() - start
-    if return_components:
-        return noise, prediction, seconds, component_ids
     return noise, prediction, seconds
 
 

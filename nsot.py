@@ -23,13 +23,10 @@ from scipy.spatial.distance import cdist
 import torch
 
 import anchor_flow
-import anchor_conditioning
-import nsot_directional
 
 FORMAT_VERSION = 1
 PRIOR_FORMAT_VERSION = 2
 SOLVER = "scipy_linear_sum_assignment"
-DIRECTIONAL_IMPLEMENTATION = "nsot_anchor_prior_directional_hybrid_v1"
 
 
 def file_sha256(path):
@@ -44,6 +41,11 @@ def settings(config):
     if config.get("coupling") != "nsot":
         raise ValueError("NSOT preparation requires coupling: nsot")
     value = config.get("nsot", {})
+    if not isinstance(value, dict):
+        raise ValueError("nsot must be a mapping")
+    unknown = value.keys() - {"cache", "superset_size", "cache_seed", "beta", "solver", "cache_sha256"}
+    if unknown:
+        raise ValueError("Unsupported nsot settings: " + ", ".join(sorted(map(str, unknown))))
     size, seed, beta = value.get("superset_size"), value.get("cache_seed"), value.get("beta")
     if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 10000:
         raise ValueError("Exact NSOT superset_size must be an integer in [1,10000]")
@@ -57,8 +59,6 @@ def settings(config):
     if config["model"]["point_dim"] != 2 or not 1 <= config["data"]["n_points"] <= size:
         raise ValueError("2D NSOT requires point_dim=2 and 1 <= n_points <= superset_size")
     anchor_flow.settings(config)
-    nsot_directional.settings(config)
-    anchor_conditioning.settings(config)
     return {"superset_size": size, "cache_seed": seed, "beta": float(beta),
             "cache": str(value["cache"]), "solver": SOLVER}
 
@@ -221,146 +221,6 @@ def load_cache(config, dataset):
     return _load_cache(config, dataset)[:5]
 
 
-def _directional_parameters(config):
-    options = nsot_directional.settings(config)
-    return {key: value for key, value in options.items()
-            if key not in ("artifact", "artifact_sha256")}
-
-
-def _directional_identity(config, dataset, pair_cache_sha256):
-    """Bind a small fitted kernel to the unchanged, separately hashed OT bank."""
-    return {
-        "format_version": 1, "implementation": DIRECTIONAL_IMPLEMENTATION,
-        "dataset": dataset, "pair_cache_sha256": pair_cache_sha256,
-        "anchor_prior": anchor_flow.cache_spec(config),
-        "prior_centers": config["anchor_flow"]["centers"],
-        "beta": float(config["nsot"]["beta"]),
-        "settings": _directional_parameters(config),
-    }
-
-
-def _reject_nonfinite_json(value):
-    raise ValueError(f"Nonfinite JSON constant in directional artifact: {value}")
-
-
-def _load_directional_artifact(config, dataset, pair_cache_sha256):
-    options = nsot_directional.settings(config)
-    path = Path(options["artifact"])
-    if not path.is_file():
-        raise FileNotFoundError(f"Directional NSOT artifact missing: {path}; "
-                                "run python prepare_nsot.py CONFIG --dataset " + dataset)
-    digest = file_sha256(path)
-    if options.get("artifact_sha256") not in (None, digest):
-        raise ValueError("Directional artifact SHA256 differs from the checkpoint training artifact")
-    try:
-        with path.open(encoding="utf-8") as stream:
-            artifact = json.load(stream, parse_constant=_reject_nonfinite_json)
-    except (ValueError, UnicodeError) as error:
-        raise ValueError("Invalid directional NSOT artifact JSON") from error
-    if not isinstance(artifact, dict):
-        raise ValueError("Directional NSOT artifact must be a mapping")
-    identity = _directional_identity(config, dataset, pair_cache_sha256)
-    required = set(identity) | {"matrices", "components", "fit_seconds", "fit_timing_scope",
-                                "fit_source_sha256", "prior_preservation", "target_coordinates", "quality_guarantee"}
-    if set(artifact) != required:
-        raise ValueError("Directional artifact has missing/extra fields")
-    for key, value in identity.items():
-        if artifact.get(key) != value:
-            raise ValueError(f"Directional artifact/config mismatch: {key}")
-    matrices = np.asarray(artifact.get("matrices"), dtype=np.float64)
-    k = config["num_regions"]
-    if matrices.shape != (k, 2, 2):
-        raise ValueError("Directional artifact requires one 2x2 matrix per original component")
-    nsot_directional.factors(matrices)  # PSD/range/finiteness checks, CPU setup only.
-    if not np.allclose(np.trace(matrices, axis1=1, axis2=2), 2 * identity["beta"],
-                       rtol=0, atol=1e-8):
-        raise ValueError("Directional artifact changes the scalar hybrid noise budget")
-    reports = artifact.get("components")
-    if not isinstance(reports, list) or len(reports) != k:
-        raise ValueError("Directional artifact requires a fit report for every component")
-    count_total = 0
-    for component, report in enumerate(reports):
-        if not isinstance(report, dict) or report.get("component") != component:
-            raise ValueError("Directional component report has an invalid component ID")
-        count = report.get("count")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ValueError("Directional component report has an invalid sample count")
-        count_total += count
-        if not isinstance(report.get("fallback"), bool) or not isinstance(report.get("reason"), str):
-            raise ValueError("Directional component report has no fallback status/reason")
-        eigenvalues = np.asarray(report.get("beta_eigenvalues"), dtype=np.float64)
-        if eigenvalues.shape != (2,) or not np.isfinite(eigenvalues).all() \
-                or not np.allclose(eigenvalues, np.linalg.eigvalsh(matrices[component]), rtol=0, atol=1e-8):
-            raise ValueError("Directional component report eigenvalues differ from its matrix")
-    if count_total != config["nsot"]["superset_size"]:
-        raise ValueError("Directional component counts differ from the pair cache size")
-    seconds = artifact.get("fit_seconds")
-    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) \
-            or not math.isfinite(seconds) or seconds < 0:
-        raise ValueError("Invalid directional fitting time")
-    if not isinstance(artifact["fit_source_sha256"], dict) \
-            or set(artifact["fit_source_sha256"]) != {"nsot.py", "nsot_directional.py"}:
-        raise ValueError("Invalid directional fitting provenance")
-    for digest_value in artifact["fit_source_sha256"].values():
-        if not isinstance(digest_value, str) or len(digest_value) != 64 \
-                or any(character not in "0123456789abcdef" for character in digest_value):
-            raise ValueError("Invalid directional fitting source SHA256")
-    if not isinstance(artifact["fit_timing_scope"], str) or not artifact["fit_timing_scope"]:
-        raise ValueError("Invalid directional fitting timing scope")
-    if artifact["quality_guarantee"] is not False:
-        raise ValueError("Directional artifacts must not claim a quality guarantee")
-    if any(not isinstance(artifact[key], str) or not artifact[key]
-           for key in ("prior_preservation", "target_coordinates")):
-        raise ValueError("Invalid directional prior/target scope description")
-    # Includes nested fit reports. Reject overflows such as JSON 1e999 before training/save.
-    try:
-        json.dumps(artifact, allow_nan=False)
-    except (TypeError, ValueError) as error:
-        raise ValueError("Directional artifact contains nonfinite or nonserializable metadata") from error
-    return artifact, digest
-
-
-def prepare_directional(config, dataset):
-    """Fit/validate a small sidecar without changing or re-solving the OT bank."""
-    options = nsot_directional.settings(config)
-    if options is None:
-        raise ValueError("prepare_directional requires nsot.directional_hybrid")
-    resolved = copy.deepcopy(config)
-    source, target, permutation, _, digest, components = _load_cache(resolved, dataset)
-    path = Path(options["artifact"])
-    if path.resolve() == Path(config["nsot"]["cache"]).resolve():
-        raise ValueError("Directional artifact must not replace the OT pair cache")
-    if path.exists():
-        artifact, artifact_hash = _load_directional_artifact(resolved, dataset, digest)
-        print(f"reused_directional_artifact={path} sha256={artifact_hash}", flush=True)
-        return path, artifact
-    if options.get("artifact_sha256") is not None:
-        raise FileNotFoundError("Pinned directional artifact is missing; do not recreate a trained artifact")
-    tick = perf_counter()
-    fitted = nsot_directional.fit(source, target[permutation], components,
-                                 resolved["anchor_flow"]["centers"],
-                                 sigma=resolved["anchor_flow"]["sigma"],
-                                 beta=resolved["nsot"]["beta"], options=options)
-    fit_seconds = perf_counter() - tick
-    artifact = {
-        **_directional_identity(resolved, dataset, digest), **fitted,
-        "fit_seconds": fit_seconds,
-        "fit_timing_scope": "component statistics and ridge/PCA fitting only; excludes parent OT and all file IO/loading",
-        "fit_source_sha256": {name: file_sha256(Path(__file__).parent / name)
-                              for name in ("nsot.py", "nsot_directional.py")},
-        "prior_preservation": "exact for fresh population Gaussian residuals and independent noise; fixed finite cache is approximate",
-        "target_coordinates": "unchanged cached OT targets; no oversampling, deformation or re-assignment",
-        "quality_guarantee": False,
-    }
-    # Validate numerical output before exclusive creation. Never overwrite an old fit.
-    nsot_directional.factors(fitted["matrices"])
-    encoded = json.dumps(artifact, indent=2, allow_nan=False)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8") as stream:
-        stream.write(encoded)
-    print(f"saved_directional_artifact={path} sha256={file_sha256(path)} "
-          f"fit_seconds={fit_seconds:.6f}", flush=True)
-    return path, artifact
 
 
 def prepare(config, dataset):
@@ -372,8 +232,6 @@ def prepare(config, dataset):
     if path.exists():
         _, _, _, metadata, digest = load_cache(config, dataset)
         print(f"reused_nsot_cache={path} sha256={digest}", flush=True)
-        if nsot_directional.settings(config) is not None:
-            prepare_directional(config, dataset)
         return path, metadata
     start = perf_counter()
     components, centers, prior_draw = None, None, {}
@@ -416,6 +274,11 @@ def prepare(config, dataset):
             marginals="finite point-superset plus component-centered jitter approximates the saved population GMM",
             source_prior=anchor_flow.experiment_details(resolved), **prior_draw)
         metadata["source_sha256"]["anchor_flow.py"] = file_sha256(Path(__file__).parent / "anchor_flow.py")
+        if prior_spec.get("center_fit") == "gmm_em":
+            metadata.update(
+                implementation="nsot_fixed_isotropic_gmm_em_v1",
+                paper_setting="experimental equal-weight fixed-sigma GMM-EM/component-centered extension; NOT original NSOT",
+            )
     path.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation prevents accidental destruction of an existing cache.
     # If interrupted during writing, the partial file fails load_cache validation.
@@ -429,8 +292,6 @@ def prepare(config, dataset):
     print(f"saved_nsot_cache={path} sha256={digest}", flush=True)
     print(f"precompute_seconds={metadata['precompute_seconds']:.3f} "
           f"cost_before={metadata['cost_before']:.6f} cost_after={optimal_cost:.6f}", flush=True)
-    if nsot_directional.settings(config) is not None:
-        prepare_directional(config, dataset)
     return path, metadata
 
 
@@ -469,30 +330,12 @@ class NSOTPairSampler:
             self.source_components = torch.as_tensor(components, device=device, dtype=torch.long)
             self.prior_centers = torch.tensor(flow["centers"], device=device, dtype=dtype)
             self.sigma = flow["sigma"]
-        self.directional_shrink, self.directional_refresh = None, None
-        self.directional_metadata, self.artifact_sha256 = None, None
-        self.directional_artifact_path = None
-        self.directional_setup_seconds = None
-        if nsot_directional.settings(config) is not None:
-            tick = perf_counter()
-            self.directional_artifact_path = nsot_directional.settings(config)["artifact"]
-            self.directional_metadata, self.artifact_sha256 = _load_directional_artifact(
-                config, dataset, self.cache_sha256)
-            shrink, refresh = nsot_directional.factors(self.directional_metadata["matrices"])
-            self.directional_shrink = torch.as_tensor(shrink, device=device, dtype=dtype)
-            self.directional_refresh = torch.as_tensor(refresh, device=device, dtype=dtype)
-            config["nsot"]["directional_hybrid"]["artifact_sha256"] = self.artifact_sha256
-            self.directional_setup_seconds = perf_counter() - tick
         self.flow_details = anchor_flow.experiment_details(config)
 
     @torch.no_grad()
-    def sample(self, batch_size, *, generator=None, return_components=False):
+    def sample(self, batch_size, *, generator=None):
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
-        if not isinstance(return_components, bool):
-            raise ValueError("return_components must be a bool")
-        if return_components and self.source_components is None:
-            raise ValueError("Original source components require an anchor-prior NSOT bank")
         # Independent draws WITH replacement: Appendix A.1.2's product law.
         index = torch.randint(len(self.source), (batch_size, self.n_points),
                               device=self.source.device, generator=generator)
@@ -501,16 +344,8 @@ class NSOTPairSampler:
         if self.source_components is not None:
             components = self.source_components[index]
             centers = self.prior_centers[components]
-            if self.directional_shrink is not None:
-                paired_source = nsot_directional.apply(
-                    source, centers, sigma=self.sigma,
-                    shrink=self.directional_shrink[components],
-                    refresh=self.directional_refresh[components], noise=noise)
-            else:
-                paired_source = component_centered_hybrid(source, centers, sigma=self.sigma,
-                                                          beta=self.beta, noise=noise)
-            if return_components:
-                return paired_source, target, components
+            paired_source = component_centered_hybrid(source, centers, sigma=self.sigma,
+                                                      beta=self.beta, noise=noise)
             return paired_source, target
         return math.sqrt(1 - self.beta) * source + math.sqrt(self.beta) * noise, target
 
@@ -531,21 +366,4 @@ class NSOTPairSampler:
                           source_draw_seed=self.metadata["source_draw_seed"],
                           target_draw_seed=self.metadata["target_draw_seed"],
                           draw_rng=self.metadata["draw_rng"])
-        if self.directional_metadata is not None:
-            result["directional_hybrid"] = {
-                "artifact": self.directional_artifact_path,
-                "artifact_sha256": self.artifact_sha256,
-                "pair_cache_sha256": self.cache_sha256,
-                "settings": self.directional_metadata["settings"],
-                "matrices": self.directional_metadata["matrices"],
-                "components": self.directional_metadata["components"],
-                "fit_source_sha256": self.directional_metadata["fit_source_sha256"],
-                "conditioning": "original sampled component labels select fixed kernels; labels are NOT model inputs",
-                "noise_budget": "trace(S_k)=2*beta for every component, including isotropic fallbacks",
-                "online_work": "two small fixed matrix-vector products per sampled point; no solves or network Jacobians",
-            }
-            result.update(directional_precompute_seconds=self.directional_metadata["fit_seconds"],
-                          directional_precompute_timing_scope=self.directional_metadata["fit_timing_scope"],
-                          directional_setup_seconds=self.directional_setup_seconds,
-                          directional_setup_timing_scope="artifact read/validation and factor placement; no explicit CUDA synchronization")
         return result
