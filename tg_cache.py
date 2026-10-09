@@ -3,12 +3,9 @@
 bank: reuse a finite paired-cloud bank with cached exact coarse assignments.
 stream: prepare the complete training stream; each cloud is used once.
 Neither mode requires online OT. Fine pairing is resampled on every visit.
-By default inference starts from fresh iid standard Gaussian, without the
-cache. Optional anchor_flow experiments have explicit, checkpointed priors;
-they never silently reinterpret the baseline cache.
+Inference starts from fresh iid standard Gaussian, without the cache.
 """
 
-import copy
 import hashlib
 import json
 from pathlib import Path
@@ -19,8 +16,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 
-import anchor_flow
 from coupling import assign_regions, balanced_target_partition
+from data import validate_gaussian_source
 from nsot import dataset_spec, file_sha256
 
 
@@ -75,7 +72,7 @@ def settings(config):
     if not isinstance(value.get("path"), str) or not value["path"]:
         raise ValueError("tg_cache.path must name a cache directory")
     workers = _integer(value.get("num_workers", 0), "tg_cache.num_workers", 0)
-    anchor_flow.settings(config)
+    validate_gaussian_source(config)
     result = {"method": method, "path": value["path"], "sampling": sampling,
               "num_clouds": count, "cache_seed": _integer(value.get("seed", 0), "tg_cache.seed", 0),
               "prepare_batch_size": _integer(value.get("prepare_batch_size", 64), "prepare_batch_size"),
@@ -89,10 +86,6 @@ def _spec(config, dataset, opts):
             "cache_seed": opts["cache_seed"], "prepare_batch_size": opts["prepare_batch_size"],
             "n_points": opts["n_points"], "num_regions": opts["num_regions"],
             "dataset_spec": dataset_spec(config, dataset)}
-    # Prior experiments DO change X and therefore require a different spec.
-    flow = anchor_flow.cache_spec(config)
-    if flow is not None and flow["mode"] == "anchor_prior":
-        result["anchor_prior"] = flow
     return result
 
 
@@ -128,15 +121,9 @@ def load_cache(config, dataset):
     for key, value in _spec(config, dataset, opts).items():
         if metadata.get(key) != value:
             raise ValueError(f"TG cache/config mismatch: {key}")
-    expected_prior = _spec(config, dataset, opts).get("anchor_prior")
-    if metadata.get("anchor_prior") != expected_prior:
-        raise ValueError("TG cache/config mismatch: anchor_prior")
-    if expected_prior is not None:
-        # Validate resolved state as well as input hyperparameters. This also
-        # prevents using a checkpoint with a different fitted prior.
-        anchor_flow.bind_prior_centers(copy.deepcopy(config), metadata.get("prior_centers"))
-    elif "prior_centers" in metadata:
-        raise ValueError("A standard Gaussian TG cache must not contain prior_centers")
+    if (metadata.get("implementation") != "tg_offline_v1"
+            or metadata.get("source_coordinates") != "unmodified iid standard Gaussian draws"):
+        raise ValueError("Unsupported TG cache source/implementation; only standard-Gaussian caches are supported")
     count = _integer(metadata.get("num_clouds"), "cached num_clouds")
     if opts["num_clouds"] is not None and count != opts["num_clouds"]:
         raise ValueError("TG cache cloud count mismatch")
@@ -181,13 +168,6 @@ def prepare(config, dataset):
     if shutil.disk_usage(ancestor).free < storage + 128 * 2**20:
         raise OSError("Insufficient disk space for this TG cache; choose another drive/path or a smaller bank")
     start = perf_counter()
-    source_config = copy.deepcopy(config)
-    prior_centers, prior_fit_seconds = None, 0.
-    if spec.get("anchor_prior") is not None:
-        tick = perf_counter()
-        prior_centers = anchor_flow.fit_prior_centers(config, dataset)
-        anchor_flow.bind_prior_centers(source_config, prior_centers)
-        prior_fit_seconds = perf_counter() - tick
     path.parent.mkdir(parents=True, exist_ok=True)
     path.mkdir(exist_ok=False)
     arrays = {name: np.lib.format.open_memmap(path / f"{name}.npy", mode="w+", dtype=dtype, shape=shape)
@@ -208,7 +188,7 @@ def prepare(config, dataset):
             for begin in range(0, count, opts["prepare_batch_size"]):
                 end = min(begin + opts["prepare_batch_size"], count)
                 tick = perf_counter()
-                source = anchor_flow.sample_source(source_config, end - begin, device="cpu", dtype=torch.float32)
+                source = torch.randn(end - begin, opts["n_points"], 2, device="cpu", dtype=torch.float32)
                 target = (sample_horse(mask, end - begin, opts["n_points"]) if dataset == "horse"
                           else sample_checkerboard(end - begin, opts["n_points"], "cpu", torch.float32,
                                                    config["data"]["grid_size"]))
@@ -248,13 +228,6 @@ def prepare(config, dataset):
                 "environment": {"torch": str(torch.__version__), "numpy": np.__version__},
                 "source_sha256": {name: file_sha256(Path(__file__).parent / name)
                                   for name in ("tg_cache.py", "coupling.py", "data.py", "train_horse.py")}}
-    if prior_centers is not None:
-        metadata.update(prior_centers=prior_centers, prior_fit_seconds=prior_fit_seconds,
-                        implementation="tg_offline_anchor_prior_v1",
-                        source_coordinates="fixed training-derived anchor centers + sigma * fresh Gaussian; no whitening",
-                        inference_source="fresh iid uniform anchor Gaussian mixture, using checkpointed centers; no cache",
-                        source_prior=anchor_flow.experiment_details(source_config))
-        metadata["source_sha256"]["anchor_flow.py"] = file_sha256(Path(__file__).parent / "anchor_flow.py")
     # Written last: interruption leaves an explicitly incomplete cache, never a
     # apparently valid one. No overwrite/automatic deletion of existing data.
     with (path / "metadata.json").open("x", encoding="utf-8") as stream:
@@ -309,9 +282,6 @@ class TGCachedPairSampler:
         start = perf_counter()
         opts = settings(config)
         self.path, self.metadata, self.cache_sha256 = load_cache(config, dataset)
-        if "anchor_prior" in self.metadata:
-            anchor_flow.bind_prior_centers(config, self.metadata["prior_centers"])
-        self.flow_details = anchor_flow.experiment_details(config)
         self.device, self.dtype = torch.device(device), dtype
         self.dataset = _CloudDataset(self.path, self.metadata, config["seed"] + 1)
         self.iterator, self.loader = None, None
@@ -371,7 +341,4 @@ class TGCachedPairSampler:
                 "cached_target_sha256": meta["array_sha256"]["target"],
                 "cached_target_partition_sha256": meta["array_sha256"]["target_labels"],
                 "precompute_source_sha256": meta["source_sha256"]}
-        result.update(self.flow_details)
-        if "prior_fit_seconds" in meta:
-            result["prior_fit_seconds"] = meta["prior_fit_seconds"]
         return result

@@ -14,8 +14,8 @@ import scipy
 import torch
 import yaml
 
-from anchor_flow import experiment_details, sample_source, settings as anchor_flow_settings, variant_suffix
 from coupling import canonical_method, coupling_info
+from data import validate_gaussian_source
 from sample import integrate_velocity
 
 
@@ -23,7 +23,7 @@ def read_config(path):
     with Path(path).open(encoding="utf-8") as file:
         config = yaml.safe_load(file)
     config["coupling"] = canonical_method(config["coupling"])
-    anchor_flow_settings(config)  # Validate templates without resolving or fitting a source prior.
+    validate_gaussian_source(config)
     if config["coupling"] == "nsot":
         from nsot import settings as nsot_settings
         nsot_settings(config)
@@ -50,14 +50,12 @@ def training_signature(config):
 
 
 def save_training(model, config, dataset, config_path, seconds, loss, *, coupling_metadata=None):
+    validate_gaussian_source(config)
     if not np.isfinite(loss):
         raise FloatingPointError("Final training loss is nonfinite; checkpoint was not saved")
     now = datetime.now(timezone.utc)
     method = canonical_method(config["coupling"])
     name = f"{dataset}_{method}_k{config.get('num_regions', 'na')}_n{config['data']['n_points']}_seed{config['seed']}"
-    variant = variant_suffix(config)
-    if variant:
-        name += f"_{variant}"
     run_dir = Path("runs") / dataset / f"{name}_{now:%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     snapshot = copy.deepcopy(config)
@@ -72,8 +70,6 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     }
     if coupling_metadata is not None:
         metadata["coupling_details"].update(coupling_metadata)
-    # Apply last: baseline TG metadata assumes a Gaussian source and linear path.
-    metadata["coupling_details"].update(experiment_details(config))
     checkpoint = run_dir / snapshot["checkpoint"]
     torch.save({**metadata, "model_state_dict": model.state_dict()}, checkpoint)
     with (run_dir / "config.yaml").open("x", encoding="utf-8") as file:
@@ -88,14 +84,6 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
 
 def load_model(config_path, model_class, dataset, *, device=None):
     config = read_config(config_path)
-    if ((config.get("anchor_flow") or {}).get("mode") == "anchor_prior"
-            and "centers" not in config["anchor_flow"]):
-        raise ValueError("Anchor-prior inference requires resolved fixed centers in the saved runs/.../config.yaml; "
-                         "do not evaluate an unresolved training-template YAML")
-    if (config.get("anchor_flow") or {}).get("mode") == "gmm_prior":
-        from gmm_prior import settings as gmm_settings
-        if not {"weights", "means", "covariances"} <= gmm_settings(config).keys():
-            raise ValueError("GMM inference requires saved weights, means and covariances in runs/.../config.yaml")
     if device is not None:
         config["device"] = str(torch.device(device))
     checkpoint = Path(config["checkpoint"])
@@ -136,17 +124,12 @@ def evaluation_settings(config):
     return settings
 
 
-def sample_for_evaluation(model, config, steps, *, timing_details=None):
+def sample_for_evaluation(model, config, steps):
+    validate_gaussian_source(config)
     parameter = next(model.parameters())
     batch = evaluation_settings(config)["batch_size"]
-    if timing_details is not None:
-        synchronize(parameter.device)
-        source_start = perf_counter()
-    noise = sample_source(
-        config, batch, device=parameter.device, dtype=parameter.dtype)
-    if timing_details is not None:
-        synchronize(parameter.device)
-        timing_details["source_sampling_seconds"] = perf_counter() - source_start
+    noise = torch.randn(batch, config["data"]["n_points"], config["model"]["point_dim"],
+                        device=parameter.device, dtype=parameter.dtype)
     time = parameter.new_zeros(batch, 1, 1)
     with torch.no_grad():
         for _ in range(10):
@@ -159,47 +142,8 @@ def sample_for_evaluation(model, config, steps, *, timing_details=None):
     return noise, prediction, seconds
 
 
-def sample_evaluation_target(config, dataset, batch_size, *, device, dtype, seed=None):
-    """Optional isolated target stream for matched prior-family comparisons.
-
-    With seed=None, preserve the existing evaluators' global RNG draw exactly.
-    An explicit seed makes targets independent of each prior's sampling method,
-    model initialization, and NFE. The caller's CPU/CUDA RNG states are restored.
-    """
-    from data import sample_checkerboard
-    from train_horse import load_horse_mask, sample_horse
-
-    device = torch.device(device)
-    if dataset not in ("checkerboard", "horse"):
-        raise ValueError("Expected checkerboard or horse evaluation target")
-
-    def draw():
-        if dataset == "horse":
-            return sample_horse(load_horse_mask(device, dtype), batch_size, config["data"]["n_points"])
-        return sample_checkerboard(batch_size, config["data"]["n_points"], device, dtype,
-                                   config["data"]["grid_size"])
-
-    if seed is None:
-        return draw()
-    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**63:
-        raise ValueError("Evaluation target seed must be an integer in [0,2**63)")
-    cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] \
-        if device.type == "cuda" else []
-    with torch.random.fork_rng(devices=cuda_devices):
-        torch.set_rng_state(torch.Generator(device="cpu").manual_seed(seed).get_state())
-        if cuda_devices:
-            torch.cuda.set_rng_state(torch.Generator(device=device).manual_seed(seed).get_state(), device)
-        return draw()
-
-
-def evaluation_target_hash(target):
-    """Record exact held-out coordinates so comparison equality is auditable."""
-    values = target.detach().cpu().contiguous().numpy()
-    return hashlib.sha256(values.tobytes()).hexdigest()
-
-
 def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, seconds, scores, *,
-                    render=True, metric_metadata=None, target_seed=None, target_hash=None, source_sampling_seconds=None):
+                    render=True, metric_metadata=None):
     now = datetime.now(timezone.utc)
     settings = evaluation_settings(config)
     checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
@@ -217,14 +161,8 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
         "training_seconds": metadata.get("training_seconds"),
         "training_environment": metadata.get("environment"), "evaluation_environment": environment(config["device"]),
         "evaluation_seed": settings["seed"], "evaluation_batch_size": settings["batch_size"],
-        "evaluation_target_seed": target_seed,
-        "evaluation_target_sha256": target_hash,
-        "evaluation_target_rng": "isolated shared target stream" if target_seed is not None else "legacy global RNG after source sampling",
         "n_points": config["data"]["n_points"], "total_points": settings["batch_size"] * config["data"]["n_points"],
         "euler_steps": steps, "histogram_bins": settings["histogram_bins"], "inference_seconds": seconds,
-        "source_sampling_seconds": source_sampling_seconds,
-        "sampling_plus_inference_seconds": seconds + source_sampling_seconds if source_sampling_seconds is not None else None,
-        "source_sampling_timing_scope": "actual fresh source draw, including prior validation and Cholesky; no sampler warmup; first-use overhead possible",
         "inference_timing_scope": "integration only; excludes source sampling, warmup, loading, metrics and rendering",
         "metric_definitions": {"chamfer": "sum of directional mean squared distances; then mean over clouds",
                                "leakage": "invalid points / all pooled points",
@@ -234,15 +172,9 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
         "image": str(image_path.resolve()) if render else None,
         **scores,
     }
-    if config.get("anchor_flow") is not None:
-        results["metric_definitions"]["source_prefix"] = (
-            "same metrics on initial source before any model step, against the SAME sampled target; "
-            "no-flow prior baseline, not an additional generation run")
     # Undefined conditional TV (no valid points) is recorded as null, not NaN.
     if "cell_mass_error" in results and not np.isfinite(results["cell_mass_error"]):
         results["cell_mass_error"] = None
-    if "source_cell_mass_error" in results and not np.isfinite(results["source_cell_mass_error"]):
-        results["source_cell_mass_error"] = None
     json_path = output_dir / f"{name}.json"
     with json_path.open("x", encoding="utf-8") as file:
         json.dump(results, file, indent=2, allow_nan=False)
@@ -254,7 +186,5 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 
 def evaluation_title(config):
-    variant = variant_suffix(config)
-    name = config['coupling'] + (f" / {variant}" if variant else "")
-    return (f"{name} | K={config.get('num_regions', 'na')} | "
+    return (f"{config['coupling']} | K={config.get('num_regions', 'na')} | "
             f"N={config['data']['n_points']} | seed={config['seed']}")

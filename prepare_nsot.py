@@ -1,17 +1,9 @@
-"""Prepare 2D exact-superset NSOT, once per dataset and configured source prior.
+"""Prepare standard-Gaussian 2D exact-superset NSOT, once per dataset.
 
 python prepare_nsot.py checkerboard_experiments/nsot.yaml --dataset checkerboard
 python prepare_nsot.py horse_experiments/horse_nsot_n256_seed0.yaml --dataset horse
 
-Experimental fixed anchor-GMM prior with component-centered preserving noise:
-python prepare_nsot.py checkerboard_experiments/nsot_anchor_prior_k8_n256_seed0.yaml --dataset checkerboard
-python prepare_nsot.py horse_experiments/horse_nsot_anchor_prior_k8_n256_seed0.yaml --dataset horse
-
 Then use the existing train.py/train_horse.py and eval.py/eval_horse.py commands.
-The experimental GMM is drawn BEFORE fresh exact OT. Original component labels
-and fixed centers are cached; checkpoint configs embed the same centers for
-cache-free inference. Changing the prior requires a NEW cache path. Gaussian
-baseline caches remain format 1; anchor-prior caches use separate format 2.
 No GeomLoss, KeOps, custom CUDA extension, author-code claim or 100K approximation.
 
 """

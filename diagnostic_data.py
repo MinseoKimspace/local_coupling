@@ -1,4 +1,4 @@
-"""Shared, indexed draws from each configured source law for read-only 2D diagnostics."""
+"""Shared, indexed Gaussian source and target draws for read-only 2D diagnostics."""
 
 import hashlib
 from pathlib import Path
@@ -6,8 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from anchor_flow import sample_source
-from data import sample_checkerboard
+from data import sample_checkerboard, validate_gaussian_source
 from experiment import load_model
 from model import PointSetTransformer
 from train_horse import HorsePointSetTransformer, load_horse_mask, sample_horse
@@ -42,6 +41,7 @@ class DiagnosticData:
     """
 
     def __init__(self, config, dataset, device, dtype, seed):
+        validate_gaussian_source(config)
         if dataset not in ("checkerboard", "horse"):
             raise ValueError("Expected checkerboard or horse")
         self.config, self.dataset = config, dataset
@@ -55,7 +55,8 @@ class DiagnosticData:
 
     def source(self, index, purpose="evaluation"):
         generator = torch.Generator(device=self.device).manual_seed(self.draw_seed(purpose + ":source", index))
-        return sample_source(self.config, 1, device=self.device, dtype=self.dtype, generator=generator)[0]
+        return torch.randn(1, self.n, self.config["model"]["point_dim"], device=self.device,
+                           dtype=self.dtype, generator=generator)[0]
 
     def target(self, index, purpose="evaluation"):
         cuda_devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()] \

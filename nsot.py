@@ -6,12 +6,8 @@ This is NOT author code or the main 100K approximate-gradient-flow experiment.
 Keep the original Gaussian coordinates; exact OT only permutes the target.
 Fixed finite caches approximate, rather than exactly equal, population marginals.
 Baseline inference starts from fresh iid standard Gaussian, without this cache.
-Optional anchor_prior uses a GMM BEFORE OT and a component-centered hybrid
-kernel; its population GMM is preserved, not the original NSOT Gaussian prior.
-The separate gmm_prior mode learns weights, means and full covariances by EM.
 """
 
-import copy
 import hashlib
 import json
 import math
@@ -23,11 +19,9 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 import torch
 
-import anchor_flow
+from data import validate_gaussian_source
 
 FORMAT_VERSION = 1
-PRIOR_FORMAT_VERSION = 2
-GMM_FORMAT_VERSION = 3
 SOLVER = "scipy_linear_sum_assignment"
 
 
@@ -60,7 +54,7 @@ def settings(config):
         raise ValueError("NSOT requires a cache path and scipy_linear_sum_assignment solver")
     if config["model"]["point_dim"] != 2 or not 1 <= config["data"]["n_points"] <= size:
         raise ValueError("2D NSOT requires point_dim=2 and 1 <= n_points <= superset_size")
-    anchor_flow.settings(config)
+    validate_gaussian_source(config)
     return {"superset_size": size, "cache_seed": seed, "beta": float(beta),
             "cache": str(value["cache"]), "solver": SOLVER}
 
@@ -81,9 +75,6 @@ def dataset_spec(config, dataset):
 
 def draw_supersets(config, dataset):
     """Isolated CPU float32 draws using the unmodified project target samplers."""
-    if anchor_flow.settings(config) is not None:
-        source, target, _, _, _ = _draw_prior_supersets(config, dataset)
-        return source, target
     opts = settings(config)
     count = opts["superset_size"]
     # Reset CPU RNG only, without advancing/restoring any CUDA generator.
@@ -100,56 +91,6 @@ def draw_supersets(config, dataset):
         else:
             raise ValueError("Expected checkerboard or horse")
     return source.numpy(), target.numpy()
-
-
-def _draw_prior_supersets(config, dataset):
-    """New experimental draws with separately isolated source/target streams.
-
-    The original Gaussian baseline's draw order above is deliberately untouched.
-    This variant does not promise its target superset equals that old stream.
-    The GMM draw uses sample_source's exact categorical-then-Gaussian ordering.
-    """
-    opts = settings(config)
-    source_config = copy.deepcopy(config)
-    tick = perf_counter()
-    flow = anchor_flow.settings(source_config)
-    fit_details = {}
-    if flow["mode"] == "gmm_prior":
-        import gmm_prior
-        centers, fit_details = gmm_prior.fit(source_config, dataset)
-        gmm_prior.bind(source_config, centers)
-    else:
-        centers = anchor_flow.fit_prior_centers(source_config, dataset)
-        anchor_flow.bind_prior_centers(source_config, centers)
-    fit_seconds = perf_counter() - tick
-    source_config["data"]["n_points"] = opts["superset_size"]
-    source_generator = torch.Generator(device="cpu").manual_seed(opts["cache_seed"])
-    source, components = anchor_flow.sample_source_with_components(
-        source_config, 1, device="cpu", dtype=torch.float32, generator=source_generator)
-    target_seed = int.from_bytes(hashlib.sha256(
-        f"nsot_anchor_prior_target_v1:{opts['cache_seed']}".encode()).digest()[:8], "little") % (2**63 - 1)
-    with torch.random.fork_rng(devices=[]):
-        torch.set_rng_state(torch.Generator(device="cpu").manual_seed(target_seed).get_state())
-        if dataset == "checkerboard":
-            from data import sample_checkerboard
-            target = sample_checkerboard(1, opts["superset_size"], "cpu", torch.float32,
-                                         config["data"]["grid_size"])[0]
-        elif dataset == "horse":
-            from train_horse import load_horse_mask, sample_horse
-            target = sample_horse(load_horse_mask("cpu", torch.float32), 1, opts["superset_size"])[0]
-        else:
-            raise ValueError("Expected checkerboard or horse")
-    draw_details = {
-        "prior_fit_seconds": fit_seconds, "source_draw_seed": opts["cache_seed"],
-        "target_draw_seed": target_seed,
-        "draw_rng": "isolated CPU source generator and separate hashed target seed; independent of prior fitting"}
-    if fit_details:
-        draw_details["gmm_fit_details"] = fit_details
-    return source[0].numpy(), target.numpy(), components[0].numpy(), centers, draw_details
-
-
-def _component_sha256(components):
-    return hashlib.sha256(np.ascontiguousarray(components).tobytes()).hexdigest()
 
 
 def exact_superset_permutation(source, target):
@@ -174,10 +115,9 @@ def source_moments(source):
     return {"mean": value.mean(0).tolist(), "covariance": (centered.T @ centered / len(value)).tolist()}
 
 
-def _load_cache(config, dataset):
+def load_cache(config, dataset):
+    """Validate and load an original standard-Gaussian cache."""
     opts = settings(config)
-    prior_spec = anchor_flow.cache_spec(config)
-    is_gmm = prior_spec is not None and prior_spec["mode"] == "gmm_prior"
     path = Path(opts["cache"])
     if not path.is_file():
         raise FileNotFoundError(f"NSOT cache missing: {path}; run python prepare_nsot.py CONFIG --dataset {dataset}")
@@ -187,27 +127,18 @@ def _load_cache(config, dataset):
         raise ValueError("NSOT cache SHA256 differs from the checkpoint training cache")
     with np.load(path, allow_pickle=False) as archive:
         expected_arrays = {"source", "target", "permutation", "metadata"}
-        if prior_spec is not None:
-            expected_arrays.add("source_components")
         if set(archive.files) != expected_arrays:
-            raise ValueError("NSOT cache has missing/extra arrays or a different source prior")
+            raise ValueError("NSOT cache has missing/extra arrays; only standard-Gaussian caches are supported")
         metadata = json.loads(str(archive["metadata"].item()))
         source, target, permutation = archive["source"], archive["target"], archive["permutation"]
-        components = archive["source_components"] if prior_spec is not None else None
-    version = GMM_FORMAT_VERSION if is_gmm else (PRIOR_FORMAT_VERSION if prior_spec is not None else FORMAT_VERSION)
-    expected = {"format_version": version,
+    expected = {"format_version": FORMAT_VERSION,
+                "implementation": "paper_based_2d_exact_superset_v1",
                 "solver": SOLVER,
                 "superset_size": opts["superset_size"], "cache_seed": opts["cache_seed"],
                 "dataset_spec": dataset_spec(config, dataset)}
     for key, value in expected.items():
         if metadata.get(key) != value:
             raise ValueError(f"NSOT cache/config mismatch: {key}")
-    if metadata.get("anchor_prior") != (None if is_gmm else prior_spec):
-        raise ValueError("NSOT cache/config mismatch: anchor_prior")
-    if metadata.get("gmm_prior") != (prior_spec if is_gmm else None):
-        raise ValueError("NSOT cache/config mismatch: gmm_prior")
-    if prior_spec is None and "prior_centers" in metadata:
-        raise ValueError("A Gaussian NSOT cache must not contain prior_centers")
     count = opts["superset_size"]
     if source.shape != (count, 2) or target.shape != source.shape \
             or source.dtype != np.float32 or target.dtype != np.float32 \
@@ -215,41 +146,12 @@ def _load_cache(config, dataset):
             or permutation.shape != (count,) or not np.issubdtype(permutation.dtype, np.integer) \
             or not np.array_equal(np.sort(permutation), np.arange(count)):
         raise ValueError("NSOT cache contains invalid points or a non-bijective permutation")
-    if prior_spec is not None:
-        k = config["num_regions"]
-        if (components.shape != (count,) or components.dtype != np.int64
-                or (components < 0).any() or (components >= k).any()):
-            raise ValueError("NSOT anchor prior requires original int64 source_components in [0,K)")
-        if metadata.get("source_components_sha256") != _component_sha256(components):
-            raise ValueError("NSOT cache source_components SHA256 mismatch")
-        # Bind only after every stored array and prior setting has validated.
-        # This rejects replacing an explicitly saved center configuration.
-        if is_gmm:
-            import gmm_prior
-            if "prior_centers" in metadata:
-                raise ValueError("General GMM cache must not contain anchor-prior centers")
-            gmm_prior.bind(config, metadata.get("gmm_parameters"))
-        else:
-            anchor_flow.bind_prior_centers(config, metadata.get("prior_centers"))
-    return source, target, permutation, metadata, cache_hash, components
-
-
-def load_cache(config, dataset):
-    """Validate and load a cache; preserve the original five-value public API.
-
-    Anchor priors additionally bind the exact stored centers into config for
-    checkpoint saving. Components remain a binary array, not a huge JSON list.
-    """
-    return _load_cache(config, dataset)[:5]
-
-
+    return source, target, permutation, metadata, cache_hash
 
 
 def prepare(config, dataset):
     """Prepare once; existing files are validated/reused, NEVER overwritten."""
     opts = settings(config)
-    prior_spec = anchor_flow.cache_spec(config)
-    is_gmm = prior_spec is not None and prior_spec["mode"] == "gmm_prior"
     spec = dataset_spec(config, dataset)
     path = Path(opts["cache"])
     if path.exists():
@@ -257,14 +159,10 @@ def prepare(config, dataset):
         print(f"reused_nsot_cache={path} sha256={digest}", flush=True)
         return path, metadata
     start = perf_counter()
-    components, centers, prior_draw = None, None, {}
-    if prior_spec is None:
-        source, target = draw_supersets(config, dataset)
-    else:
-        source, target, components, centers, prior_draw = _draw_prior_supersets(config, dataset)
+    source, target = draw_supersets(config, dataset)
     size = opts["superset_size"]
     print(f"NSOT exact OT M={size}; dense float64 cost={8 * size * size / 2**20:.1f} MiB CPU RAM", flush=True)
-    sampling_and_fit_seconds = perf_counter() - start
+    sampling_seconds = perf_counter() - start
     ot_start = perf_counter()
     permutation, optimal_cost = exact_superset_permutation(source, target)
     ot_seconds = perf_counter() - ot_start
@@ -277,7 +175,7 @@ def prepare(config, dataset):
         "cost_before": float(np.square(source.astype(np.float64) - target).sum(1).mean()),
         "cost_after": optimal_cost, "source_moments": source_moments(source),
         "precompute_seconds": perf_counter() - start,
-        "sampling_and_fit_seconds": sampling_and_fit_seconds, "ot_seconds": ot_seconds,
+        "sampling_seconds": sampling_seconds, "ot_seconds": ot_seconds,
         "precompute_timing_scope": "sampling and exact OT compute; excludes cache file IO and training-time loading",
         "environment": {"torch": str(torch.__version__), "numpy": np.__version__},
         "source_sha256": {name: file_sha256(Path(__file__).parent / name)
@@ -285,40 +183,12 @@ def prepare(config, dataset):
         "marginals": "fixed finite empirical supersets; Gaussian/target population marginals are approximate",
         "target_coordinates": "unchanged project orientation/scale; no centering, rotation, whitening or clipping",
     }
-    if prior_spec is not None:
-        resolved = copy.deepcopy(config)
-        if is_gmm:
-            import gmm_prior
-            gmm_prior.bind(resolved, centers)
-        else:
-            anchor_flow.bind_prior_centers(resolved, centers)
-        metadata.update(
-            format_version=GMM_FORMAT_VERSION if is_gmm else PRIOR_FORMAT_VERSION,
-            implementation="nsot_full_gmm_component_hybrid_v1" if is_gmm else "nsot_anchor_prior_component_hybrid_v1",
-            paper_setting=("experimental full-GMM/component-centered extension; NOT the original NSOT prior/kernel" if is_gmm
-                           else "experimental anchor-GMM/component-centered extension; NOT the original NSOT prior/kernel"),
-            source_components_sha256=_component_sha256(components),
-            source_component_counts=np.bincount(components, minlength=config["num_regions"]).tolist(),
-            component_label_origin="sampled categorical BEFORE exact OT; never reassigned by nearest centroid",
-            source_moments_scope="cached GMM source superset BEFORE component-centered hybrid jitter",
-            transport_cost_scope="full source/target superset squared cost BEFORE training-time hybrid jitter",
-            marginals="finite point-superset plus component-centered jitter approximates the saved population GMM",
-            source_prior=anchor_flow.experiment_details(resolved), **prior_draw)
-        metadata["source_sha256"]["anchor_flow.py"] = file_sha256(Path(__file__).parent / "anchor_flow.py")
-        if is_gmm:
-            metadata.update(gmm_prior=prior_spec, gmm_parameters=centers)
-            metadata["precompute_timing_scope"] = "prior fitting, sampling and exact OT compute; excludes cache file IO and training-time loading"
-            metadata["source_sha256"]["gmm_prior.py"] = file_sha256(Path(__file__).parent / "gmm_prior.py")
-        else:
-            metadata.update(anchor_prior=prior_spec, prior_centers=centers)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation prevents accidental destruction of an existing cache.
     # If interrupted during writing, the partial file fails load_cache validation.
     with path.open("xb") as stream:
         arrays = {"source": source, "target": target, "permutation": permutation,
                   "metadata": np.array(json.dumps(metadata, allow_nan=False))}
-        if components is not None:
-            arrays["source_components"] = components
         np.savez_compressed(stream, **arrays)
     digest = file_sha256(path)
     print(f"saved_nsot_cache={path} sha256={digest}", flush=True)
@@ -327,66 +197,13 @@ def prepare(config, dataset):
     return path, metadata
 
 
-def component_centered_hybrid(source, centers, *, sigma, beta, noise):
-    """Population-GMM-preserving noise, centered on original source labels.
-
-    Configuration scalars are checked without synchronizing the GPU. Tensor
-    shape/device/dtype checks only: finite cache validation happens at setup.
-    For iid residual/noise N(0,I), each component keeps its mean and sigma²I.
-    Finite cached residuals approximate this statement rather than equal it.
-    """
-    if (isinstance(beta, bool) or not isinstance(beta, (int, float))
-            or not math.isfinite(beta) or not 0 <= beta <= 1
-            or isinstance(sigma, bool) or not isinstance(sigma, (int, float))
-            or not math.isfinite(sigma) or sigma <= 0):
-        raise ValueError("Centered hybrid requires finite beta in [0,1] and positive sigma")
-    if (not isinstance(source, torch.Tensor) or not source.is_floating_point()
-            or not isinstance(centers, torch.Tensor) or not isinstance(noise, torch.Tensor)
-            or centers.shape != source.shape or noise.shape != source.shape
-            or centers.device != source.device or noise.device != source.device
-            or centers.dtype != source.dtype or noise.dtype != source.dtype):
-        raise ValueError("Centered hybrid source, centers and noise must share shape/device/dtype")
-    return centers + math.sqrt(1 - beta) * (source - centers) + sigma * math.sqrt(beta) * noise
-
-
-def full_covariance_hybrid(source, means, cholesky, *, beta, noise):
-    """Preserve N(mean_k, covariance_k) using the ORIGINAL cached component.
-
-    cholesky has [...,2,2] shape and maps iid standard noise into that component.
-    Cov = (1-beta)*Sigma + beta*Sigma. Finite caches approximate this identity.
-    """
-    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or not math.isfinite(beta) or not 0 <= beta <= 1:
-        raise ValueError("Full-covariance hybrid beta must be finite and in [0,1]")
-    if (not isinstance(source, torch.Tensor) or not source.is_floating_point()
-            or not all(isinstance(value, torch.Tensor) for value in (means, cholesky, noise))
-            or means.shape != source.shape or noise.shape != source.shape
-            or cholesky.shape != (*source.shape[:-1], source.shape[-1], source.shape[-1])
-            or any(value.device != source.device or value.dtype != source.dtype for value in (means, cholesky, noise))):
-        raise ValueError("Full-covariance hybrid requires matching floating tensors and [...,D,D] Cholesky factors")
-    colored_noise = torch.matmul(cholesky, noise.unsqueeze(-1)).squeeze(-1)
-    return means + math.sqrt(1 - beta) * (source - means) + math.sqrt(beta) * colored_noise
-
-
 class NSOTPairSampler:
     def __init__(self, config, dataset, device, dtype):
         opts = settings(config)
-        source, target, permutation, self.metadata, self.cache_sha256, components = _load_cache(config, dataset)
+        source, target, permutation, self.metadata, self.cache_sha256 = load_cache(config, dataset)
         self.source = torch.as_tensor(source, device=device, dtype=dtype)
         self.target = torch.as_tensor(target[permutation], device=device, dtype=dtype)
         self.beta, self.n_points = opts["beta"], config["data"]["n_points"]
-        flow = anchor_flow.settings(config)
-        self.source_components, self.prior_centers, self.sigma = None, None, None
-        self.prior_cholesky = None
-        if flow is not None:
-            self.source_components = torch.as_tensor(components, device=device, dtype=torch.long)
-            if flow["mode"] == "gmm_prior":
-                self.prior_centers = torch.tensor(flow["means"], device=device, dtype=dtype)
-                covariance = torch.tensor(flow["covariances"], device=device, dtype=dtype)
-                self.prior_cholesky = torch.linalg.cholesky(covariance)
-            else:
-                self.prior_centers = torch.tensor(flow["centers"], device=device, dtype=dtype)
-                self.sigma = flow["sigma"]
-        self.flow_details = anchor_flow.experiment_details(config)
 
     @torch.no_grad()
     def sample(self, batch_size, *, generator=None):
@@ -397,16 +214,6 @@ class NSOTPairSampler:
                               device=self.source.device, generator=generator)
         source, target = self.source[index], self.target[index]
         noise = torch.randn(source.shape, device=source.device, dtype=source.dtype, generator=generator)
-        if self.source_components is not None:
-            components = self.source_components[index]
-            centers = self.prior_centers[components]
-            if self.prior_cholesky is not None:
-                paired_source = full_covariance_hybrid(source, centers, self.prior_cholesky[components],
-                                                       beta=self.beta, noise=noise)
-                return paired_source, target
-            paired_source = component_centered_hybrid(source, centers, sigma=self.sigma,
-                                                      beta=self.beta, noise=noise)
-            return paired_source, target
         return math.sqrt(1 - self.beta) * source + math.sqrt(self.beta) * noise, target
 
     def details(self):
@@ -416,17 +223,7 @@ class NSOTPairSampler:
                 "cost_before": self.metadata["cost_before"], "cost_after": self.metadata["cost_after"],
                 "source_moments": self.metadata["source_moments"], "dataset_spec": self.metadata["dataset_spec"],
                 "precompute_source_sha256": self.metadata["source_sha256"]}
-        result.update(self.flow_details)
-        for key in ("ot_seconds", "sampling_and_fit_seconds", "gmm_fit_details"):
+        for key in ("ot_seconds", "sampling_seconds"):
             if key in self.metadata:
                 result[key] = self.metadata[key]
-        if self.source_components is not None:
-            result.update(prior_fit_seconds=self.metadata["prior_fit_seconds"],
-                          source_components_sha256=self.metadata["source_components_sha256"],
-                          source_component_counts=self.metadata["source_component_counts"],
-                          source_moments_scope=self.metadata["source_moments_scope"],
-                          transport_cost_scope=self.metadata["transport_cost_scope"],
-                          source_draw_seed=self.metadata["source_draw_seed"],
-                          target_draw_seed=self.metadata["target_draw_seed"],
-                          draw_rng=self.metadata["draw_rng"])
         return result

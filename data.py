@@ -1,6 +1,12 @@
 import torch
 
 
+def validate_gaussian_source(config):
+    """Reject removed experiment configs instead of silently changing their source law."""
+    if "anchor_flow" in config:
+        raise ValueError("Custom-prior experiments have been removed; use an original standard-Gaussian configuration")
+
+
 def checkerboard_centers(
     grid_size: int,
     device: torch.device | str,

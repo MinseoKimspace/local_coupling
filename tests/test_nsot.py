@@ -129,6 +129,51 @@ class NSOTTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "NSOTPairSampler"):
                 function(torch.zeros(1, 8, 2), torch.zeros(1, 8, 2), coupling="nsot")
 
+    def test_removed_source_settings_rejected_before_cache_creation(self):
+        config = self.config()
+        config["anchor_flow"] = {"mode": "removed_experiment"}
+        for function in (nsot.settings, lambda value: nsot.draw_supersets(value, "checkerboard"),
+                         lambda value: nsot.prepare(value, "checkerboard")):
+            with self.assertRaisesRegex(ValueError, "removed"):
+                function(config)
+        self.assertFalse(Path(config["nsot"]["cache"]).exists())
+
+    def test_unsupported_cache_variants_are_not_reinterpreted(self):
+        config = self.config()
+        path, metadata = self.prepare(config)
+        source, target, permutation, _, _ = nsot.load_cache(config, "checkerboard")
+        original = path.read_bytes()
+        for version in (2, 3):
+            changed = {**metadata, "format_version": version}
+            np.savez_compressed(path, source=source, target=target, permutation=permutation,
+                                metadata=np.array(json.dumps(changed)))
+            before = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "format_version"):
+                nsot.prepare(config, "checkerboard")
+            self.assertEqual(path.read_bytes(), before)
+        changed = {**metadata, "implementation": "unsupported_source_variant"}
+        np.savez_compressed(path, source=source, target=target, permutation=permutation,
+                            metadata=np.array(json.dumps(changed)))
+        with self.assertRaisesRegex(ValueError, "implementation"):
+            nsot.load_cache(config, "checkerboard")
+        np.savez_compressed(path, source=source, target=target, permutation=permutation,
+                            metadata=np.array(json.dumps(metadata)), source_components=np.zeros(64, dtype=np.int64))
+        with self.assertRaisesRegex(ValueError, "missing/extra arrays"):
+            nsot.load_cache(config, "checkerboard")
+        path.write_bytes(original)
+        nsot.load_cache(config, "checkerboard")
+
+    def test_superset_gaussian_and_target_draw_order_unchanged(self):
+        from data import sample_checkerboard
+        config = self.config()
+        actual = nsot.draw_supersets(config, "checkerboard")
+        with torch.random.fork_rng(devices=[]):
+            torch.set_rng_state(torch.Generator().manual_seed(config["nsot"]["cache_seed"]).get_state())
+            source = torch.randn(64, 2)
+            target = sample_checkerboard(1, 64, "cpu", torch.float32, 4)[0]
+        for left, right in zip(actual, (source.numpy(), target.numpy())):
+            np.testing.assert_array_equal(left, right)
+
     def test_nsot_yaml_matches_existing_comparison_hyperparameters(self):
         root = Path(__file__).resolve().parents[1]
         for directory, name, baseline in (

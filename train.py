@@ -5,9 +5,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import anchor_flow
 from coupling import OFFLINE_METHODS, TG_CACHED_METHODS, coupled_points
-from data import checkerboard_centers, sample_checkerboard
+from data import checkerboard_centers, sample_checkerboard, validate_gaussian_source
 from experiment import read_config, save_training, synchronize
 from model import PointSetTransformer
 
@@ -28,12 +27,7 @@ def flow_matching_loss(model, x_data, x_noise, t):
 
 def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, target_centers=None,
                                sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None,
-                               paired_noise=None, anchor_config=None):
-    flow = anchor_flow.settings(anchor_config) if anchor_config is not None else None
-    if flow is not None and (coupling not in OFFLINE_METHODS or coupling != anchor_config["coupling"]):
-        raise ValueError("anchor_flow requires its configured offline coupling, including the loss coupling argument")
-    if flow is not None and paired_noise is None:
-        raise ValueError("anchor_flow training requires prepared offline pairs")
+                               paired_noise=None):
     if paired_noise is None:
         x_noise = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype)
         x_noise, x_data = coupled_points(
@@ -51,13 +45,11 @@ def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, tar
 
 
 def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_centers=None,
-               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None, paired_noise=None,
-               anchor_config=None):
+               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None, paired_noise=None):
     loss = coupled_flow_matching_loss(
         model, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
         sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iterations=sinkhorn_iterations,
         coupling_generator=coupling_generator, paired_noise=paired_noise,
-        anchor_config=anchor_config,
     )
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -66,6 +58,7 @@ def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_c
 
 
 def train_model(model, config, sample_batch, *, dataset, config_path, target_centers=None):
+    validate_gaussian_source(config)
     training = config["training"]
     if training["num_steps"] < 1 or training["log_every"] < 1:
         raise ValueError("num_steps and log_every must be positive")
@@ -86,13 +79,6 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
         config["tg_cache"]["cache_sha256"] = pair_sampler.cache_sha256
         print(f"tg_cache_sha256={pair_sampler.cache_sha256} "
               f"sampling={pair_sampler.metadata['sampling']} clouds={pair_sampler.metadata['num_clouds']}", flush=True)
-    loss_config = config if "anchor_flow" in config else None
-    if (config.get("anchor_flow") or {}).get("mode") == "gmm_prior":
-        # read_config and NSOTPairSampler already validated the saved SPD
-        # parameters. The loss uses only mode/coupling, not mixture parameters;
-        # avoid CPU tensor creation and Cholesky checks on every GPU update.
-        # Keep the authoritative resolved config untouched for saving/inference.
-        loss_config = {**config, "anchor_flow": anchor_flow.cache_spec(config)}
     model.train()
     synchronize(device)
     start = perf_counter()
@@ -110,7 +96,6 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
                 sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
                 sinkhorn_iterations=config.get("sinkhorn_iterations", 100), coupling_generator=generator,
                 paired_noise=paired_noise,
-                anchor_config=loss_config,
             )
             if log_step:
                 value = loss.item()
@@ -139,7 +124,7 @@ def read_training_config(config_path, *, seed=None, steps=None):
 
 
 def training_arguments(default_config):
-    parser = argparse.ArgumentParser(description="Train with the configured coupling and optional fixed anchor prior.")
+    parser = argparse.ArgumentParser(description="Train with the configured coupling and standard Gaussian source.")
     parser.add_argument("config_path", nargs="?", default=default_config)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--steps", type=int, default=None, help="Override update count; saved in the run config")

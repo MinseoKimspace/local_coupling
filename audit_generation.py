@@ -1,6 +1,6 @@
 """Joint generation-quality, integration and optional FM-residual diagnostics.
 
-All NFE levels share a fixed bank from the configured source prior and a fixed fresh target bank.
+All NFE levels share a fixed Gaussian source bank and a fixed fresh target bank.
 Reference refinement is an empirical check, not a proof of ODE convergence.
 """
 
@@ -263,7 +263,7 @@ def audit(config_path, dataset, *, clouds=32, batch_size=16, nfes=NFES, referenc
                                    "primary_quality_absolute_change": quality_tolerance},
         "noise_sha256": tensor_sha256(noise), "target_sha256": tensor_sha256(target),
         "definitions": {
-            "draws": "fixed configured-source-prior and fresh target banks, indexed by cloud; independent of FM matching batch; source hashes differ when the prior changes",
+            "draws": "fixed iid standard Gaussian and fresh target banks, indexed by cloud; independent of FM matching batch",
             "endpoint": "same INDEXED particles vs finest finite Euler reference; NOT target correspondence or mean-field approximation error",
             "reference": "finest requested refinement, even if checks fail; two successive endpoint+quality checks, NOT a proof of exact integration",
             "quality": "Chamfer sum of directional squared-distance means, averaged across clouds; other metrics POOLED across all generated points",
@@ -284,10 +284,6 @@ def audit(config_path, dataset, *, clouds=32, batch_size=16, nfes=NFES, referenc
         "example_trajectory": {"times": [i / max_reference_nfe for i in range(max_reference_nfe + 1)],
                                "points": reference_path.tolist()},
     }
-    if config.get("anchor_flow") is not None:
-        payload["initial_source_quality"] = quality_scores(noise, target, config, dataset, data.mask, regions)
-        payload["definitions"]["initial_source_quality"] = (
-            "no-flow prior baseline before any model step, scored against the SAME fixed target bank")
     directory = output_directory(Path(output) / dataset, checkpoint.stem + "_quality_diagnostic")
     save_json(directory / "diagnostics.json", payload)
     render(payload, directory)

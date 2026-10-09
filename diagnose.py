@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from anchor_flow import sample_source
 from experiment import evaluation_title
 from summarize_results import output_directory, save_json, save_table, statistics, formatted, plt
 
@@ -122,7 +121,7 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
     first_path = None
     for batch in range(batches):
         target = sample_target()
-        noise = sample_source(config, batch_size, device=device, dtype=dtype)
+        noise = torch.randn(batch_size, n, config["model"]["point_dim"], device=device, dtype=dtype)
         if pair_sampler is None:
             paired_noise, target = coupled_points(noise, target, coupling=config["coupling"],
                 num_regions=config.get("num_regions"), target_centers=centers,

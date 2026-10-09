@@ -78,6 +78,26 @@ class TGCacheTests(unittest.TestCase):
             tg_cache.prepare(config, "checkerboard")
         self.assertFalse(Path(config["tg_cache"]["path"]).exists())
 
+    def test_removed_source_settings_rejected_before_cache_creation(self):
+        config = self.config()
+        config["anchor_flow"] = {"mode": "removed_experiment"}
+        with self.assertRaisesRegex(ValueError, "removed"):
+            tg_cache.prepare(config, "checkerboard")
+        self.assertFalse(Path(config["tg_cache"]["path"]).exists())
+
+    def test_non_gaussian_cache_cannot_be_used_as_hard_bank(self):
+        config = self.config()
+        path, metadata = self.prepare(config)
+        for field in ("implementation", "source_coordinates"):
+            changed = {**metadata, field: "unsupported_source_variant"}
+            (path / "metadata.json").write_text(json.dumps(changed), encoding="utf-8")
+            before = (path / "metadata.json").read_bytes()
+            with self.assertRaisesRegex(ValueError, "standard-Gaussian"):
+                tg_cache.prepare(config, "checkerboard")
+            self.assertEqual((path / "metadata.json").read_bytes(), before)
+        (path / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        tg_cache.load_cache(config, "checkerboard")
+
     def test_unsupported_cache_format_is_not_silently_reinterpreted(self):
         config = self.config()
         path, meta = self.prepare(config)

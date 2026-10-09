@@ -8,8 +8,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 import torch
 
-from experiment import (evaluation_settings, evaluation_title, load_model,
-                        evaluation_target_hash, sample_evaluation_target, sample_for_evaluation, save_evaluation)
+from experiment import evaluation_settings, evaluation_title, load_model, sample_for_evaluation, save_evaluation
 from metrics import chamfer_distance, horse_metrics
 from horse_regions import HorseRegions
 from train_horse import HorsePointSetTransformer, load_horse_mask, sample_horse
@@ -58,32 +57,23 @@ def render_comparison(
     plt.close(figure)
 
 
-def main(config_path="horse_experiments/horse_independent_n256_seed0.yaml", num_steps=100, *, roi_file=None, target_seed=None):
+def main(config_path="horse_experiments/horse_independent_n256_seed0.yaml", num_steps=100, *, roi_file=None):
     steps = int(num_steps)
     if steps < 1:
         raise ValueError("num_steps must be positive")
     model, config, checkpoint, metadata = load_model(config_path, HorsePointSetTransformer, "horse")
     settings, data = evaluation_settings(config), config["data"]
     print(f"nfe={steps}")
-    timings = {} if target_seed is not None else None
-    noise, prediction, seconds = sample_for_evaluation(model, config, steps, timing_details=timings)
+    _, prediction, seconds = sample_for_evaluation(model, config, steps)
     mask = load_horse_mask(prediction.device, prediction.dtype)
-    target = sample_evaluation_target(config, "horse", settings["batch_size"],
-                                      device=prediction.device, dtype=prediction.dtype, seed=target_seed)
+    target = sample_horse(mask, settings["batch_size"], data["n_points"])
     leakage, js = horse_metrics(prediction, mask, settings["histogram_bins"])
     scores = {"chamfer": chamfer_distance(prediction, target).item(), "leakage": leakage, "histogram_js": js}
     regions = HorseRegions(mask, roi_file)
     scores.update(regions.score(prediction))
-    if config.get("anchor_flow") is not None:
-        source_leakage, source_js = horse_metrics(noise, mask, settings["histogram_bins"])
-        scores.update(source_chamfer=chamfer_distance(noise, target).item(),
-                      source_leakage=source_leakage, source_histogram_js=source_js)
-        scores.update({"source_" + key: value for key, value in regions.score(noise).items()})
     roi_definition = regions.definition()
     output = save_evaluation(config_path, config, checkpoint, metadata, "horse", steps, seconds, scores,
-                             metric_metadata={"horse_roi_definition": roi_definition}, target_seed=target_seed,
-                             target_hash=evaluation_target_hash(target) if target_seed is not None else None,
-                             source_sampling_seconds=(timings or {}).get("source_sampling_seconds"))
+                             metric_metadata={"horse_roi_definition": roi_definition})
     roi_image = output.parent / f"horse_rois_{regions.file_hash[:8]}_{roi_definition['mask_sha256'][:8]}.png"
     if not roi_image.exists():
         regions.render(roi_image)
@@ -97,6 +87,5 @@ if __name__ == "__main__":
     parser.add_argument("config", nargs="?", default="horse_experiments/horse_independent_n256_seed0.yaml")
     parser.add_argument("num_steps", nargs="?", type=int, default=100)
     parser.add_argument("--roi-file", default=None, help="Same prespecified ROI JSON for all compared methods")
-    parser.add_argument("--target-seed", type=int, default=None, help="Optional isolated target draw shared by prior comparisons")
     args = parser.parse_args()
-    main(args.config, args.num_steps, roi_file=args.roi_file, target_seed=args.target_seed)
+    main(args.config, args.num_steps, roi_file=args.roi_file)

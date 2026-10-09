@@ -21,7 +21,7 @@ import eval_horse
 import train
 import train_horse
 from data import checkerboard_centers, sample_checkerboard
-from experiment import load_model, save_evaluation, save_training
+from experiment import load_model, sample_for_evaluation, save_evaluation, save_training
 from metrics import chamfer_distance, checkerboard_metrics, horse_metrics
 from model import PointSetTransformer
 from sample import integrate_velocity
@@ -223,6 +223,24 @@ class ArtifactTests(unittest.TestCase):
     def save(self):
         with contextlib.redirect_stdout(io.StringIO()):
             return save_training(self.model, self.config, "checkerboard", "original.yaml", 1.23, .1)
+
+    def test_removed_source_config_rejected_before_training_or_loading(self):
+        for settings in (None, {}, {"mode": "removed_experiment"}):
+            self.config["anchor_flow"] = settings
+            Path("original.yaml").write_text(yaml.safe_dump(self.config), encoding="utf-8")
+            for operation in (lambda: train.main("original.yaml"),
+                              lambda: load_model("original.yaml", PointSetTransformer, "checkerboard"),
+                              self.save):
+                with self.assertRaisesRegex(ValueError, "removed"):
+                    operation()
+        self.assertFalse(Path("runs").exists())
+
+    def test_evaluation_source_is_exact_standard_gaussian(self):
+        torch.manual_seed(23)
+        expected = torch.randn(8, 16, 2)
+        torch.manual_seed(23)
+        actual, _, _ = sample_for_evaluation(self.model.eval(), self.config, 1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_preservation_metadata_and_mismatch(self):
         torch.save(self.model.state_dict(), "legacy.pt")
