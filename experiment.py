@@ -56,6 +56,8 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     now = datetime.now(timezone.utc)
     method = canonical_method(config["coupling"])
     name = f"{dataset}_{method}_k{config.get('num_regions', 'na')}_n{config['data']['n_points']}_seed{config['seed']}"
+    if method == "target_guided_cached" and config.get("tg_cache", {}).get("fine_pairing", "random") == "exact":
+        name += "_fine_exact"
     run_dir = Path("runs") / dataset / f"{name}_{now:%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     snapshot = copy.deepcopy(config)
@@ -186,5 +188,8 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 
 def evaluation_title(config):
-    return (f"{config['coupling']} | K={config.get('num_regions', 'na')} | "
+    method = config["coupling"]
+    if method == "target_guided_cached" and config.get("tg_cache", {}).get("fine_pairing", "random") == "exact":
+        method += " / fine_exact"
+    return (f"{method} | K={config.get('num_regions', 'na')} | "
             f"N={config['data']['n_points']} | seed={config['seed']}")

@@ -9,8 +9,11 @@ the same model, optimizer, batch and updates as the corresponding online TG.
 
 For a full single-use stream, set tg_cache.sampling: stream, num_clouds: null,
 and a NEW tg_cache.path in a COPY of the YAML. At B=64 and 10000 updates this
-prepares 640000 clouds (~3.68 GiB per cache). Both modes cache exact coarse
-labels offline and draw fine pairing and time afresh in training.
+prepares 640000 clouds (~3.68 GiB random-fine, ~4.29 GiB exact-fine per cache).
+Both modes cache exact coarse
+labels offline. Random fine pairing and time are drawn afresh in training.
+Set tg_cache.fine_pairing: exact to solve and save patchwise exact squared-
+Euclidean bijections offline instead; there is no fine OT during training.
 
 Generation uses the existing eval.py/eval_horse.py and saved run config.yaml.
 audit_generation.py supports these caches; FM residuals use their training
@@ -21,6 +24,9 @@ Report precompute_seconds, cache_setup_seconds and training_seconds separately.
 Alternatively pass --sampling stream. The CLI derives a separate _stream
 cache, writes its effective config.yaml there WITHOUT changing your input,
 and prints the training command for that generated configuration.
+--fine-pairing exact likewise derives a separate _fine_exact cache/config.
+Fine pairing is applied before the sampling override, so combining both
+options produces a _fine_exact_stream path. The input YAML is never edited.
 """
 
 import argparse
@@ -32,8 +38,16 @@ from experiment import read_config
 from tg_cache import prepare
 
 
-def main(config_path, dataset, *, sampling=None):
+def main(config_path, dataset, *, sampling=None, fine_pairing=None):
     config = read_config(config_path)
+    if fine_pairing is not None:
+        if fine_pairing not in ("random", "exact"):
+            raise ValueError("fine_pairing must be random or exact")
+        previous = config["tg_cache"].get("fine_pairing", "random")
+        if fine_pairing != previous:
+            config["tg_cache"]["fine_pairing"] = fine_pairing
+            config["tg_cache"]["path"] += "_fine_" + fine_pairing
+            config["tg_cache"].pop("cache_sha256", None)
     if sampling is not None:
         previous = config["tg_cache"].get("sampling", "bank")
         if sampling != previous:
@@ -43,7 +57,7 @@ def main(config_path, dataset, *, sampling=None):
             config["tg_cache"].pop("cache_sha256", None)
     path, metadata = prepare(config, dataset)
     effective = Path(config_path)
-    if sampling is not None:
+    if sampling is not None or fine_pairing is not None:
         effective = path / "config.yaml"
         if effective.exists():
             if yaml.safe_load(effective.read_text(encoding="utf-8")) != config:
@@ -62,5 +76,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", required=True, choices=["checkerboard", "horse"])
     parser.add_argument("--sampling", choices=["bank", "stream"], default=None,
                         help="Derive a separate cache/config without editing the input YAML")
+    parser.add_argument("--fine-pairing", choices=["random", "exact"], default=None,
+                        help="Derive a separate fine-pairing cache/config; exact OT is offline only")
     args = parser.parse_args()
-    main(args.config, args.dataset, sampling=args.sampling)
+    main(args.config, args.dataset, sampling=args.sampling, fine_pairing=args.fine_pairing)
