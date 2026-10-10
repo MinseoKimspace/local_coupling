@@ -3,8 +3,9 @@
 bank: reuse a finite paired-cloud bank with cached exact coarse assignments.
 stream: prepare the complete training stream; each cloud is used once.
 Neither mode requires online OT. Fine pairing is resampled on every visit.
-Optional boundary-guided/control experiments choose a cached hard coarse
-table uniformly per visit, then use the SAME fresh random fine pairing.
+Optional path-affine experiments choose cached hard grouping tables uniformly
+per visit, then sample fresh within-group random bijections. Fine permutations
+used to score candidate tables offline are never used as training targets.
 Inference starts from fresh iid standard Gaussian, without the cache.
 """
 
@@ -25,10 +26,10 @@ from nsot import dataset_spec, file_sha256
 
 METHODS = {"target_guided_cached"}
 FORMAT_VERSION = 1
-BOUNDARY_FORMAT_VERSION = 3
-COARSE_MODES = ("baseline", "boundary_guided", "random_swap_control")
+LOCAL_FORMAT_VERSION = 4
+COARSE_MODES = ("baseline", "path_affine", "path_affine_subpatch")
 CONFIG_KEYS = {"path", "sampling", "num_clouds", "seed",
-               "prepare_batch_size", "num_workers", "cache_sha256", "coarse_mode", "boundary"}
+               "prepare_batch_size", "num_workers", "cache_sha256", "coarse_mode", "local"}
 
 
 def random_fine_permutation(source_labels, target_labels, k, rng):
@@ -70,16 +71,21 @@ def settings(config):
         raise ValueError("tg_cache.sampling must be bank or stream")
     coarse_mode = value.get("coarse_mode", "baseline")
     if coarse_mode not in COARSE_MODES:
-        raise ValueError("tg_cache.coarse_mode must be baseline, boundary_guided or random_swap_control")
-    boundary = None
+        raise ValueError("tg_cache.coarse_mode must be baseline, path_affine or path_affine_subpatch")
+    local = None
     if coarse_mode == "baseline":
-        if "boundary" in value:
-            raise ValueError("tg_cache.boundary requires a non-baseline coarse_mode")
+        if "local" in value:
+            raise ValueError("tg_cache.local requires a non-baseline coarse_mode")
     else:
-        from tg_boundary import settings as boundary_settings
-        boundary = boundary_settings(value.get("boundary", {}))
+        from tg_local import settings as local_settings
+        local = local_settings(value.get("local", {}))
+        expected_subpatches = 2 if coarse_mode == "path_affine_subpatch" else 1
+        if local["subpatches"] != expected_subpatches:
+            raise ValueError(f"{coarse_mode} requires tg_cache.local.subpatches={expected_subpatches}")
+        if n // k < expected_subpatches:
+            raise ValueError("Every target patch must have at least one point per subpatch")
         if n > np.iinfo(np.int32).max:
-            raise ValueError("Boundary coarse tables require int32 patch indices")
+            raise ValueError("Local pairing tables require int32 group indices")
     count = value.get("num_clouds")
     if count is not None:
         count = _integer(count, "tg_cache.num_clouds")
@@ -90,7 +96,7 @@ def settings(config):
     workers = _integer(value.get("num_workers", 0), "tg_cache.num_workers", 0)
     validate_gaussian_source(config)
     result = {"method": method, "path": value["path"], "sampling": sampling,
-              "coarse_mode": coarse_mode, "boundary": boundary,
+              "coarse_mode": coarse_mode, "local": local,
               "num_clouds": count, "cache_seed": _integer(value.get("seed", 0), "tg_cache.seed", 0),
               "prepare_batch_size": _integer(value.get("prepare_batch_size", 64), "prepare_batch_size"),
               "num_workers": workers, "n_points": n, "num_regions": k}
@@ -99,14 +105,15 @@ def settings(config):
 
 def _spec(config, dataset, opts):
     variant = opts["coarse_mode"] != "baseline"
-    result = {"format_version": BOUNDARY_FORMAT_VERSION if variant else FORMAT_VERSION, "method": opts["method"],
+    result = {"format_version": LOCAL_FORMAT_VERSION if variant else FORMAT_VERSION, "method": opts["method"],
             "sampling": opts["sampling"], "configured_num_clouds": opts["num_clouds"],
             "cache_seed": opts["cache_seed"], "prepare_batch_size": opts["prepare_batch_size"],
             "n_points": opts["n_points"], "num_regions": opts["num_regions"],
             "dataset_spec": dataset_spec(config, dataset)}
     # Do not alter the v1 spec: existing random-TG caches/checkpoints still work.
     if variant:
-        result.update(coarse_mode=opts["coarse_mode"], boundary_options=opts["boundary"])
+        result.update(coarse_mode=opts["coarse_mode"], local_options=opts["local"],
+                      fine_num_regions=opts["num_regions"] * opts["local"]["subpatches"])
     return result
 
 
@@ -126,7 +133,8 @@ def _array_shapes(count, opts):
               "target_labels": ((count, n), np.int32), "capacities": ((count, k), np.int32)}
     shapes["source_labels"] = ((count, n), np.int32)
     if opts["coarse_mode"] != "baseline":
-        shapes["coarse_tables"] = ((count, opts["boundary"]["num_tables"], n), np.int32)
+        shapes["pairing_tables"] = ((count, opts["local"]["num_tables"], n), np.int32)
+        shapes["fine_target_labels"] = ((count, n), np.int32)
     return shapes
 
 
@@ -144,7 +152,7 @@ def load_cache(config, dataset):
     for key, value in _spec(config, dataset, opts).items():
         if metadata.get(key) != value:
             raise ValueError(f"TG cache/config mismatch: {key}")
-    implementation = "tg_offline_v1" if opts["coarse_mode"] == "baseline" else "tg_offline_boundary_v3"
+    implementation = "tg_offline_v1" if opts["coarse_mode"] == "baseline" else "tg_offline_local_v4"
     if (metadata.get("implementation") != implementation
             or metadata.get("source_coordinates") != "unmodified iid standard Gaussian draws"):
         raise ValueError("Unsupported TG cache source/implementation; only standard-Gaussian caches are supported")
@@ -172,7 +180,7 @@ def load_cache(config, dataset):
     return path, metadata, digest
 
 
-def _accumulate_boundary(summary, record):
+def _accumulate_local(summary, record):
     """Streaming summaries only; do not keep per-cloud reports in RAM."""
     summary["clouds"] += 1
     summary["noop_clouds"] += int(record["accepted_swaps"] == 0)
@@ -186,7 +194,7 @@ def _accumulate_boundary(summary, record):
                 visit(item, f"{prefix}.{index}")
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             if not np.isfinite(value):
-                raise FloatingPointError(f"Nonfinite boundary diagnostic: {prefix}")
+                raise FloatingPointError(f"Nonfinite local-coupling diagnostic: {prefix}")
             item = summary["metrics"].setdefault(
                 prefix, {"count": 0, "sum": 0., "min": float(value), "max": float(value)})
             item["count"] += 1
@@ -222,7 +230,7 @@ def prepare(config, dataset):
               for name, (shape, dtype) in shapes.items()}
     draw_seconds = partition_seconds = assignment_seconds = 0.
     guidance_seconds = 0.
-    boundary_summary = {"clouds": 0, "noop_clouds": 0, "metrics": {}}
+    local_summary = {"clouds": 0, "noop_clouds": 0, "metrics": {}}
     threads = torch.get_num_threads()
     try:
         # Small CPU N x K solves; avoid large thread-pool overhead. Restore the
@@ -255,18 +263,18 @@ def prepare(config, dataset):
                 arrays["source_labels"][begin:end] = source_labels
                 assignment_seconds += perf_counter() - tick
                 if opts["coarse_mode"] != "baseline":
-                    from tg_boundary import build_tables
+                    from tg_local import build_tables
                     tick = perf_counter()
                     for offset in range(end - begin):
                         index = begin + offset
                         seed = int(np.random.SeedSequence([opts["cache_seed"], index, 0x5447]).generate_state(
                             1, dtype=np.uint64)[0])
-                        guided, control, record = build_tables(
+                        tables, fine_labels, record = build_tables(
                             source[offset].numpy(), target[offset].numpy(), source_labels[offset],
-                            labels[offset].numpy(), opts["num_regions"], opts["boundary"], seed)
-                        arrays["coarse_tables"][index] = (guided if opts["coarse_mode"] == "boundary_guided"
-                                                          else control)
-                        _accumulate_boundary(boundary_summary, record)
+                            labels[offset].numpy(), opts["num_regions"], opts["local"], seed)
+                        arrays["pairing_tables"][index] = tables
+                        arrays["fine_target_labels"][index] = fine_labels
+                        _accumulate_local(local_summary, record)
                     guidance_seconds += perf_counter() - tick
                 print(f"tg_prepared={end}/{count}", flush=True)
     finally:
@@ -293,20 +301,20 @@ def prepare(config, dataset):
                 "source_sha256": {name: file_sha256(Path(__file__).parent / name)
                                   for name in ("tg_cache.py", "coupling.py", "data.py", "train_horse.py")}}
     if opts["coarse_mode"] != "baseline":
-        for values in boundary_summary["metrics"].values():
+        for values in local_summary["metrics"].values():
             values["mean"] = values["sum"] / values["count"]
         metadata.update(
-            implementation="tg_offline_boundary_v3",
-            source_assignment="exact POT baseline followed by offline capacity-preserving coarse swaps",
-            coarse_resampling="uniform hard table per visit; table zero is the unchanged TG baseline",
-            coarse_guidance_seconds=guidance_seconds,
-            boundary_summary=boundary_summary,
-            boundary_score_definition="source-kNN graph hinge of ensemble-mean velocity differences at t=0; NOT a neural Jacobian",
-            boundary_matching="both variants constructed together per cloud; equal accepted swaps per table and bounded coarse-cost gap",
-            boundary_guard_definition="per-table centroid cost budget, target adjacency/distance, per-source ensemble centroid-drift budget; NOT topology guarantees",
-            precompute_timing_scope="draws, coarse solves, paired guided/control construction, array IO and hashing; excludes final metadata write")
-        metadata["source_sha256"]["tg_boundary.py"] = file_sha256(Path(__file__).parent / "tg_boundary.py")
-        print(f"boundary_mode={opts['coarse_mode']} noop_clouds={boundary_summary['noop_clouds']}/{count} "
+            implementation="tg_offline_local_v4",
+            source_assignment="exact POT parent assignment, offline capacity-preserving coarse swaps, optional balanced source-child allocation",
+            coarse_resampling="uniform hard grouping table per visit; table zero preserves baseline parent labels, with children in subpatch mode",
+            fine_pairing="fresh uniform random bijection per cached fine group per visit; scoring permutations are discarded",
+            local_guidance_seconds=guidance_seconds,
+            local_summary=local_summary,
+            local_score_definition="mean of per-bijection, multi-time, cross-validated local affine velocity residuals; NOT a neural Jacobian",
+            local_guard_definition="hard parent/child capacities, coarse centroid and expected random fine cost budgets, target adjacency/distance, scored-coverage and destination drift limits; NOT topology guarantees",
+            precompute_timing_scope="draws, coarse solves, local scoring and grouping, array IO and hashing; excludes final metadata write")
+        metadata["source_sha256"]["tg_local.py"] = file_sha256(Path(__file__).parent / "tg_local.py")
+        print(f"local_mode={opts['coarse_mode']} coarse_noop_clouds={local_summary['noop_clouds']}/{count} "
               f"guidance_seconds={guidance_seconds:.3f}", flush=True)
     # Written last: interruption leaves an explicitly incomplete cache, never a
     # apparently valid one. No overwrite/automatic deletion of existing data.
@@ -333,13 +341,15 @@ class _CloudDataset(Dataset):
             self.arrays = {name: np.load(Path(self.path) / f"{name}.npy", mmap_mode="r", allow_pickle=False)
                            for name in self.metadata["array_sha256"]}
         arrays = self.arrays
-        if "coarse_tables" in arrays:
-            table = int(rng.integers(self.metadata["boundary_options"]["num_tables"]))
-            source_labels = arrays["coarse_tables"][index, table]
+        if "pairing_tables" in arrays:
+            table = int(rng.integers(self.metadata["local_options"]["num_tables"]))
+            source_labels = arrays["pairing_tables"][index, table]
+            target_labels = arrays["fine_target_labels"][index]
+            groups = self.metadata["fine_num_regions"]
         else:
             source_labels = arrays["source_labels"][index]
-        permutation = random_fine_permutation(source_labels, arrays["target_labels"][index],
-                                             self.metadata["num_regions"], rng)
+            target_labels, groups = arrays["target_labels"][index], self.metadata["num_regions"]
+        permutation = random_fine_permutation(source_labels, target_labels, groups, rng)
         # Copies make writable CPU tensors without modifying read-only caches.
         return (torch.from_numpy(arrays["source"][index].copy()),
                 torch.from_numpy(arrays["target"][index][permutation].copy()))
@@ -428,11 +438,12 @@ class TGCachedPairSampler:
         if "coarse_mode" in meta:
             result.update(implementation=meta["implementation"], coarse_mode=meta["coarse_mode"],
                           source_assignment=meta["source_assignment"],
-                          boundary_options=meta["boundary_options"], boundary_summary=meta["boundary_summary"],
-                          coarse_guidance_seconds=meta["coarse_guidance_seconds"],
-                          boundary_score_definition=meta["boundary_score_definition"],
-                          boundary_guard_definition=meta["boundary_guard_definition"],
-                          boundary_matching=meta["boundary_matching"],
+                          local_options=meta["local_options"], local_summary=meta["local_summary"],
+                          local_guidance_seconds=meta["local_guidance_seconds"],
+                          local_score_definition=meta["local_score_definition"],
+                          local_guard_definition=meta["local_guard_definition"],
+                          fine_num_regions=meta["fine_num_regions"],
                           cached_source_assignment_sha256=meta["array_sha256"]["source_labels"],
-                          cached_coarse_tables_sha256=meta["array_sha256"]["coarse_tables"])
+                          cached_pairing_tables_sha256=meta["array_sha256"]["pairing_tables"],
+                          cached_fine_target_labels_sha256=meta["array_sha256"]["fine_target_labels"])
         return result

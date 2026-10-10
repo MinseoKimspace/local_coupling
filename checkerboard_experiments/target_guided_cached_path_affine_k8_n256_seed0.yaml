@@ -5,24 +5,26 @@ coupling: target_guided_cached
 num_regions: 8
 
 tg_cache:
-  path: coupling_cache/checkerboard_tg_hard_k8_n256_seed0_boundary_guided
+  path: coupling_cache/checkerboard_tg_path_affine_k8_n256_seed0
   sampling: bank
   num_clouds: 4096
   seed: 0
   prepare_batch_size: 64
   num_workers: 2
-  coarse_mode: boundary_guided
-  boundary:
-    num_tables: 4
-    source_neighbors: 8
-    max_swaps: 16
-    tau: 2.0
-    distance_epsilon: 0.001
+  coarse_mode: path_affine
+  local:
+    num_tables: 3
+    score_permutations: 2
+    candidate_count: 4
+    max_swaps: 4
+    times: [0.0, 0.5, 0.75, 0.9]
+    neighbors: 12
+    ridge: 0.001
     max_cost_increase: 0.02
-    cost_match_tolerance: 0.005
-    destination_budget: 0.5
     target_neighbors: 2
     max_target_distance_factor: 2.0
+    destination_budget: 0.5
+    subpatches: 1
 
 data:
   batch_size: 64
@@ -46,4 +48,4 @@ training:
 evaluation:
   batch_size: 64
 
-checkpoint: target_guided_cached_boundary_guided_k8_n256_seed0.pt
+checkpoint: target_guided_cached_path_affine_k8_n256_seed0.pt

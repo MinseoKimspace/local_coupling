@@ -5,4 +5,5 @@ runs/psf3d/
 eval_results/psf3d/
 analysis_results/
 coupling_cache/
+experiment_manifests/
 data/ShapeNetCore.v2.PC15k/

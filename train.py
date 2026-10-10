@@ -81,7 +81,8 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
               f"sampling={pair_sampler.metadata['sampling']} clouds={pair_sampler.metadata['num_clouds']}", flush=True)
         if "coarse_mode" in pair_sampler.metadata:
             print(f"coarse_mode={pair_sampler.metadata['coarse_mode']} fine=fresh_random "
-                  f"tables={pair_sampler.metadata['boundary_options']['num_tables']}", flush=True)
+                  f"tables={pair_sampler.metadata['local_options']['num_tables']} "
+                  f"fine_groups={pair_sampler.metadata['fine_num_regions']}", flush=True)
     model.train()
     synchronize(device)
     start = perf_counter()
