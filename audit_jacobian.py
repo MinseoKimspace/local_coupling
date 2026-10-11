@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from coupling import OFFLINE_METHODS, TG_CACHED_METHODS
+from coupling import OFFLINE_METHODS, TG_OFFLINE_METHODS
 from diagnostic_data import DiagnosticData, diagnostic_metadata, load_verified_model, tensor_sha256
 from experiment import evaluation_title, synchronize
 from summarize_results import output_directory, plt, save_json, statistics
@@ -160,14 +160,14 @@ def rollout_snapshots(model, source, times, steps):
 
 def _cached_pairs(config, dataset, data, clouds):
     parameter_device, dtype = data.device, data.dtype
-    if config["coupling"] in TG_CACHED_METHODS:
-        from tg_cache import TGCachedPairSampler
-        sampler = TGCachedPairSampler(config, dataset, parameter_device, dtype)
+    if config["coupling"] in TG_OFFLINE_METHODS:
+        from tg_cache import make_pair_sampler
+        sampler = make_pair_sampler(config, dataset, parameter_device, dtype)
     elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         sampler = NSOTPairSampler(config, dataset, parameter_device, dtype)
     else:
-        raise ValueError("coupling scope requires target_guided_cached or nsot; use rollout for other methods")
+        raise ValueError("coupling scope requires cached/superset TG or nsot; use rollout for other methods")
     sources, targets = [], []
     try:
         for index in range(clouds):
@@ -234,7 +234,7 @@ def audit(config_path, dataset, *, scope="rollout", clouds=16, times=TIMES, prob
     if method == "exact" and dimension > max_exact_dim:
         raise ValueError("Exact Jacobian exceeds max_exact_dim; use --method hutchinson or explicitly raise --max-exact-dim")
     if scope != "rollout" and config["coupling"] not in OFFLINE_METHODS:
-        raise ValueError("coupling scope requires target_guided_cached or nsot; use rollout for other methods")
+        raise ValueError("coupling scope requires cached/superset TG or nsot; use rollout for other methods")
     data = DiagnosticData(config, dataset, parameter.device, parameter.dtype, seed)
     synchronize(parameter.device)
     start = perf_counter()

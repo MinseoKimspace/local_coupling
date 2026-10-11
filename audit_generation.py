@@ -11,7 +11,7 @@ from time import perf_counter
 import numpy as np
 import torch
 
-from coupling import CLOUD_METHODS, TG_CACHED_METHODS, coupled_points
+from coupling import CLOUD_METHODS, TG_OFFLINE_METHODS, coupled_points
 from data import checkerboard_centers
 from diagnose import BINS, NFES, TIMES, fm_errors, rollout
 from diagnostic_data import (DiagnosticData, diagnostic_metadata, finite_scores,
@@ -120,9 +120,9 @@ def fm_summary(model, config, data, batches, batch_size, seed):
     if config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, data.dataset, parameter.device, parameter.dtype)
-    elif config["coupling"] in TG_CACHED_METHODS:
-        from tg_cache import TGCachedPairSampler
-        pair_sampler = TGCachedPairSampler(config, data.dataset, parameter.device, parameter.dtype)
+    elif config["coupling"] in TG_OFFLINE_METHODS:
+        from tg_cache import make_pair_sampler
+        pair_sampler = make_pair_sampler(config, data.dataset, parameter.device, parameter.dtype)
     centers = (checkerboard_centers(config["data"]["grid_size"], parameter.device, parameter.dtype)
                if data.dataset == "checkerboard" else None)
     errors, bins, energy = [[] for _ in TIMES], [[] for _ in BINS], []

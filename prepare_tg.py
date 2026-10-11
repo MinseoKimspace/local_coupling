@@ -10,10 +10,9 @@ the same model, optimizer, batch and updates as the corresponding online TG.
 For a full single-use stream, set tg_cache.sampling: stream, num_clouds: null,
 and a NEW tg_cache.path in a COPY of the YAML. At B=64 and 10000 updates this
 prepares 640000 clouds (~3.68 GiB per baseline cache). Both modes cache coarse
-labels offline and draw fine pairing and time afresh in training. Optional
-path-affine experiments additionally store hard grouping tables and target
-fine-group labels. Scoring is offline; fine bijections remain fresh during
-training. See TG_LOCAL.md for the comparison runner and cost/quality limits.
+labels offline and draw fine pairing and time afresh in training. An optional
+tg_cache.beta applies Gaussian hybrid noise after pairing. See TG_SUPERSET.md
+for the stream versus dense-superset comparison.
 
 Generation uses the existing eval.py/eval_horse.py and saved run config.yaml.
 audit_generation.py supports these caches; FM residuals use their training

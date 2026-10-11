@@ -27,6 +27,9 @@ def read_config(path):
     if config["coupling"] == "nsot":
         from nsot import settings as nsot_settings
         nsot_settings(config)
+    elif config["coupling"] == "target_guided_superset":
+        from tg_superset import settings
+        settings(config)
     return config
 
 
@@ -56,9 +59,10 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     now = datetime.now(timezone.utc)
     method = canonical_method(config["coupling"])
     name = f"{dataset}_{method}_k{config.get('num_regions', 'na')}_n{config['data']['n_points']}_seed{config['seed']}"
-    coarse_mode = config.get("tg_cache", {}).get("coarse_mode", "baseline")
-    if method == "target_guided_cached" and coarse_mode != "baseline":
-        name += "_" + coarse_mode
+    section = "tg_superset" if method == "target_guided_superset" else "tg_cache"
+    beta = config.get(section, {}).get("beta", 0.0)
+    if method in ("target_guided_cached", "target_guided_superset"):
+        name += f"_beta{beta:g}"
     run_dir = Path("runs") / dataset / f"{name}_{now:%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     snapshot = copy.deepcopy(config)
@@ -190,8 +194,8 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 def evaluation_title(config):
     method = config["coupling"]
-    coarse_mode = config.get("tg_cache", {}).get("coarse_mode", "baseline")
-    if method == "target_guided_cached" and coarse_mode != "baseline":
-        method += " / " + coarse_mode
+    if method in ("target_guided_cached", "target_guided_superset"):
+        section = "tg_superset" if method == "target_guided_superset" else "tg_cache"
+        method += f" / beta={config.get(section, {}).get('beta', 0.0):g}"
     return (f"{method} | K={config.get('num_regions', 'na')} | "
             f"N={config['data']['n_points']} | seed={config['seed']}")

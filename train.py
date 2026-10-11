@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from coupling import OFFLINE_METHODS, TG_CACHED_METHODS, coupled_points
+from coupling import OFFLINE_METHODS, TG_OFFLINE_METHODS, coupled_points
 from data import checkerboard_centers, sample_checkerboard, validate_gaussian_source
 from experiment import read_config, save_training, synchronize
 from model import PointSetTransformer
@@ -73,16 +73,13 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
         pair_sampler = NSOTPairSampler(config, dataset, device, next(model.parameters()).dtype)
         config["nsot"]["cache_sha256"] = pair_sampler.cache_sha256
         print(f"nsot_cache_sha256={pair_sampler.cache_sha256} beta={pair_sampler.beta}", flush=True)
-    elif config["coupling"] in TG_CACHED_METHODS:
-        from tg_cache import TGCachedPairSampler
-        pair_sampler = TGCachedPairSampler(config, dataset, device, next(model.parameters()).dtype, training=True)
-        config["tg_cache"]["cache_sha256"] = pair_sampler.cache_sha256
+    elif config["coupling"] in TG_OFFLINE_METHODS:
+        from tg_cache import make_pair_sampler
+        pair_sampler = make_pair_sampler(config, dataset, device, next(model.parameters()).dtype, training=True)
+        section = "tg_superset" if config["coupling"] == "target_guided_superset" else "tg_cache"
+        config[section]["cache_sha256"] = pair_sampler.cache_sha256
         print(f"tg_cache_sha256={pair_sampler.cache_sha256} "
-              f"sampling={pair_sampler.metadata['sampling']} clouds={pair_sampler.metadata['num_clouds']}", flush=True)
-        if "coarse_mode" in pair_sampler.metadata:
-            print(f"coarse_mode={pair_sampler.metadata['coarse_mode']} fine=fresh_random "
-                  f"tables={pair_sampler.metadata['local_options']['num_tables']} "
-                  f"fine_groups={pair_sampler.metadata['fine_num_regions']}", flush=True)
+              f"sampling={pair_sampler.metadata.get('sampling', 'dense_superset')} beta={pair_sampler.beta}", flush=True)
     model.train()
     synchronize(device)
     start = perf_counter()
@@ -104,10 +101,10 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
             if log_step:
                 value = loss.item()
                 timing = (f" seconds/update={(perf_counter() - start) / step:.4f}"
-                          if config["coupling"] in TG_CACHED_METHODS else "")
+                          if config["coupling"] in TG_OFFLINE_METHODS else "")
                 print(f"step={step} loss={value:.6f}{timing}")
     finally:
-        if config["coupling"] in TG_CACHED_METHODS and pair_sampler is not None:
+        if config["coupling"] in TG_OFFLINE_METHODS and pair_sampler is not None:
             pair_sampler.close()
     synchronize(device)
     seconds = perf_counter() - start

@@ -11,7 +11,9 @@ import torch.nn.functional as F
 ALIASES = {"global_hungarian": "global_ot", "geometry_aware_hungarian": "geometry_aware_ot"}
 CLOUD_METHODS = {"minibatch_ot", "equivariant_ot_permutation"}
 TG_CACHED_METHODS = {"target_guided_cached"}
-OFFLINE_METHODS = {"nsot"} | TG_CACHED_METHODS
+TG_SUPERSET_METHODS = {"target_guided_superset"}
+TG_OFFLINE_METHODS = TG_CACHED_METHODS | TG_SUPERSET_METHODS
+OFFLINE_METHODS = {"nsot"} | TG_OFFLINE_METHODS
 
 METHODS = {
     "independent": ("none", "none", "none"),
@@ -47,6 +49,15 @@ def balanced_partition_solver(method):
 
 def coupling_info(name: str) -> dict:
     name = canonical_method(name)
+    if name in TG_SUPERSET_METHODS:
+        return {"method": name, "implementation": "tg_dense_superset_v1",
+                "target_partition": "dense balanced FPS + exact POT; actual patch centroids",
+                "source_assignment": "dense exact POT M-by-K transportation",
+                "local_pairing": "fresh_uniform_random_bijection_on_selected_subsets",
+                "plan_sampling": "uniform pool, uniform source subset without replacement, matched target counts",
+                "cost": "squared_euclidean", "target_rotation": False, "target_centering": False,
+                "inference_source": "fresh_iid_standard_gaussian_no_cache",
+                "marginals": "uniform finite-pool subsets; approximate population CLOUD marginals"}
     if name in TG_CACHED_METHODS:
         return {"method": name, "implementation": "tg_offline_v1", "target_partition": "balanced",
                 "source_assignment": "exact",
@@ -260,7 +271,7 @@ def coupling_permutation(source, target, *, coupling, num_regions=None, target_c
                          sinkhorn_epsilon=0.1, sinkhorn_iterations=100, generator=None):
     method = canonical_method(coupling)
     if method in OFFLINE_METHODS:
-        sampler = "NSOTPairSampler" if method == "nsot" else "TGCachedPairSampler"
+        sampler = "NSOTPairSampler" if method == "nsot" else "tg_cache.make_pair_sampler"
         raise ValueError(f"{method} samples precomputed pairs; use {sampler}, not a fresh-cloud permutation")
     if method in CLOUD_METHODS:
         raise ValueError(f"{method} reassigns clouds; use coupled_points to obtain both paired tensors")
@@ -311,7 +322,7 @@ def coupled_points(source, target, *, coupling, **options):
     """Pair [B, N, D] tensors, allowing cloud resampling as well as point permutations."""
     method = canonical_method(coupling)
     if method in OFFLINE_METHODS:
-        sampler = "NSOTPairSampler" if method == "nsot" else "TGCachedPairSampler"
+        sampler = "NSOTPairSampler" if method == "nsot" else "tg_cache.make_pair_sampler"
         raise ValueError(f"{method} requires {sampler} and its offline cache")
     if source.ndim != 3 or source.shape != target.shape or min(source.shape) < 1:
         raise ValueError("Source and target must have the same nonempty [B, N, D] shape")
