@@ -136,6 +136,88 @@ Replace both placeholder paths with their actual saved run directories; for chec
 
 Inspect mean, median and per-cloud outliers separately for coupling and rollout. A smaller Jacobian alone is not a success criterion: require preserved low-NFE quality and improved high-NFE CD/leakage/thin-region metrics. The paper motivates support expansion, not a theorem linking this refinement to flow quality: [Gerber and Maggioni, 2017](https://arxiv.org/abs/1708.02469). The sparse assignment implementation uses [SciPy's full bipartite matching solver](https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csgraph.min_weight_full_bipartite_matching.html).
 
+## Diagnose original MS-W2: quality and Jacobian on the same clouds
+
+`audit_ms_w2_clouds.py` is a **read-only, original-MS-W2-only** diagnostic. It accepts an existing
+`audit_jacobian.py` JSON with `rollout` or `both` scope, replays those exact Gaussian clouds,
+and joins their generation quality with their existing rollout Jacobians. It does not train,
+change coupling, load a training cache, or run the cross-leaf experiment.
+
+Run from the project directory **on the machine containing the checkpoint**:
+
+```powershell
+python audit_ms_w2_clouds.py "PATH_TO_ORIGINAL_MS_W2_HORSE_JACOBIAN.json"
+python audit_ms_w2_clouds.py "PATH_TO_ORIGINAL_MS_W2_CHECKERBOARD_JACOBIAN.json"
+```
+
+Replace the placeholders with the actual Jacobian JSON paths, not NFE evaluation JSONs.
+The dataset, checkpoint config, diagnostic seed, cloud count and time grid are read from
+the report. If the saved run moved, pass `--config "runs/.../config.yaml"`; do not pass a
+pre-training YAML. The config must match the checkpoint and original audit. Defaults are
+NFE **1, 8, 128, 256, 512**, plus the original Jacobian rollout NFE if absent.
+
+The checkpoint SHA256, Gaussian bank SHA256, and **every recorded rollout-state SHA256**
+must match. CPU/CUDA or software/backend changes can invalidate bitwise replay. In that
+case the program stops rather than joining unrelated measurements. Regenerate the rollout
+audit in the current environment (no training cache needed), then use its new JSON:
+
+```powershell
+python audit_jacobian.py "SAVED_MS_W2_RUN/config.yaml" --dataset horse --scope rollout --clouds 16 --probes 16 --rollout-steps 256 --seed 2026 --times 0 0.125 0.25 0.5 0.75 0.875 0.9375 0.96875 1
+```
+
+For checkerboard use its saved run config and `--dataset checkerboard`. Times must include
+0 and 1. The new diagnostic deliberately uses the original single-cloud math-attention
+Euler path; it prioritizes reproducibility over batched inference throughput.
+
+### What is compared
+
+- Each generated cloud gets CD against one independent, equal-size target cloud held
+  fixed across NFEs; leakage; and checkerboard cell-mass TV or all fixed horse ROI metrics.
+- Original rollout Jacobian values are **reused, not recomputed at each NFE**. Quality
+  quartiles and correlations use that original rollout's endpoint NFE (256 for the current
+  reports), so their generated endpoint is exactly the one measured by the Jacobian audit.
+- CD, leakage and front-leg **absolute mass error** (or checker cell TV) each define separate
+  low/high-error quartiles. Jacobian values never influence selection. IDs resolve tied
+  ranks, boundary ties are flagged, and constant/insufficient metrics produce no groups.
+- All-cloud scatter plots and Spearman coefficients relate these quality metrics to late
+  Jacobian, endpoint Jacobian and trapezoidal normalized squared-Jacobian energy. No p-values
+  or causal claims are made. Late mean is the unweighted mean of recorded times >=0.75.
+- Two finite Euler doublings, 128->256->512, check paired endpoint MSE and quality changes
+  per cloud. Defaults are absolute tolerances 1e-5 and 1e-3 respectively. Passing means
+  empirical stability on these grids, **not** proof of convergence or correct density.
+  Leakage changes in units of one point/N can fail the quality tolerance even with tiny MSE.
+- 64 independent target-only clouds, each compared against another independent target
+  cloud, estimate ordinary finite-sampling variation at the same N. Their 10-90% bands are
+  descriptive, not confidence intervals, optimal-CD bounds, or a statistical success test.
+  Sparse per-cloud histogram JS is deliberately excluded from rankings; pooled JS is saved.
+
+Outputs in a new `analysis_results/<dataset>/*_same_cloud_*` directory:
+
+| File | Use |
+| --- | --- |
+| `same_cloud.json` | Full provenance, per-cloud results, finite-refinement checks, groups and correlations |
+| `per_cloud.csv` | One cloud/NFE per row; quality, reused original-rollout Jacobian features and stability flags |
+| `target_controls.csv` | Target-only sampling baseline |
+| `clouds.npz` | All Gaussian sources, fixed references, target controls, generated points and original rollout states |
+| `quality_by_cloud.png` | NFE curves per cloud and target-only bands |
+| `quality_vs_jacobian.png` | All-cloud quality/Jacobian scatter with cloud IDs |
+| `gallery_*.png` | Quality-selected examples at multiple NFEs, target-only examples and each cloud's Jacobian curve |
+| `jacobian_groups_*.png` | Raw Jacobian curves and medians of quality-only quartiles |
+| `front_legs_zoom.png`, `horse_rois.png` | Horse ROI view; zoom is omitted if the mass-error ranking cannot separate groups |
+
+`--skip-render` retains JSON/CSV/NPZ and terminal summaries. `--control-clouds 128` increases
+the target-only baseline, **not** the number of Jacobian clouds. To increase that count,
+first generate a larger rollout audit. `--reference-nfe` and `--max-reference-nfe` must
+allow at least two doublings; requested NFEs must not exceed the latter.
+
+Interpretation: first check whether high-error examples remain poor after refinement and
+whether errors exceed typical target-only sampling variation. Then inspect whether their
+Jacobian trajectories differ from low-error examples. A correlation can guide a subsequent
+controlled experiment, but cannot by itself identify coupling, approximation, density, or
+integration as the cause. One checkpoint and 16 clouds are exploratory; the Monte Carlo
+Jacobian estimates also contain probe noise. No result from this diagnostic alone justifies
+penalizing Jacobians or changing the coupling.
+
 ## Matching construction
 
 1. Draw one standard Gaussian source superset and one target superset with the same isolated sampler and cache seed as the existing 2D NSOT implementation. Keep both arrays unchanged.
