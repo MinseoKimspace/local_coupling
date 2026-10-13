@@ -3,7 +3,7 @@ import copy
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -20,6 +20,22 @@ from train_horse import HorsePointSetTransformer
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_shipped_manifest_is_portable_and_complete(self):
+        path = Path(__file__).resolve().parents[1] / "comparison_runs.yaml"
+        manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
+        self.assertEqual(set(manifest["datasets"]), {"checkerboard", "horse"})
+        for dataset, entries in manifest["datasets"].items():
+            self.assertEqual([e["id"] for e in entries],
+                             ["independent", "efm", "minibatch_ot", "nsot", "tg", "ms_w2"])
+            for entry in entries:
+                value = entry["config"]
+                self.assertTrue(value.startswith(f"./runs/{dataset}/"))
+                self.assertTrue(value.endswith("/config.yaml"))
+                self.assertFalse(Path(value).is_absolute())
+                self.assertFalse(PureWindowsPath(value).drive)
+                self.assertNotIn("REPLACE_", value)
+                self.assertIn("_n256_seed0_", value)
+
     def setUp(self):
         self.previous = Path.cwd()
         self.temp = tempfile.TemporaryDirectory()

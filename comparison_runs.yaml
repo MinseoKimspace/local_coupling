@@ -1,5 +1,7 @@
 # Run paths transcribed from the user's screenshots, 2026-10-13.
-# Keep this manifest beside runs/. Run --check-only on the training machine
+# All paths are relative to this file; no workstation-specific absolute paths.
+# Keep this manifest beside runs/. Do NOT overwrite it with the example template.
+# Run --check-only on the training machine
 # to verify the actual files and checkpoint metadata before rendering.
 version: 1
 datasets:
@@ -7,49 +9,49 @@ datasets:
     - id: independent
       label: Independent
       coupling: independent
-      config: runs/checkerboard/checkerboard_independent_kna_n256_seed0_20260909T165106231277Z/config.yaml
+      config: ./runs/checkerboard/checkerboard_independent_kna_n256_seed0_20260909T165106231277Z/config.yaml
     - id: efm
       label: EFM (permutation)
       coupling: equivariant_ot_permutation
-      config: runs/checkerboard/checkerboard_equivariant_ot_permutation_kna_n256_seed0_20261004T021236809560Z_85cdd126/config.yaml
+      config: ./runs/checkerboard/checkerboard_equivariant_ot_permutation_kna_n256_seed0_20261004T021236809560Z_85cdd126/config.yaml
     - id: minibatch_ot
       label: Minibatch OT
       coupling: minibatch_ot
-      config: runs/checkerboard/checkerboard_minibatch_ot_kna_n256_seed0_20261001T225840963758Z_62413405/config.yaml
+      config: ./runs/checkerboard/checkerboard_minibatch_ot_kna_n256_seed0_20261001T225840963758Z_62413405/config.yaml
     - id: nsot
       label: NSOT
       coupling: nsot
-      config: runs/checkerboard/checkerboard_nsot_kna_n256_seed0_20261013T142047050309Z_1262d92f/config.yaml
+      config: ./runs/checkerboard/checkerboard_nsot_kna_n256_seed0_20261013T142047050309Z_1262d92f/config.yaml
     - id: tg
       label: TG (cached K=8)
       coupling: target_guided_cached
-      config: runs/checkerboard/checkerboard_target_guided_cached_k8_n256_seed0_20261008T012057833282Z_46da0989/config.yaml
+      config: ./runs/checkerboard/checkerboard_target_guided_cached_k8_n256_seed0_20261008T012057833282Z_46da0989/config.yaml
     - id: ms_w2
       label: MS-W2
       coupling: multiscale_wasserstein
-      config: runs/checkerboard/checkerboard_multiscale_wasserstein_kna_n256_seed0_20261013T095002745772Z_8c8ebd26/config.yaml
+      config: ./runs/checkerboard/checkerboard_multiscale_wasserstein_kna_n256_seed0_20261013T095002745772Z_8c8ebd26/config.yaml
   horse:
     - id: independent
       label: Independent
       coupling: independent
-      config: runs/horse/horse_independent_kna_n256_seed0_20260910T060826982096Z/config.yaml
+      config: ./runs/horse/horse_independent_kna_n256_seed0_20260910T060826982096Z/config.yaml
     - id: efm
       label: EFM (permutation)
       coupling: equivariant_ot_permutation
-      config: runs/horse/horse_equivariant_ot_permutation_kna_n256_seed0_20261006T230206092442Z_c4770473/config.yaml
+      config: ./runs/horse/horse_equivariant_ot_permutation_kna_n256_seed0_20261006T2320206092442Z_c4770473/config.yaml
     - id: minibatch_ot
       label: Minibatch OT
       coupling: minibatch_ot
-      config: runs/horse/horse_minibatch_ot_kna_n256_seed0_20261004T021728467411Z_27895c9e/config.yaml
+      config: ./runs/horse/horse_minibatch_ot_kna_n256_seed0_20261004T021728467411Z_27895c9e/config.yaml
     - id: nsot
       label: NSOT
       coupling: nsot
-      config: runs/horse/horse_nsot_kna_n256_seed0_20261013T142812990946Z_79f6cc91/config.yaml
+      config: ./runs/horse/horse_nsot_kna_n256_seed0_20261013T142812990946Z_79f6cc91/config.yaml
     - id: tg
       label: TG (cached K=8)
       coupling: target_guided_cached
-      config: runs/horse/horse_target_guided_cached_k8_n256_seed0_20261008T012552927034Z_4290464f/config.yaml
+      config: ./runs/horse/horse_target_guided_cached_k8_n256_seed0_20261008T012552927034Z_4290464f/config.yaml
     - id: ms_w2
       label: MS-W2
       coupling: multiscale_wasserstein
-      config: runs/horse/horse_multiscale_wasserstein_kna_n256_seed0_20261013T095445144196Z_042ec583/config.yaml
+      config: ./runs/horse/horse_multiscale_wasserstein_kna_n256_seed0_20261013T095445144196Z_042ec583/config.yaml

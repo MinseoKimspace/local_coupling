@@ -6,15 +6,17 @@ bank, compute Jacobians, or modify a checkpoint. No extra dependency is needed.
 
 ## Run from the project root (Windows CMD)
 
-```bat
-copy comparison_runs.example.yaml comparison_runs.yaml
-notepad comparison_runs.yaml
-```
+`comparison_runs.yaml` is already populated with the 12 run folders from the
+provided screenshots. All entries use `./runs/.../config.yaml`, relative to this
+manifest. Copy it to the lab machine's project root beside `runs/` and
+`render_comparison.py`; no username, drive letter or absolute project path is needed.
+Do NOT copy `comparison_runs.example.yaml` over this populated file.
 
-Replace the 12 `REPLACE_*` paths with your saved runs. Keep each `.pt` file beside
+Only for a DIFFERENT set of runs, copy the example to a new manifest name and
+replace its `REPLACE_*` paths. Keep each `.pt` file beside
 its saved `config.yaml` when moving runs between machines. Do not use the original
 experiment template YAML if training changed its seed/settings. Paths in the
-manifest are relative to the manifest's own directory; absolute paths also work.
+manifest are relative to the manifest's own directory.
 Use forward slashes or single quotes for Windows YAML paths.
 
 First validate every selected file, method, dataset, architecture and checkpoint
