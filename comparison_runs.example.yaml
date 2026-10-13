@@ -1,0 +1,56 @@
+# Copy to comparison_runs.yaml and replace EVERY REPLACE_* path with a saved run.
+# Paths are relative to THIS manifest, not the current working directory.
+# Use forward slashes or YAML single quotes for Windows paths.
+# List order is column order. Never silently picks the newest checkpoint.
+version: 1
+datasets:
+  checkerboard:
+    - id: independent
+      label: Independent
+      coupling: independent
+      config: runs/checkerboard/REPLACE_INDEPENDENT/config.yaml
+    - id: efm
+      label: EFM (permutation)
+      coupling: equivariant_ot_permutation
+      config: runs/checkerboard/REPLACE_EFM/config.yaml
+    - id: minibatch_ot
+      label: Minibatch OT
+      coupling: minibatch_ot
+      config: runs/checkerboard/REPLACE_MINIBATCH_OT/config.yaml
+    - id: nsot
+      label: NSOT
+      coupling: nsot
+      config: runs/checkerboard/REPLACE_NSOT/config.yaml
+    - id: tg
+      label: TG (cached)
+      coupling: target_guided_cached
+      config: runs/checkerboard/REPLACE_TG/config.yaml
+    - id: ms_w2
+      label: MS-W2
+      coupling: multiscale_wasserstein
+      config: runs/checkerboard/REPLACE_MS_W2/config.yaml
+  horse:
+    - id: independent
+      label: Independent
+      coupling: independent
+      config: runs/horse/REPLACE_INDEPENDENT/config.yaml
+    - id: efm
+      label: EFM (permutation)
+      coupling: equivariant_ot_permutation
+      config: runs/horse/REPLACE_EFM/config.yaml
+    - id: minibatch_ot
+      label: Minibatch OT
+      coupling: minibatch_ot
+      config: runs/horse/REPLACE_MINIBATCH_OT/config.yaml
+    - id: nsot
+      label: NSOT
+      coupling: nsot
+      config: runs/horse/REPLACE_NSOT/config.yaml
+    - id: tg
+      label: TG (cached)
+      coupling: target_guided_cached
+      config: runs/horse/REPLACE_TG/config.yaml
+    - id: ms_w2
+      label: MS-W2
+      coupling: multiscale_wasserstein
+      config: runs/horse/REPLACE_MS_W2/config.yaml

@@ -218,6 +218,14 @@ integration as the cause. One checkpoint and 16 clouds are exploratory; the Mont
 Jacobian estimates also contain probe noise. No result from this diagnostic alone justifies
 penalizing Jacobians or changing the coupling.
 
+## Side-by-side comparison with other saved models
+
+Use [RENDER_COMPARISON.md](RENDER_COMPARISON.md) and `render_comparison.py` to compare
+Independent, EFM (permutation), Minibatch OT, NSOT, TG and baseline MS-W2 at
+NFE 1/2/4/8/16/32/128. It reuses saved checkpoints and common Gaussian inputs,
+producing density/scatter grids and per-NFE strips for horse and checkerboard.
+No retraining or training-bank access is required.
+
 ## Matching construction
 
 1. Draw one standard Gaussian source superset and one target superset with the same isolated sampler and cache seed as the existing 2D NSOT implementation. Keep both arrays unchanged.
