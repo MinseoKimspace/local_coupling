@@ -166,9 +166,9 @@ def _cached_pairs(config, dataset, data, clouds):
     elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         sampler = NSOTPairSampler(config, dataset, parameter_device, dtype)
-    elif config["coupling"] == "wasserstein_bank":
-        from wasserstein_bank import WassersteinBankSampler
-        sampler = WassersteinBankSampler(config, dataset, parameter_device, dtype)
+    elif config["coupling"] == "multiscale_wasserstein":
+        from multiscale_wasserstein import MultiscaleWassersteinSampler
+        sampler = MultiscaleWassersteinSampler(config, dataset, parameter_device, dtype)
     else:
         raise ValueError("coupling scope requires an offline bank coupling; use rollout for other methods")
     sources, targets = [], []
@@ -299,7 +299,7 @@ def audit(config_path, dataset, *, scope="rollout", clouds=16, times=TIMES, prob
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Full-cloud spatial Jacobian Frobenius norm; no training or checkpoint edits.")
     parser.add_argument("config", help="Saved runs/.../config.yaml matching the checkpoint")
-    parser.add_argument("--dataset", required=True, choices=("horse", "checkerboard", "mixture2d"))
+    parser.add_argument("--dataset", required=True, choices=("horse", "checkerboard"))
     parser.add_argument("--scope", choices=("rollout", "coupling", "both"), default="rollout")
     parser.add_argument("--clouds", type=int, default=16)
     parser.add_argument("--times", type=float, nargs="+", default=list(TIMES))

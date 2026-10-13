@@ -1,5 +1,4 @@
 import argparse
-import json
 from time import perf_counter
 
 import numpy as np
@@ -69,11 +68,11 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
     generator = torch.Generator(device=device).manual_seed(config["seed"] + 1)
     np.random.seed(config["seed"] + 1)  # Original upstream OT samplers use NumPy.
     pair_sampler = None
-    if config["coupling"] == "wasserstein_bank":
-        from wasserstein_bank import WassersteinBankSampler
-        pair_sampler = WassersteinBankSampler(config, dataset, device, next(model.parameters()).dtype)
-        config["wasserstein_bank"]["cache_sha256"] = pair_sampler.cache_sha256
-        print(f"wasserstein_selector={pair_sampler.selector} selected_candidate={pair_sampler.selected}", flush=True)
+    if config["coupling"] == "multiscale_wasserstein":
+        from multiscale_wasserstein import MultiscaleWassersteinSampler
+        pair_sampler = MultiscaleWassersteinSampler(config, dataset, device, next(model.parameters()).dtype)
+        config["multiscale_wasserstein"]["cache_sha256"] = pair_sampler.cache_sha256
+        print(f"multiscale_cache_sha256={pair_sampler.cache_sha256}", flush=True)
     elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, dataset, device, next(model.parameters()).dtype)
@@ -88,14 +87,9 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
     model.train()
     synchronize(device)
     start = perf_counter()
-    history = []
-    validation_seconds = 0.0
-    early_step = max(1, int(training["num_steps"] * 0.05))
     try:
         for step in range(1, training["num_steps"] + 1):
             log_step = step == 1 or step % training["log_every"] == 0
-            if config["coupling"] == "wasserstein_bank":
-                log_step = log_step or step in (early_step, training["num_steps"])
             paired_noise = None
             if pair_sampler is None:
                 target = sample_batch()
@@ -113,21 +107,6 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
                 timing = (f" seconds/update={(perf_counter() - start) / step:.4f}"
                           if config["coupling"] in TG_CACHED_METHODS else "")
                 print(f"step={step} loss={value:.6f}{timing}")
-                if config["coupling"] == "wasserstein_bank":
-                    from wasserstein_bank import integrated_curve
-                    synchronize(device)
-                    validation_start = perf_counter()
-                    curve = pair_sampler.validation_curve(model, training.get("validation_batch_size", 16),
-                                                          config["seed"] + 100003)
-                    synchronize(device)
-                    validation_seconds += perf_counter() - validation_start
-                    if not np.isfinite([point["mse_per_coordinate"] for point in curve]).all():
-                        raise FloatingPointError("Nonfinite bank validation loss")
-                    history.append({"step": step, "training_loss": value,
-                                    "elapsed_seconds": perf_counter() - start, "validation_by_time": curve,
-                                    "integrated_validation_mse": integrated_curve(curve),
-                                    "validation_seconds_cumulative": validation_seconds})
-                    print(f"integrated_validation_mse={integrated_curve(curve):.6f}", flush=True)
     finally:
         if config["coupling"] in TG_CACHED_METHODS and pair_sampler is not None:
             pair_sampler.close()
@@ -135,16 +114,7 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
     seconds = perf_counter() - start
     print(f"training_seconds={seconds:.3f}")
     details = pair_sampler.details() if pair_sampler is not None else None
-    if config["coupling"] == "wasserstein_bank":
-        details.update(validation_seconds=validation_seconds,
-                       training_seconds_excluding_validation=seconds - validation_seconds)
     run_dir = save_training(model, config, dataset, config_path, seconds, loss.item(), coupling_metadata=details)
-    if history:
-        with (run_dir / "learning_curve.json").open("x", encoding="utf-8") as file:
-            json.dump({"validation_definition": pair_sampler.metadata["holdout_definition"],
-                       "validation_seed": config["seed"] + 100003,
-                       "early_selector_step": early_step, "early_selector_fraction": 0.05,
-                       "history": history}, file, indent=2, allow_nan=False)
     return run_dir
 
 

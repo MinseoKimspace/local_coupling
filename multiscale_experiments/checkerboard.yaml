@@ -1,0 +1,38 @@
+# Same model, data, training and evaluation as checkerboard_experiments/nsot.yaml.
+dataset: checkerboard
+seed: 0
+device: cuda
+dtype: float32
+coupling: multiscale_wasserstein
+
+multiscale_wasserstein:
+  cache: coupling_cache/multiscale_wasserstein/checkerboard_m10000_seed0.npz
+  superset_size: 10000
+  cache_seed: 0
+  partition_counts: [4, 20, 100]
+  scale_weights: [1.0, 1.0, 1.0]
+  max_cost_mib: 512
+
+data:
+  batch_size: 64
+  n_points: 256
+  grid_size: 4
+
+model:
+  point_dim: 2
+  d_model: 128
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 256
+  dropout: 0.0
+
+training:
+  num_steps: 10000
+  learning_rate: 0.001
+  weight_decay: 0.01
+  log_every: 100
+
+evaluation:
+  batch_size: 64
+
+checkpoint: checkerboard_multiscale_wasserstein.pt

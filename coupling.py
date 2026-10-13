@@ -11,7 +11,7 @@ import torch.nn.functional as F
 ALIASES = {"global_hungarian": "global_ot", "geometry_aware_hungarian": "geometry_aware_ot"}
 CLOUD_METHODS = {"minibatch_ot", "equivariant_ot_permutation"}
 TG_CACHED_METHODS = {"target_guided_cached"}
-OFFLINE_METHODS = {"nsot", "wasserstein_bank"} | TG_CACHED_METHODS
+OFFLINE_METHODS = {"nsot", "multiscale_wasserstein"} | TG_CACHED_METHODS
 
 METHODS = {
     "independent": ("none", "none", "none"),
@@ -47,11 +47,12 @@ def balanced_partition_solver(method):
 
 def coupling_info(name: str) -> dict:
     name = canonical_method(name)
-    if name == "wasserstein_bank":
-        return {"method": name, "implementation": "complete_wasserstein_bank_2d_v1",
-                "target_partition": "none", "source_assignment": "offline_candidate_bank_selection",
-                "local_pairing": "selected_superset_bijection", "plan_sampling": "iid_pairs_with_replacement_given_shape",
-                "shape_sampling": "uniform; one shape per cloud; no shape ID supplied to model",
+    if name == "multiscale_wasserstein":
+        return {"method": name, "implementation": "nested_equal_mass_patch_w2_exact_v1",
+                "target_partition": "nested_equal_mass_spatial_kd",
+                "source_assignment": "exact_leaf_assignment_using_multiscale_patch_w2_costs",
+                "local_pairing": "exact_within_leaf_squared_euclidean",
+                "plan_sampling": "iid_pairs_with_replacement",
                 "source_coordinates": "unchanged Gaussian draws; no training perturbation",
                 "inference_source": "fresh_iid_standard_gaussian_no_cache"}
     if name in TG_CACHED_METHODS:
@@ -267,7 +268,7 @@ def coupling_permutation(source, target, *, coupling, num_regions=None, target_c
                          sinkhorn_epsilon=0.1, sinkhorn_iterations=100, generator=None):
     method = canonical_method(coupling)
     if method in OFFLINE_METHODS:
-        sampler = {"nsot": "NSOTPairSampler", "wasserstein_bank": "WassersteinBankSampler"}.get(method, "TGCachedPairSampler")
+        sampler = {"nsot": "NSOTPairSampler", "multiscale_wasserstein": "MultiscaleWassersteinSampler"}.get(method, "TGCachedPairSampler")
         raise ValueError(f"{method} samples precomputed pairs; use {sampler}, not a fresh-cloud permutation")
     if method in CLOUD_METHODS:
         raise ValueError(f"{method} reassigns clouds; use coupled_points to obtain both paired tensors")
@@ -318,7 +319,7 @@ def coupled_points(source, target, *, coupling, **options):
     """Pair [B, N, D] tensors, allowing cloud resampling as well as point permutations."""
     method = canonical_method(coupling)
     if method in OFFLINE_METHODS:
-        sampler = {"nsot": "NSOTPairSampler", "wasserstein_bank": "WassersteinBankSampler"}.get(method, "TGCachedPairSampler")
+        sampler = {"nsot": "NSOTPairSampler", "multiscale_wasserstein": "MultiscaleWassersteinSampler"}.get(method, "TGCachedPairSampler")
         raise ValueError(f"{method} requires {sampler} and its offline cache")
     if source.ndim != 3 or source.shape != target.shape or min(source.shape) < 1:
         raise ValueError("Source and target must have the same nonempty [B, N, D] shape")

@@ -100,9 +100,9 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
     time_generator = torch.Generator(device=device).manual_seed(seed + 2)
     n = config["data"]["n_points"]
     pair_sampler = None
-    if config["coupling"] == "wasserstein_bank":
-        from wasserstein_bank import WassersteinBankSampler
-        pair_sampler = WassersteinBankSampler(config, dataset, device, dtype)
+    if config["coupling"] == "multiscale_wasserstein":
+        from multiscale_wasserstein import MultiscaleWassersteinSampler
+        pair_sampler = MultiscaleWassersteinSampler(config, dataset, device, dtype)
     elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, dataset, device, dtype)

@@ -1,0 +1,357 @@
+"""Prepare/train/evaluate multiscale Wasserstein matching with a 10K pair bank.
+
+Default is preparation only. Training is explicit (--stage train/all).
+"""
+
+import argparse
+import copy
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+from uuid import uuid4
+
+import numpy as np
+import torch
+import yaml
+
+from nsot import file_sha256
+
+
+ROOT = Path(__file__).resolve().parent
+FORMAT = "multiscale_wasserstein_experiment_v1"
+NFES = [1, 2, 4, 8, 16, 32, 64, 128]
+
+
+@contextmanager
+def project_directory():
+    previous = Path.cwd()
+    try:
+        os.chdir(ROOT)
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def save_manifest(path, value):
+    temporary = path.with_suffix(".json.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, indent=2, allow_nan=False)
+    temporary.replace(path)
+
+
+def _integers(values, label, minimum=0):
+    if (not values or len(values) != len(set(values)) or
+            any(isinstance(v, bool) or not isinstance(v, int) or not minimum <= v < 2**32 - 1
+                for v in values)):
+        raise ValueError(f"{label} must contain distinct integers in [{minimum},2**32-1)")
+    return list(values)
+
+
+def _read_yaml(path):
+    with Path(path).open(encoding="utf-8") as stream:
+        return yaml.safe_load(stream)
+
+
+def _cache_path(config, dataset, method):
+    from nsot import dataset_spec
+    options = {key: value for key, value in config[method].items()
+               if key not in ("cache", "cache_sha256", "beta")}
+    dependencies = (["nsot.py", "data.py", "train_horse.py"] if method == "nsot" else
+                    ["multiscale_wasserstein.py", "nsot.py", "data.py", "train_horse.py"])
+    specification = {"dataset": dataset_spec(config, dataset), "options": options,
+                     "implementation_sha256": {name: file_sha256(ROOT / name) for name in dependencies}}
+    digest = hashlib.sha256(json.dumps(specification, sort_keys=True).encode()).hexdigest()[:20]
+    return ROOT / "coupling_cache" / method / f"{dataset}_{digest}.npz"
+
+
+def create_experiment(*, datasets=None, seeds=None, bank_seed=0, device=None, steps=None,
+                      superset_size=None, partition_counts=None, scale_weights=None,
+                      with_nsot=False, smoke=False, nfe=None, output_root=None):
+    from multiscale_wasserstein import METHOD, settings
+    datasets = ["checkerboard", "horse"] if datasets is None else list(datasets)
+    if (not datasets or len(datasets) != len(set(datasets)) or
+            any(d not in ("checkerboard", "horse") for d in datasets)):
+        raise ValueError("Choose distinct checkerboard/horse datasets")
+    seeds = _integers([0] if seeds is None else seeds, "seeds")
+    _integers([bank_seed], "bank_seed")
+    nfe = _integers(([1, 2] if smoke else NFES) if nfe is None else nfe, "nfe", 1)
+    if smoke and any(v is not None for v in (device, steps, superset_size, partition_counts, scale_weights)):
+        raise ValueError("--smoke supplies its own device, steps, bank size and partition settings")
+    if steps is not None:
+        _integers([steps], "steps", 1)
+    directory = Path(output_root or ROOT / "experiment_manifests")
+    if not directory.is_absolute():
+        directory = ROOT / directory
+    directory = directory.resolve() / f"multiscale_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
+    # Validate all proposed settings before creating an experiment directory.
+    proposed = []
+    for dataset in datasets:
+        config = _read_yaml(ROOT / "multiscale_experiments" / f"{dataset}.yaml")
+        config["dataset"], config["coupling"] = dataset, METHOD
+        options = config[METHOD]
+        options["cache_seed"] = bank_seed
+        if device is not None:
+            config["device"] = device
+        if steps is not None:
+            config["training"]["num_steps"] = steps
+        if superset_size is not None:
+            options["superset_size"] = superset_size
+        if partition_counts is not None:
+            options["partition_counts"] = list(partition_counts)
+        if scale_weights is not None:
+            options["scale_weights"] = list(scale_weights)
+        if smoke:
+            config["device"] = "cpu"
+            config["data"].update(batch_size=2, n_points=16)
+            config["model"].update(d_model=8, nhead=2, num_layers=1, dim_feedforward=16)
+            config["training"].update(num_steps=2, log_every=1)
+            config["evaluation"].update(batch_size=6, histogram_bins=16)
+            options.update(superset_size=64, partition_counts=[2, 4, 8], scale_weights=[1.0, 1.0, 1.0])
+        settings(config)
+        options["cache"] = str(_cache_path(config, dataset, METHOD))
+        proposed.append((dataset, "multiscale", config))
+        if with_nsot:
+            for beta in (0.0, 0.2):
+                baseline = copy.deepcopy(config)
+                baseline.pop(METHOD)
+                baseline["coupling"] = "nsot"
+                baseline["nsot"] = {"cache": "pending", "superset_size": options["superset_size"],
+                                    "cache_seed": bank_seed, "beta": beta,
+                                    "solver": "scipy_linear_sum_assignment"}
+                from nsot import settings as nsot_settings
+                nsot_settings(baseline)
+                baseline["nsot"]["cache"] = str(_cache_path(baseline, dataset, "nsot"))
+                proposed.append((dataset, "nsot_beta0" if beta == 0 else "nsot_beta02", baseline))
+    directory.mkdir(parents=True, exist_ok=False)
+    jobs = []
+    for dataset, label, config in proposed:
+        for seed in seeds:
+            job_config = copy.deepcopy(config)
+            job_config["seed"] = seed
+            job_config["checkpoint"] = f"{dataset}_{label}_bank{bank_seed}_seed{seed}.pt"
+            config_path = directory / f"{dataset}_{label}_seed{seed}.yaml"
+            with config_path.open("x", encoding="utf-8") as stream:
+                yaml.safe_dump(job_config, stream, sort_keys=False)
+            jobs.append({"dataset": dataset, "label": label, "seed": seed,
+                         "config": str(config_path), "config_sha256": file_sha256(config_path),
+                         "bank": None, "run": None, "evaluations": {}})
+    manifest = {"format": FORMAT, "created_at": datetime.now(timezone.utc).isoformat(),
+                "smoke": smoke, "datasets": datasets, "bank_seed": bank_seed,
+                "training_seeds": seeds, "with_nsot": with_nsot, "evaluation_nfes": nfe,
+                "protocol": {"matching": "multiscale patch Wasserstein cost, restricted block permutation",
+                             "source": "original standard Gaussian bank; fresh Gaussian inference",
+                             "model_training": "unchanged original checkerboard/horse baseline settings unless overridden",
+                             "online_perturbation": "none for multiscale; beta0 and beta0.2 controls only if requested",
+                             "marginals": "exact finite empirical endpoints; not exact population marginals",
+                             "timing": "precompute shared once per unique bank; training loop and inference separately"},
+                "endpoint_checks": {}, "jobs": jobs}
+    path = directory / "manifest.json"
+    save_manifest(path, manifest)
+    print(f"experiment_manifest={path}", flush=True)
+    print(f"planned_models={len(jobs)} smoke={smoke}; prepare stage does not train", flush=True)
+    return path, manifest
+
+
+def verify_job(job):
+    path = Path(job["config"])
+    if file_sha256(path) != job["config_sha256"]:
+        raise ValueError(f"Prepared YAML changed: {path}; start a new experiment")
+    config = _read_yaml(path)
+    if config["coupling"] not in ("multiscale_wasserstein", "nsot") or config["dataset"] != job["dataset"]:
+        raise ValueError("Manifest/config dataset or method mismatch")
+    if job["bank"]:
+        bank = job["bank"]
+        if file_sha256(bank["path"]) != bank["sha256"]:
+            raise ValueError(f"Prepared bank changed: {bank['path']}")
+        if config[config["coupling"]].get("cache_sha256") != bank["sha256"]:
+            raise ValueError("Prepared YAML and manifest disagree about bank hash")
+    if job["run"]:
+        for name in ("config", "checkpoint", "training_metadata"):
+            item = job["run"][name]
+            if file_sha256(item["path"]) != item["sha256"]:
+                raise ValueError(f"Saved training artifact changed: {item['path']}")
+    for result in job["evaluations"].values():
+        for item in result.values():
+            if file_sha256(item["path"]) != item["sha256"]:
+                raise ValueError(f"Evaluation artifact changed: {item['path']}")
+    return config
+
+
+def prepare_jobs(path, manifest):
+    for job in manifest["jobs"]:
+        config = verify_job(job)
+        if job["bank"] is not None:
+            continue
+        if config["coupling"] == "nsot":
+            from nsot import prepare
+        else:
+            from multiscale_wasserstein import prepare
+        with project_directory():
+            cache, metadata = prepare(config, job["dataset"])
+        cache = cache.resolve()
+        digest = file_sha256(cache)
+        config[config["coupling"]]["cache_sha256"] = digest
+        # Keep the input YAML immutable. If interrupted before the manifest update,
+        # the unreferenced prepared YAML can be verified and adopted on resume.
+        prepared_path = Path(job["config"]).with_name(Path(job["config"]).stem + "_prepared.yaml")
+        serialized = yaml.safe_dump(config, sort_keys=False)
+        if prepared_path.exists():
+            if _read_yaml(prepared_path) != config:
+                raise ValueError(f"Stale prepared config disagrees with current bank: {prepared_path}")
+        else:
+            with prepared_path.open("x", encoding="utf-8") as stream:
+                stream.write(serialized)
+        job["config"] = str(prepared_path)
+        job["config_sha256"] = file_sha256(prepared_path)
+        job["bank"] = {"path": str(cache), "sha256": digest,
+                       "precompute_seconds": metadata["precompute_seconds"], "metadata": metadata}
+        save_manifest(path, manifest)
+    if manifest["with_nsot"]:
+        for dataset in manifest["datasets"]:
+            entries = [j for j in manifest["jobs"] if j["dataset"] == dataset]
+            ms = next(j for j in entries if j["label"] == "multiscale")
+            ns = next(j for j in entries if j["label"] == "nsot_beta0")
+            with np.load(ms["bank"]["path"], allow_pickle=False) as left, np.load(ns["bank"]["path"], allow_pickle=False) as right:
+                for key in ("source", "target"):
+                    if not np.array_equal(left[key], right[key]):
+                        raise ValueError(f"{dataset}: multiscale and NSOT {key} endpoints differ")
+            manifest["endpoint_checks"][dataset] = {"same_source": True, "same_target": True,
+                                                       "multiscale_bank_sha256": ms["bank"]["sha256"],
+                                                       "nsot_bank_sha256": ns["bank"]["sha256"]}
+        save_manifest(path, manifest)
+
+
+def _artifact(path):
+    path = Path(path).resolve()
+    return {"path": str(path), "sha256": file_sha256(path)}
+
+
+def train_jobs(path, manifest):
+    for job in manifest["jobs"]:
+        verify_job(job)
+        if job["bank"] is None:
+            raise ValueError("Bank preparation is incomplete")
+        if job["run"] is not None:
+            print(f"reused_completed_training={job['run']['config']['path']}", flush=True)
+            continue
+        if job["dataset"] == "horse":
+            from train_horse import main as train
+        else:
+            from train import main as train
+        print(f"training={job['dataset']}/{job['label']} seed={job['seed']}", flush=True)
+        with project_directory():
+            directory = Path(train(job["config"])).resolve()
+        saved = _read_yaml(directory / "config.yaml")
+        job["run"] = {"config": _artifact(directory / "config.yaml"),
+                      "checkpoint": _artifact(directory / saved["checkpoint"]),
+                      "training_metadata": _artifact(directory / "training.json")}
+        save_manifest(path, manifest)
+
+
+def evaluate_jobs(path, manifest):
+    for job in manifest["jobs"]:
+        verify_job(job)
+        if job["run"] is None:
+            raise ValueError("Run --stage train/all before evaluation")
+        if job["dataset"] == "horse":
+            from eval_horse import main as evaluate
+        else:
+            from eval import main as evaluate
+        for nfe in manifest["evaluation_nfes"]:
+            existing = job["evaluations"].get(str(nfe))
+            if existing:
+                for artifact in existing.values():
+                    if file_sha256(artifact["path"]) != artifact["sha256"]:
+                        raise ValueError(f"Evaluation artifact changed: {artifact['path']}")
+                continue
+            with project_directory():
+                image = Path(evaluate(job["run"]["config"]["path"], nfe)).resolve()
+            job["evaluations"][str(nfe)] = {"json": _artifact(image.with_suffix(".json")),
+                                            "png": _artifact(image)}
+            save_manifest(path, manifest)
+
+
+def write_summary(path, manifest):
+    banks, rows = {}, []
+    for job in manifest["jobs"]:
+        verify_job(job)
+        if job["bank"]:
+            banks[job["bank"]["path"]] = {"sha256": job["bank"]["sha256"],
+                                          "precompute_seconds": job["bank"]["precompute_seconds"]}
+        row = {"dataset": job["dataset"], "method": job["label"], "seed": job["seed"],
+               "bank": job["bank"]["path"] if job["bank"] else None,
+               "training_seconds": None, "evaluations": {}}
+        if job["run"]:
+            with Path(job["run"]["training_metadata"]["path"]).open(encoding="utf-8") as stream:
+                row["training_seconds"] = json.load(stream)["training_seconds"]
+        for nfe, artifacts in job["evaluations"].items():
+            with Path(artifacts["json"]["path"]).open(encoding="utf-8") as stream:
+                result = json.load(stream)
+            # Retain the standard evaluator's complete metric schema, including horse ROI metrics.
+            row["evaluations"][nfe] = {"result": result, "json": artifacts["json"]["path"],
+                                        "png": artifacts["png"]["path"]}
+        rows.append(row)
+    save_manifest(path.parent / "summary.json", {"format": FORMAT, "smoke": manifest["smoke"],
+                                                  "banks": banks, "jobs": rows,
+                                                  "endpoint_checks": manifest["endpoint_checks"],
+                                                  "timing_note": "Precompute counted per unique bank, not per beta/seed; inference_seconds excludes rendering/metrics."})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stage", choices=("prepare", "train", "eval", "all"), default="prepare")
+    parser.add_argument("--manifest", help="Resume exact saved jobs without finding the latest run")
+    parser.add_argument("--datasets", nargs="+", choices=("checkerboard", "horse"))
+    parser.add_argument("--seeds", nargs="+", type=int)
+    parser.add_argument("--bank-seed", type=int)
+    parser.add_argument("--device")
+    parser.add_argument("--steps", type=int)
+    parser.add_argument("--superset-size", type=int)
+    parser.add_argument("--partition-counts", nargs="+", type=int)
+    parser.add_argument("--scale-weights", nargs="+", type=float)
+    parser.add_argument("--with-nsot", action="store_true", help="Also train matched-endpoint NSOT beta=0 and beta=0.2 controls")
+    parser.add_argument("--smoke", action="store_true", help="Tiny CPU two-update pipeline check; not a quality experiment")
+    parser.add_argument("--nfe", nargs="+", type=int)
+    args = parser.parse_args()
+    if args.stage == "eval" and not args.manifest:
+        parser.error("--stage eval requires --manifest for previously trained jobs")
+    if args.manifest:
+        if args.smoke or args.with_nsot or any(v is not None for v in (
+                args.datasets, args.seeds, args.bank_seed, args.device, args.steps,
+                args.superset_size, args.partition_counts, args.scale_weights)):
+            parser.error("With --manifest only --stage and --nfe may change")
+        path = Path(args.manifest).resolve()
+        with path.open(encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        if manifest.get("format") != FORMAT:
+            raise ValueError("Unsupported manifest format")
+        if args.nfe is not None:
+            additions = _integers(args.nfe, "nfe", 1)
+            manifest["evaluation_nfes"] = sorted(set(manifest["evaluation_nfes"]) | set(additions))
+            save_manifest(path, manifest)
+    else:
+        path, manifest = create_experiment(
+            datasets=args.datasets, seeds=args.seeds, bank_seed=args.bank_seed or 0,
+            device=args.device, steps=args.steps, superset_size=args.superset_size,
+            partition_counts=args.partition_counts, scale_weights=args.scale_weights,
+            with_nsot=args.with_nsot, smoke=args.smoke, nfe=args.nfe)
+    if manifest["smoke"]:
+        torch.set_num_threads(1)
+        print("SMOKE ONLY: M=64, N=16, CPU, two optimizer updates; not quality evidence", flush=True)
+    prepare_jobs(path, manifest)
+    if args.stage in ("train", "all"):
+        train_jobs(path, manifest)
+    if args.stage in ("eval", "all"):
+        evaluate_jobs(path, manifest)
+    write_summary(path, manifest)
+    print(f"experiment_manifest={path}", flush=True)
+    print(f"summary={path.parent / 'summary.json'}", flush=True)
+    if args.stage == "prepare":
+        print(f'next_command=python run_multiscale.py --manifest "{path}" --stage all', flush=True)
+
+
+if __name__ == "__main__":
+    main()

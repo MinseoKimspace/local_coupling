@@ -117,9 +117,9 @@ def fm_summary(model, config, data, batches, batch_size, seed):
     generator = torch.Generator(device=parameter.device).manual_seed(seed + 1)
     time_generator = torch.Generator(device=parameter.device).manual_seed(seed + 2)
     pair_sampler = None
-    if config["coupling"] == "wasserstein_bank":
-        from wasserstein_bank import WassersteinBankSampler
-        pair_sampler = WassersteinBankSampler(config, data.dataset, parameter.device, parameter.dtype)
+    if config["coupling"] == "multiscale_wasserstein":
+        from multiscale_wasserstein import MultiscaleWassersteinSampler
+        pair_sampler = MultiscaleWassersteinSampler(config, data.dataset, parameter.device, parameter.dtype)
     elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, data.dataset, parameter.device, parameter.dtype)

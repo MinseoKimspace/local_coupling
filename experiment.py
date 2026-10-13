@@ -27,8 +27,8 @@ def read_config(path):
     if config["coupling"] == "nsot":
         from nsot import settings as nsot_settings
         nsot_settings(config)
-    elif config["coupling"] == "wasserstein_bank":
-        from wasserstein_bank import settings as bank_settings
+    elif config["coupling"] == "multiscale_wasserstein":
+        from multiscale_wasserstein import settings as bank_settings
         bank_settings(config)
     return config
 
@@ -79,8 +79,7 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
         yaml.safe_dump(snapshot, file, sort_keys=False)
     with (run_dir / "training.json").open("x", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2, allow_nan=False)
-    eval_script = ("eval_wasserstein_bank.py" if dataset == "mixture2d"
-                   else "eval_horse.py" if dataset == "horse" else "eval.py")
+    eval_script = "eval_horse.py" if dataset == "horse" else "eval.py"
     print(f"checkpoint={checkpoint}")
     print(f"eval_command=python {eval_script} {run_dir / 'config.yaml'}")
     return run_dir
@@ -191,9 +190,14 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 def evaluation_title(config):
     method = config["coupling"]
-    if method == "wasserstein_bank":
-        bank = config["wasserstein_bank"]
-        method += "/" + (f"candidate_{bank['candidate_id']:02d}" if "candidate_id" in bank
-                         else bank.get("selector", "joint"))
+    if method == "multiscale_wasserstein":
+        bank = config["multiscale_wasserstein"]
+        partitions = "/".join(map(str, bank["partition_counts"]))
+        return (f"MS-W2 | M={bank['superset_size']} | P={partitions}\n"
+                f"N={config['data']['n_points']} | seed={config['seed']}")
+    if method == "nsot":
+        bank = config["nsot"]
+        return (f"NSOT | M={bank['superset_size']} | beta={bank['beta']:g}\n"
+                f"N={config['data']['n_points']} | seed={config['seed']}")
     return (f"{method} | K={config.get('num_regions', 'na')} | "
             f"N={config['data']['n_points']} | seed={config['seed']}")
