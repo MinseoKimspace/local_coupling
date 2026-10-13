@@ -68,7 +68,13 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
     generator = torch.Generator(device=device).manual_seed(config["seed"] + 1)
     np.random.seed(config["seed"] + 1)  # Original upstream OT samplers use NumPy.
     pair_sampler = None
-    if config["coupling"] == "multiscale_wasserstein":
+    if config["coupling"] == "multiscale_refined":
+        from multiscale_refinement import MultiscaleRefinedSampler
+        pair_sampler = MultiscaleRefinedSampler(config, dataset, device, next(model.parameters()).dtype)
+        config["multiscale_refined"]["cache_sha256"] = pair_sampler.cache_sha256
+        config["multiscale_wasserstein"]["cache_sha256"] = pair_sampler.metadata["base_cache_sha256"]
+        print(f"multiscale_refined_cache_sha256={pair_sampler.cache_sha256}", flush=True)
+    elif config["coupling"] == "multiscale_wasserstein":
         from multiscale_wasserstein import MultiscaleWassersteinSampler
         pair_sampler = MultiscaleWassersteinSampler(config, dataset, device, next(model.parameters()).dtype)
         config["multiscale_wasserstein"]["cache_sha256"] = pair_sampler.cache_sha256

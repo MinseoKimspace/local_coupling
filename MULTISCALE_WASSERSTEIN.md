@@ -68,6 +68,74 @@ python run_multiscale.py --smoke --with-nsot --stage all
 
 Smoke uses CPU, M=64, N=16, partition counts [2,4,8], a tiny model, batch size 2, two updates and NFE 1/2. It does not establish generation quality.
 
+## Optional sparse cross-leaf refinement comparison
+
+The original multiscale method and default commands are unchanged. To compare it with a refined bank from scratch:
+
+```powershell
+python run_multiscale.py --with-refinement --stage all --device cuda
+```
+
+This trains **four models**: original multiscale and refined multiscale on checkerboard and horse. It changes only the fixed offline pairing bank. Both branches retain the same original endpoint arrays, M, architecture, optimizer, learning rate, steps and training seed. Inference still starts from fresh Gaussian points with no patch labels. Add `--with-nsot` only if the additional NSOT beta=0/0.2 controls are desired (eight total models).
+
+### Reuse existing completed experiments
+
+To keep your already trained baseline model and results, use its original manifest:
+
+```powershell
+python run_multiscale.py --manifest "PATH_TO_ORIGINAL_MANIFEST" --add-refinement --stage all
+```
+
+This creates a **new** manifest referencing the verified original bank/checkpoint/evaluations and adds refined jobs. The original manifest, YAMLs and baseline artifacts are not overwritten. Completed baseline training/evaluations are reused; only missing jobs/results run. If the original manifest was only prepared but not trained, its baseline still needs training. The cloned experiment uses the original saved device and training settings, so do not add `--device`, `--steps`, or other baseline overrides.
+
+The runner prints the new `cloned_manifest=...` path. To continue that comparison, resume the **new** path without `--add-refinement`:
+
+```powershell
+python run_multiscale.py --manifest "PATH_TO_CLONED_MANIFEST" --stage all
+```
+
+Preparation only and the zero-refinement identity control:
+
+```powershell
+python run_multiscale.py --manifest "PATH_TO_ORIGINAL_MANIFEST" --add-refinement
+python run_multiscale.py --with-refinement --refinement-neighbors 0 --stage all --device cuda
+python run_multiscale.py --smoke --with-refinement --stage all
+```
+
+`--refinement-neighbors` defaults to 8 and is set only when creating/adding refinement. A resumed comparison keeps its saved setting. For a different neighbor count, create another comparison from the original baseline manifest rather than editing a prepared YAML.
+
+### Refinement algorithm and scope
+
+- Start from the exact prepared baseline permutation. Preserve **all point-to-point candidate edges inside its matched finest patch blocks**, not just the selected permutation edges.
+- In source space, query each point's k nearest other source points and retain those lying in different source leaves. Add symmetric swapped-target edges using their existing partners. Repeat in target space using the inverse permutation and different target leaves. This filters ordinary kNN; it does not search until k cross-leaf neighbors have been found.
+- Solve one full sparse bipartite assignment on the combined candidate graph. Keeping the original edges guarantees that a feasible bijection exists. Target coordinates are neither averaged nor moved. `neighbors=0` returns the exact baseline permutation as a no-refinement control.
+- The cost is the normalized weighted sum of original non-leaf ancestor-patch W2 costs plus the finest weight times pointwise squared Euclidean distance. On the original block-optimal assignment, this equals the baseline multiscale objective. Refinement relaxes the leaf-block restriction; it does not silently replace that objective by global Euclidean OT or add a second copy of the finest-scale cost.
+
+This is **offline sparse-support refinement**, not a training-time proximal update, stochastic diffusion, or a reproduction of the complete Gerber--Maggioni algorithm. It does not implement the paper's scale-by-scale capacity propagation or potential-based support search. “Exact” here means optimal assignment **on the retained graph for this specified cost**, not global unconstrained Wasserstein OT. A non-increasing objective does not guarantee better CD, smaller Jacobian, or fewer visual artifacts.
+
+The runner verifies byte-identical original source/target arrays, the original permutation hash and the exact baseline cache file hash. Refined cache identity includes that baseline file hash, refinement parameters, and the refinement/cost implementation hashes. Reusing a baseline manifest does not regenerate its original bank just because source code has since changed.
+
+At M=10,000 and 100 finest leaves, retaining all original blocks uses 1,000,000 edges. With k=8, the conservative pre-deduplication upper bound is 1,320,000 edges, below the default 2,000,000 guard. Sparse does not mean linear-time or zero-overhead: graph storage, exact sparse assignment and recomputed coarse patch costs still cost CPU time/memory. The edge guard is not a total process memory limit.
+
+### Paired report and timing
+
+`summary.json` adds `paired_refinement` entries for each matching dataset/seed/NFE. They include baseline/refined CD, leakage, histogram JS, checkerboard mass error and all available horse ROI metrics, with **refined minus baseline** deltas. Negative is favorable for error metrics, but not automatically for raw ROI mass. Metric/evaluation-setting mismatches suppress quality deltas rather than presenting an unfair comparison.
+
+Baseline preprocessing is counted once per unique original bank. Refined `precompute_seconds` measures **incremental** loading/coarse-cost reconstruction/graph refinement only; stored `base_precompute_seconds` is not counted a second time. `unique_precompute_seconds` sums distinct base and incremental preparation costs across the comparison, not wall-clock time spent during a resumed command. Training and per-NFE inference times remain separate. These are single-run comparisons unless multiple seeds are requested; no statistical improvement is claimed automatically.
+
+### Optional matched Jacobian audit
+
+The standard FM and full-cloud Jacobian diagnostic tools also support the refined method. Jacobian measurement is **not** run automatically by `--stage all`. After training, use the saved run configs referenced by the comparison manifest, not the pre-training experiment YAMLs:
+
+```powershell
+python audit_jacobian.py "BASELINE_RUN/config.yaml" --dataset horse --scope both --clouds 16 --probes 16 --rollout-steps 256 --seed 2026
+python audit_jacobian.py "REFINED_RUN/config.yaml" --dataset horse --scope both --clouds 16 --probes 16 --rollout-steps 256 --seed 2026
+```
+
+Replace both placeholder paths with their actual saved run directories; for checkerboard, use its two run configs and `--dataset checkerboard`. Keep the audit seed, N, cloud count, probes, times and rollout resolution equal across methods. `scope=both` requires each method's own training cache; `scope=rollout` and normal generation evaluation do not. The comparison runner itself still verifies both banks when resuming a manifest.
+
+Inspect mean, median and per-cloud outliers separately for coupling and rollout. A smaller Jacobian alone is not a success criterion: require preserved low-NFE quality and improved high-NFE CD/leakage/thin-region metrics. The paper motivates support expansion, not a theorem linking this refinement to flow quality: [Gerber and Maggioni, 2017](https://arxiv.org/abs/1708.02469). The sparse assignment implementation uses [SciPy's full bipartite matching solver](https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csgraph.min_weight_full_bipartite_matching.html).
+
 ## Matching construction
 
 1. Draw one standard Gaussian source superset and one target superset with the same isolated sampler and cache seed as the existing 2D NSOT implementation. Keep both arrays unchanged.

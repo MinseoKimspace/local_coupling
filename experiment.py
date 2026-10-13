@@ -30,6 +30,9 @@ def read_config(path):
     elif config["coupling"] == "multiscale_wasserstein":
         from multiscale_wasserstein import settings as bank_settings
         bank_settings(config)
+    elif config["coupling"] == "multiscale_refined":
+        from multiscale_refinement import settings as bank_settings
+        bank_settings(config)
     return config
 
 
@@ -190,6 +193,11 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 def evaluation_title(config):
     method = config["coupling"]
+    if method == "multiscale_refined":
+        bank = config["multiscale_wasserstein"]
+        neighbors = config["multiscale_refined"].get("neighbors", 8)
+        return (f"MS-W2 + cross-leaf k={neighbors} | M={bank['superset_size']}\n"
+                f"N={config['data']['n_points']} | seed={config['seed']}")
     if method == "multiscale_wasserstein":
         bank = config["multiscale_wasserstein"]
         partitions = "/".join(map(str, bank["partition_counts"]))
