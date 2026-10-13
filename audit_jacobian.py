@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from coupling import OFFLINE_METHODS, TG_OFFLINE_METHODS
+from coupling import OFFLINE_METHODS, TG_CACHED_METHODS
 from diagnostic_data import DiagnosticData, diagnostic_metadata, load_verified_model, tensor_sha256
 from experiment import evaluation_title, synchronize
 from summarize_results import output_directory, plt, save_json, statistics
@@ -160,14 +160,17 @@ def rollout_snapshots(model, source, times, steps):
 
 def _cached_pairs(config, dataset, data, clouds):
     parameter_device, dtype = data.device, data.dtype
-    if config["coupling"] in TG_OFFLINE_METHODS:
-        from tg_cache import make_pair_sampler
-        sampler = make_pair_sampler(config, dataset, parameter_device, dtype)
+    if config["coupling"] in TG_CACHED_METHODS:
+        from tg_cache import TGCachedPairSampler
+        sampler = TGCachedPairSampler(config, dataset, parameter_device, dtype)
     elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         sampler = NSOTPairSampler(config, dataset, parameter_device, dtype)
+    elif config["coupling"] == "wasserstein_bank":
+        from wasserstein_bank import WassersteinBankSampler
+        sampler = WassersteinBankSampler(config, dataset, parameter_device, dtype)
     else:
-        raise ValueError("coupling scope requires cached/superset TG or nsot; use rollout for other methods")
+        raise ValueError("coupling scope requires an offline bank coupling; use rollout for other methods")
     sources, targets = [], []
     try:
         for index in range(clouds):
@@ -234,7 +237,7 @@ def audit(config_path, dataset, *, scope="rollout", clouds=16, times=TIMES, prob
     if method == "exact" and dimension > max_exact_dim:
         raise ValueError("Exact Jacobian exceeds max_exact_dim; use --method hutchinson or explicitly raise --max-exact-dim")
     if scope != "rollout" and config["coupling"] not in OFFLINE_METHODS:
-        raise ValueError("coupling scope requires cached/superset TG or nsot; use rollout for other methods")
+        raise ValueError("coupling scope requires an offline bank coupling; use rollout for other methods")
     data = DiagnosticData(config, dataset, parameter.device, parameter.dtype, seed)
     synchronize(parameter.device)
     start = perf_counter()
@@ -296,7 +299,7 @@ def audit(config_path, dataset, *, scope="rollout", clouds=16, times=TIMES, prob
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Full-cloud spatial Jacobian Frobenius norm; no training or checkpoint edits.")
     parser.add_argument("config", help="Saved runs/.../config.yaml matching the checkpoint")
-    parser.add_argument("--dataset", required=True, choices=("horse", "checkerboard"))
+    parser.add_argument("--dataset", required=True, choices=("horse", "checkerboard", "mixture2d"))
     parser.add_argument("--scope", choices=("rollout", "coupling", "both"), default="rollout")
     parser.add_argument("--clouds", type=int, default=16)
     parser.add_argument("--times", type=float, nargs="+", default=list(TIMES))

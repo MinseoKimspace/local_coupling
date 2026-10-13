@@ -21,8 +21,8 @@ def tensor_sha256(tensor):
 
 
 def load_verified_model(config_path, dataset):
-    if dataset not in ("checkerboard", "horse"):
-        raise ValueError("Diagnostics support checkerboard and horse only")
+    if dataset not in ("checkerboard", "horse", "mixture2d"):
+        raise ValueError("Diagnostics support checkerboard, horse and mixture2d only")
     model_class = HorsePointSetTransformer if dataset == "horse" else PointSetTransformer
     model, config, checkpoint, metadata = load_model(config_path, model_class, dataset)
     if not metadata["training_config_verified"]:
@@ -42,8 +42,8 @@ class DiagnosticData:
 
     def __init__(self, config, dataset, device, dtype, seed):
         validate_gaussian_source(config)
-        if dataset not in ("checkerboard", "horse"):
-            raise ValueError("Expected checkerboard or horse")
+        if dataset not in ("checkerboard", "horse", "mixture2d"):
+            raise ValueError("Expected checkerboard, horse or mixture2d")
         self.config, self.dataset = config, dataset
         self.device, self.dtype, self.seed = torch.device(device), dtype, int(seed)
         self.n = int(config["data"]["n_points"])
@@ -59,6 +59,13 @@ class DiagnosticData:
                            dtype=self.dtype, generator=generator)[0]
 
     def target(self, index, purpose="evaluation"):
+        if self.dataset == "mixture2d":
+            from wasserstein_bank import dataset_spec, target_points
+            rng = np.random.default_rng(self.draw_seed(purpose + ":target", index))
+            shapes = dataset_spec(self.config, self.dataset)["shapes"]
+            shape = shapes[int(rng.integers(len(shapes)))]
+            return torch.as_tensor(target_points(self.config, self.dataset, shape, self.n, rng),
+                                   device=self.device, dtype=self.dtype)
         cuda_devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()] \
             if self.device.type == "cuda" else []
         # Use the original sampler without changing its API or global RNG state.

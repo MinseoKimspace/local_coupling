@@ -72,11 +72,13 @@ class TGCacheTests(unittest.TestCase):
             return tg_cache.prepare(config, dataset)
 
     def test_unknown_cache_options_are_rejected_without_preparation(self):
-        config = self.config()
-        config["tg_cache"]["obsolete_experiment"] = True
-        with self.assertRaisesRegex(ValueError, "Unsupported tg_cache settings"):
-            tg_cache.prepare(config, "checkerboard")
-        self.assertFalse(Path(config["tg_cache"]["path"]).exists())
+        for key, value in (("obsolete_experiment", True), ("beta", 0.1)):
+            with self.subTest(key=key):
+                config = self.config()
+                config["tg_cache"][key] = value
+                with self.assertRaisesRegex(ValueError, "Unsupported tg_cache settings"):
+                    tg_cache.prepare(config, "checkerboard")
+                self.assertFalse(Path(config["tg_cache"]["path"]).exists())
 
     def test_removed_source_settings_rejected_before_cache_creation(self):
         config = self.config()

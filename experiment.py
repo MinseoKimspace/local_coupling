@@ -27,9 +27,9 @@ def read_config(path):
     if config["coupling"] == "nsot":
         from nsot import settings as nsot_settings
         nsot_settings(config)
-    elif config["coupling"] == "target_guided_superset":
-        from tg_superset import settings
-        settings(config)
+    elif config["coupling"] == "wasserstein_bank":
+        from wasserstein_bank import settings as bank_settings
+        bank_settings(config)
     return config
 
 
@@ -59,10 +59,6 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     now = datetime.now(timezone.utc)
     method = canonical_method(config["coupling"])
     name = f"{dataset}_{method}_k{config.get('num_regions', 'na')}_n{config['data']['n_points']}_seed{config['seed']}"
-    section = "tg_superset" if method == "target_guided_superset" else "tg_cache"
-    beta = config.get(section, {}).get("beta", 0.0)
-    if method in ("target_guided_cached", "target_guided_superset"):
-        name += f"_beta{beta:g}"
     run_dir = Path("runs") / dataset / f"{name}_{now:%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     snapshot = copy.deepcopy(config)
@@ -83,7 +79,8 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
         yaml.safe_dump(snapshot, file, sort_keys=False)
     with (run_dir / "training.json").open("x", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2, allow_nan=False)
-    eval_script = "eval_horse.py" if dataset == "horse" else "eval.py"
+    eval_script = ("eval_wasserstein_bank.py" if dataset == "mixture2d"
+                   else "eval_horse.py" if dataset == "horse" else "eval.py")
     print(f"checkpoint={checkpoint}")
     print(f"eval_command=python {eval_script} {run_dir / 'config.yaml'}")
     return run_dir
@@ -194,8 +191,7 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 def evaluation_title(config):
     method = config["coupling"]
-    if method in ("target_guided_cached", "target_guided_superset"):
-        section = "tg_superset" if method == "target_guided_superset" else "tg_cache"
-        method += f" / beta={config.get(section, {}).get('beta', 0.0):g}"
+    if method == "wasserstein_bank":
+        method += "/" + config["wasserstein_bank"]["selector"]
     return (f"{method} | K={config.get('num_regions', 'na')} | "
             f"N={config['data']['n_points']} | seed={config['seed']}")

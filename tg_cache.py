@@ -3,13 +3,11 @@
 bank: reuse a finite paired-cloud bank with cached exact coarse assignments.
 stream: prepare the complete training stream; each cloud is used once.
 Neither mode requires online OT. Fine pairing is resampled on every visit.
-An optional Gaussian hybrid is applied AFTER pairing, without reassignment.
 Inference starts from fresh iid standard Gaussian, without the cache.
 """
 
 import hashlib
 import json
-import math
 from pathlib import Path
 import shutil
 from time import perf_counter
@@ -26,31 +24,7 @@ from nsot import dataset_spec, file_sha256
 METHODS = {"target_guided_cached"}
 FORMAT_VERSION = 1
 CONFIG_KEYS = {"path", "sampling", "num_clouds", "seed",
-               "prepare_batch_size", "num_workers", "cache_sha256", "beta"}
-
-
-def validate_beta(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) \
-            or not math.isfinite(value) or not 0 <= value <= 1:
-        raise ValueError("beta must be finite and in [0,1]")
-    return float(value)
-
-
-def hybrid_source(source, beta, *, generator=None):
-    """Change source AND the downstream FM velocity; never reassign patches."""
-    if beta == 0:
-        return source
-    noise = torch.randn(source.shape, device=source.device, dtype=source.dtype, generator=generator)
-    if beta == 1:
-        return noise
-    return math.sqrt(1 - beta) * source + math.sqrt(beta) * noise
-
-
-def make_pair_sampler(config, dataset, device, dtype, *, training=False):
-    if config["coupling"] == "target_guided_superset":
-        from tg_superset import TGSupersetPairSampler
-        return TGSupersetPairSampler(config, dataset, device, dtype, training=training)
-    return TGCachedPairSampler(config, dataset, device, dtype, training=training)
+               "prepare_batch_size", "num_workers", "cache_sha256"}
 
 
 def random_fine_permutation(source_labels, target_labels, k, rng):
@@ -100,7 +74,6 @@ def settings(config):
     workers = _integer(value.get("num_workers", 0), "tg_cache.num_workers", 0)
     validate_gaussian_source(config)
     result = {"method": method, "path": value["path"], "sampling": sampling,
-              "beta": validate_beta(value.get("beta", 0.0)),
               "num_clouds": count, "cache_seed": _integer(value.get("seed", 0), "tg_cache.seed", 0),
               "prepare_batch_size": _integer(value.get("prepare_batch_size", 64), "prepare_batch_size"),
               "num_workers": workers, "n_points": n, "num_regions": k}
@@ -113,7 +86,6 @@ def _spec(config, dataset, opts):
             "cache_seed": opts["cache_seed"], "prepare_batch_size": opts["prepare_batch_size"],
             "n_points": opts["n_points"], "num_regions": opts["num_regions"],
             "dataset_spec": dataset_spec(config, dataset)}
-    # beta is online-only. Preserve the v1 spec and reuse IDENTICAL geometry.
     return result
 
 
@@ -309,7 +281,6 @@ class TGCachedPairSampler:
     def __init__(self, config, dataset, device, dtype, *, training=False):
         start = perf_counter()
         opts = settings(config)
-        self.beta = opts["beta"]
         self.path, self.metadata, self.cache_sha256 = load_cache(config, dataset)
         self.device, self.dtype = torch.device(device), dtype
         self.dataset = _CloudDataset(self.path, self.metadata, config["seed"] + 1)
@@ -350,7 +321,7 @@ class TGCachedPairSampler:
                      for index in rng.integers(len(self.dataset), size=batch_size)]
             tensors = tuple(torch.stack(values) for values in zip(*pairs))
         source, target = (value.to(device=self.device, dtype=self.dtype, non_blocking=True) for value in tensors)
-        return hybrid_source(source, self.beta, generator=generator), target
+        return source, target
 
     def close(self):
         # DataLoader workers are scoped to this run, including exceptional exits.
@@ -371,10 +342,4 @@ class TGCachedPairSampler:
                 "cached_target_sha256": meta["array_sha256"]["target"],
                 "cached_target_partition_sha256": meta["array_sha256"]["target_labels"],
                 "precompute_source_sha256": meta["source_sha256"]}
-        result.update(beta=self.beta, hybrid="sqrt(1-beta)*source + sqrt(beta)*fresh_gaussian; no reassignment",
-                      source_coordinates="original draws" if self.beta == 0 else "Gaussian hybrid; source coordinates changed")
-        if self.beta > 0:
-            result["marginals_before_hybrid"] = result["marginals"]
-            result["marginals"] = ("target: original empirical cloud law; source: scaled empirical clouds plus "
-                                   "independent Gaussian noise; not exact population Gaussian unless beta=1")
         return result

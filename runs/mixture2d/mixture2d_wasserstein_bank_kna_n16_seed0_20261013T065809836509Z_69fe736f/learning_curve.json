@@ -1,0 +1,44 @@
+{
+  "validation_definition": "independent source and target supersets; same shape modes and candidate families; no holdout-based selection",
+  "validation_seed": 100003,
+  "history": [
+    {
+      "step": 1,
+      "training_loss": 0.6609675884246826,
+      "elapsed_seconds": 0.04756289999932051,
+      "validation_by_time": [
+        {
+          "time": 0.0,
+          "mse_per_coordinate": 0.5280677080154419
+        },
+        {
+          "time": 0.5,
+          "mse_per_coordinate": 0.48838672041893005
+        },
+        {
+          "time": 1.0,
+          "mse_per_coordinate": 0.4399058222770691
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "training_loss": 0.47135046124458313,
+      "elapsed_seconds": 0.05490959994494915,
+      "validation_by_time": [
+        {
+          "time": 0.0,
+          "mse_per_coordinate": 0.5107715725898743
+        },
+        {
+          "time": 0.5,
+          "mse_per_coordinate": 0.46842172741889954
+        },
+        {
+          "time": 1.0,
+          "mse_per_coordinate": 0.421399861574173
+        }
+      ]
+    }
+  ]
+}

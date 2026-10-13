@@ -75,7 +75,7 @@ def render(payload, path, directory):
 
 def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, reference_nfe=128,
              output="analysis_results"):
-    from coupling import CLOUD_METHODS, TG_OFFLINE_METHODS, coupled_points
+    from coupling import CLOUD_METHODS, TG_CACHED_METHODS, coupled_points
     from data import checkerboard_centers, sample_checkerboard
     from experiment import environment, load_model
     from model import PointSetTransformer
@@ -100,12 +100,15 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
     time_generator = torch.Generator(device=device).manual_seed(seed + 2)
     n = config["data"]["n_points"]
     pair_sampler = None
-    if config["coupling"] == "nsot":
+    if config["coupling"] == "wasserstein_bank":
+        from wasserstein_bank import WassersteinBankSampler
+        pair_sampler = WassersteinBankSampler(config, dataset, device, dtype)
+    elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, dataset, device, dtype)
-    elif config["coupling"] in TG_OFFLINE_METHODS:
-        from tg_cache import make_pair_sampler
-        pair_sampler = make_pair_sampler(config, dataset, device, dtype)
+    elif config["coupling"] in TG_CACHED_METHODS:
+        from tg_cache import TGCachedPairSampler
+        pair_sampler = TGCachedPairSampler(config, dataset, device, dtype)
     centers = None
     if dataset == "horse":
         mask = load_horse_mask(device, dtype)
