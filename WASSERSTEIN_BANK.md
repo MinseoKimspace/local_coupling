@@ -1,143 +1,268 @@
-# Wasserstein coupling-bank selection experiment
+# Wasserstein bank scores and coupling learnability
 
-This is a new 2D experiment independent of TG. It tests whether a score on a
-complete coupling bank predicts velocity ambiguity and actual neural learnability.
-It does not assert that Wasserstein consistency controls conditional variance or
-Jacobian norms. Full learning runs should be performed on the experiment machine.
+## Question, hypothesis, and decision rule
 
-## Run
+**Question:** Do scores computed before training predict which coupling bank a
+network learns well, beyond what squared transport cost already predicts?
 
-Run from the repository root, with the existing requirements installed.
-Preparation is the default stage: it creates banks/reports/configs, **not training**.
+**Hypothesis:** On common source/target supersets and the same candidate set,
+joint position–velocity Wasserstein scores predict held-out FM risk and final
+generation quality. TG is an external comparison method; no TG partition is
+required. A low Wasserstein score is not assumed to be low conditional variance.
 
-```powershell
-# Tiny CPU check: M=64, N=16, two updates, then fresh-Gaussian evaluation.
-python run_wasserstein_bank.py --smoke --stage all --nfe 1 2
-```
+**Primary scores:** `joint` at t=0 and `path_joint` integrated over the path.
+Other scores, alpha sweeps, and bandwidth diagnostics are secondary.
 
-```powershell
-# A/B/C plus random-bank, distance and local-variogram selection controls.
-python run_wasserstein_bank.py --stage prepare --selectors random transport displacement joint multiscale variance --seeds 0 1 2 --device cuda
-```
+**Primary endpoints, separately for checkerboard and horse:**
 
-The program prints `manifest=.../manifest.json` and the exact continuation command.
-Keep this manifest to resume completed jobs without preparing a different bank.
+- Final independent-bank validation FM MSE, integrated uniformly over t in [0,1]
+  with the trapezoidal rule on the saved nonuniform time grid.
+- Chamfer distance at NFE 128, using the existing dataset evaluator.
 
-```powershell
-python run_wasserstein_bank.py --manifest "experiment_manifests/PRINTED_DIRECTORY/manifest.json" --stage train
-python run_wasserstein_bank.py --manifest "experiment_manifests/PRINTED_DIRECTORY/manifest.json" --stage eval --nfe 1 2 4 8 16 32 64 128
-```
+**Decision rule:** A full study needs at least three complete bank seeds and all
+planned candidate × training-seed jobs. For a predeclared primary score, the same
+at least `ceil(2 * number_of_bank_seeds / 3)` bank seeds must show both lower mean
+selector regret than transport selection and positive transport-controlled rank
+correlation, for both primary endpoints. This is provisional exploratory support,
+not a significance test or universal guarantee. Ties with transport, disagreeing
+endpoints, or incomplete coverage do not pass. Secondary scores cannot replace a
+primary after seeing results. Pilot and smoke runs cannot support the primary claim.
 
-Or perform preparation, training and evaluation in one invocation:
+No generated-quality improvement is asserted by the implementation or its tests.
 
-```powershell
-python run_wasserstein_bank.py --stage all --selectors random transport displacement joint multiscale variance --seeds 0 1 2 --device cuda
-```
+## Run the checkerboard and horse study
 
-Dataset variants use the original model/training templates for checkerboard/horse:
+Run from the repository root on the experiment machine with the existing Python
+requirements installed. Both datasets run separately. Every candidate is trained;
+selectors are retrospective table lookups, without duplicate training per selector.
 
-```powershell
-python run_wasserstein_bank.py --dataset checkerboard --stage all --selectors random transport displacement joint multiscale variance --device cuda
-python run_wasserstein_bank.py --dataset horse --stage all --selectors random transport displacement joint multiscale variance --device cuda
-```
-
-Without `--selectors`, only A/B/C run. Without `--seeds`, training seed 0 runs.
-All selectors/seeds in an experiment share one preparation; its time must not be
-charged once per model when reporting total experiment cost. To test bank-seed
-robustness, change `cache_seed` in a copy of the YAML and prepare another experiment.
-With `--manifest`, saved settings are used; only stage and evaluation NFEs can change.
-
-## Bank and selection
-
-- Default: M=2,048 superset points, N=256 points per training cloud, eight candidates.
-- Every candidate contains **every target shape with equal probability**. A complete
-  bank is selected once for each criterion. Source-wise target dropping is not used.
-- All candidates share exactly the same source and target arrays. One common Gaussian
-  source superset is used for all shapes, avoiding shape-specific source-bank shifts.
-- Training draws one shape for each cloud, then samples paired indices independently
-  **with replacement** from its selected superset map. The network receives only
-  the current point cloud and time, never the shape ID or candidate ID.
-- The default mixture contains filled disk, annulus, and two separated disks. Fresh
-  targets use the same analytic laws. These are three shape modes, not three separate
-  training models. Single-horse/checkerboard runs do not test ambiguity between shapes.
-- Candidate families: random permutation, exact Euclidean assignment, three projected
-  sorting assignments, and three assignments with noise in the **cost construction**.
-  The latter never modify the stored/training coordinates. No TG partition is required.
-- Validation repeats these candidate families on independently drawn supersets. The
-  candidate ID selected on the selection split is retained; validation does not reselect.
-  This tests new points in the same modes, not generalization to unseen shape modes.
-- Superset mappings are fixed; training subsets are freshly sampled. Finite banks only
-  approximate population Gaussian/target laws. Inference uses fresh iid Gaussian noise.
-
-The A/B/C scorers compare uniformly sampled subsets of one candidate's empirical
-feature distribution with that candidate's complete **scoring pool**, not its entire
-dense superset. Pool indices, subset draws and projection directions are shared across
-candidates. The pool uses the same number of points from each shape.
-
-- A (`displacement`): mean W2 squared of displacement subsets, subset size 32.
-- B (`joint`): same score on `(x_t, alpha*u)`, size 32. Default `joint_times: [0.0]`
-  gives the proposed `(x_0, alpha*u)` definition. To test path-aware scoring, prepare a
-  separate configuration with e.g. `[0.25, 0.5, 0.75, 0.9]`. `alpha=velocity_weight`
-  is fixed across candidates; features are not normalized separately per candidate.
-- C (`multiscale`): joint scores at sizes 8/32/128, each divided by the same split's
-  random-candidate reference, then equally averaged. No scale may cover the whole pool,
-  which would give an identically zero consistency score.
-- `transport`: lowest mean squared displacement over all superset points and shapes.
-- `random`: one uniformly drawn candidate bank, not necessarily the random-permutation
-  candidate. Candidate 0 is always the random-permutation scale reference.
-- `variance`: smallest time-integrated **point-position velocity variogram proxy**.
-
-`backend: exact` uses POT's weighted empirical W2 squared (and checks convergence).
-`--backend sliced` uses explicitly labelled sliced W2 squared with shared directions;
-it is a different approximate criterion. Compare candidate rankings before scaling up.
-Dense candidate assignment is protected by `max_cost_mib`; the default experiment
-is not a 15K/PSF implementation. Existing TG/NSOT experiments remain separate baselines.
-The transport selector uses an exact bank without NSOT's hybrid Gaussian perturbation,
-so it must not be labelled a full NSOT reproduction.
-
-## What is measured
-
-The local velocity proxy is a row-normalized kernel average of
-`||u_i-u_j||^2 / (2*point_dim)` for nearby `x_t`, excluding self-pairs. It reports three
-bandwidths, effective neighbor counts, coverage, global values across shapes, and
-within-shape values. Their difference is **not** an exact variance decomposition.
-Finite bandwidth also penalizes legitimate mean-field variation. Point-position
-conditioning does not include all information available to the point-set Transformer.
-Consequently this proxy is not the model's exact irreducible FM loss.
-
-Reports include Spearman correlations and residual rank correlations controlling for
-transport cost. With eight candidates these are exploratory, not significance evidence.
-Selection and independent-superset reports use separate scoring draws. Actual training
-records train loss and fixed held-out coupling validation MSE by time, preserving
-training RNG and model mode. This validation risk includes both conditional ambiguity
-and approximation error; it cannot isolate them by itself. Candidates may legitimately
-tie or A/B/C may select the same bank; no artificial differences are introduced.
-
-Artifacts under the printed experiment directory:
-
-- `bank_scores.json`, `candidate_scores.csv`, `bank_diagnostics.png`;
-- one generated training YAML per selector/seed;
-- `manifest.json` with cache hash, selected candidate IDs and completed run locations;
-- `learning_curves.png` and, after evaluation, `summary.csv`.
-
-Each saved run contains verified checkpoint/config, `training.json`, and
-`learning_curve.json`. Standard checkerboard/horse evaluators work on those saved
-run configs. Mixture evaluation uses `eval_wasserstein_bank.py`, fresh stratified
-reference clouds and CD-based MMD/COV/1-NNA, plus a nearest-reference shape-mass proxy.
-MMD means Minimum Matching Distance. 1-NNA should be interpreted relative to 0.5;
-larger coverage is better. Mixture plots show individual clouds, not just pooled density.
-Inference timing excludes warmup, metrics and rendering. Online training time includes
-scheduled validation; preparation time is reported separately.
-
-The existing full-cloud Jacobian audit also accepts the new banks, including mixture2d:
+Preparation only is the default. It creates selection/validation banks and score
+reports, saves job configurations, and prints `study_manifest=.../manifest.json`:
 
 ```powershell
-python audit_jacobian.py "runs/mixture2d/PRINTED_RUN/config.yaml" --dataset mixture2d --scope both --clouds 16 --probes 8
+python run_wasserstein_study.py
 ```
 
-`rollout` uses fresh Gaussian inference; `coupling` measures paths from the selected
-training bank. Neither scope's Jacobian is the exact conditional velocity variance.
+The full default is **2 datasets × 8 candidates × 3 bank seeds × 3 training seeds
+= 144 models**, each with 10,000 optimizer updates. Preparation does not train
+them. To execute the full study explicitly:
 
-Select on the selection split, inspect robustness on independent supersets and multiple
-bank seeds, and judge generation at both low and sufficiently high NFE. A lower score
-or validation MSE alone does not establish better final density or thin structure.
+```powershell
+python run_wasserstein_study.py --stage all --device cuda
+```
+
+Start with a pilot comparing random assignment, exact OT, and cost-noise amplitude
+0.2 on both datasets:
+
+```powershell
+python run_wasserstein_study.py --pilot --stage all --device cuda
+```
+
+The pilot defaults to one bank seed and one training seed: **six full 10,000-update
+models**. It reduces candidate and seed counts, not training length. Add
+`--steps 1000` for a deliberately shorter pilot; that changes the original budget.
+
+A tiny CPU pipeline check runs both datasets, three candidates each, two updates,
+and NFE 1/2. It is not a quality experiment:
+
+```powershell
+python run_wasserstein_study.py --smoke --stage all
+```
+
+Keep the printed study manifest and resume without regenerating banks:
+
+```powershell
+python run_wasserstein_study.py --manifest "experiment_manifests/PRINTED_STUDY/manifest.json" --stage all
+python run_wasserstein_study.py --manifest "experiment_manifests/PRINTED_STUDY/manifest.json" --stage train
+python run_wasserstein_study.py --manifest "experiment_manifests/PRINTED_STUDY/manifest.json" --stage eval
+python run_wasserstein_study.py --manifest "experiment_manifests/PRINTED_STUDY/manifest.json" --stage report
+```
+
+With a study manifest, only `--stage` changes. Saved dataset, seeds, candidate
+family, budget, and NFE settings remain fixed. `report` reads existing artifacts
+and regenerates summaries without training. Incomplete coverage is reported.
+
+Optional axes are `--datasets checkerboard` or `--datasets horse`,
+`--bank-seeds 0 1 2`, and `--seeds 0 1 2`. Bank and training seeds are separate.
+The standard NFE sweep is `1 2 4 8 16 32 64 128`; a custom sweep without 128 leaves
+the primary generation endpoint incomplete.
+
+## Candidates and comparison conditions
+
+| Default ID | Assignment |
+|---|---|
+| 0 | Uniform random permutation |
+| 1 | Exact squared-Euclidean assignment |
+| 2, 3, 4 | Projection sorting at 0, pi/4, pi/2 |
+| 5, 6, 7 | Exact assignment with Gaussian cost noise of amplitude 0.05, 0.2, 0.5 |
+
+The optional ordered family uses random, exact, and eight cost-noise amplitudes:
+`0.01, 0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 1.0`.
+
+```powershell
+python run_wasserstein_study.py --family cost_noise --stage prepare
+```
+
+Its full default is **180 models**. Amplitudes share Gaussian draws within each
+bank split, so only the magnitude changes. Noise modifies assignment costs while
+stored and training coordinates stay unchanged. This is not NSOT's training-time
+hybrid source perturbation. No K-selection sweep is included.
+
+Candidates within a bank seed share identical source/target arrays, and each
+bijection uses every endpoint once. Validation uses independent supersets with
+the same candidate families; the selected ID is never reselected on validation.
+Training freshly samples paired indices with replacement from a fixed bank.
+Inference uses fresh iid Gaussian points, without a bank or candidate ID.
+
+Checkerboard/horse YAMLs match the existing TG/NSOT comparison's data sampler,
+N=256, batch size 64, model, optimizer, 10,000-update budget, and evaluator:
+
+- Checkerboard: width 128, 2 Transformer layers, learning rate 0.001.
+- Horse: width 256, 4 Transformer layers, learning rate 0.0003.
+- Both: AdamW, weight decay 0.01, dropout 0, float32, standard renders and NFE sweep.
+
+Data exposure is not identical: **this bank uses M=2,048; existing NSOT YAMLs use
+M=10,000**. Bank sampling and coupling also differ. The study records baseline
+template hashes and configuration matches, but does not retrain TG/NSOT baselines.
+Use their existing evaluator outputs for external comparison and report bank size.
+Finite empirical banks approximate, rather than exactly equal, population laws.
+
+## Scores and mathematical audit
+
+Wasserstein scores compare uniform subsets with the full **scoring pool**, not
+the entire dense superset. Default pool size is 256 per shape and subset sizes
+are 8/32/128. Pool indices, subset draws, and projection directions are shared
+across candidates.
+
+- `transport`: full-bank mean squared displacement.
+- `displacement` (A): mean subset-to-pool W2 squared on u, subset size 32.
+- `joint` (B): the same score on `(x_t, alpha*u)`, size 32. Default
+  `joint_times: [0.0]` uses source position.
+- `path_joint`: trapezoidal time integral of the joint score over
+  `variance_times: [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]`, divided by interval length.
+  It approximates uniform-time expectation, not the unweighted grid mean.
+- `multiscale` (C): joint scores at 8/32/128, normalized by the same split's
+  random-permutation-candidate score at each scale and equally averaged.
+- `variance`: integrated point-position local velocity variogram proxy.
+- `random`: uniformly selected candidate bank; it need not be candidate 0.
+
+`alpha_values: [0.25, 0.5, 1, 2, 4]` audits t=0 joint rankings with common draws.
+Alpha is not chosen using final performance. For exact W2 squared, alpha tending
+to zero gives the common source-only score and `B(alpha)/alpha^2` tends to A at
+large alpha. B itself does not tend to A. With positive-time positions, the small
+alpha scores can differ because x_t differs between candidates.
+
+For unchanged full-bank endpoints, mean displacement is fixed and
+`transport = ||mean(u)||^2 + trace(Cov(u))`. Reports include these moments and
+score–transport correlations. A scoring pool's mapped target subset varies by
+candidate, so its mean displacement need not be fixed. A is not assumed to equal
+transport; the collinearity audit measures redundancy.
+
+The exact t=0 fixed-bank Bayes floor is separate. With S uniform shapes, shared
+source indices k, and displacement u[s,k], its coordinate-averaged value is:
+
+```text
+R0 = mean over s, k, and coordinates of (u[s,k] - mean_s u[:,k])^2.
+```
+
+Shape and index draws are independent, so the source cloud gives no shape label.
+Identical source coordinates are pooled by the implementation. **For a single
+checkerboard or horse distribution with distinct source coordinates, R0 is zero
+for every candidate, including a random finite lookup.** It is marked uninformative
+for ranking and does not imply easy neural learning. The formula applies exactly
+at t=0 on a fixed finite bank, not at small positive time or to a population of
+freshly regenerated couplings.
+
+The variogram averages `||u_i-u_j||^2/(2*point_dim)` with row-normalized Gaussian
+weights on nearby x_t and excludes self-pairs. It reports bandwidths 0.05/0.1/0.2,
+effective neighbors, coverage, and global/within-shape values. Point-position
+conditioning omits cloud context. Finite bandwidth includes valid mean-field
+variation; at fixed finite sample size, shrinking bandwidth selects nearest
+neighbors. A nonzero plateau is not proof of irreducible ambiguity. h and h-squared
+asymptotic interpretations require extra dense-sample regularity assumptions and
+are not asserted here.
+
+`backend: exact` uses empirical W2 squared with POT and checks convergence.
+`--backend sliced` is explicitly labelled sliced W2 squared: a different criterion
+with shared directions. Dense assignments have a memory guard. This is a 2D
+experiment, not a 15K/PSF implementation.
+
+## Learnability, timing, and output
+
+All candidates are trained before selector results are looked up. Reports provide
+Spearman score–performance correlations, transport-controlled rank correlations,
+and regret relative to the retrospective endpoint-specific best candidate.
+Training seeds are paired, and bank seeds are reported separately. A/B/C selecting
+the same candidate is a valid outcome. Eight candidate methods are not eight
+independent statistical replicates; no p-values or significance claims are made.
+
+Validation is recorded at logging steps, 5% of updates, and the final update with
+isolated RNG and model evaluation mode. Independent-bank FM risk includes transfer
+to regenerated correspondences and does not isolate approximation error. Fresh
+generation CD is a separate primary endpoint.
+
+The early-validation selector uses only records at or before 5% of updates.
+Every candidate must be trained to that point; the report sums updates and online
+seconds. This is not a free pretraining score. Early and final validation reuse
+the holdout bank, which can favor this selector on the validation endpoint. The
+oracle is retrospective and cannot be deployed without knowing the outcomes.
+
+Preparation time, online time including validation, validation time, and online
+time excluding validation are reported separately. Validation is observational
+but has nonzero overhead. Shared bank preparation is not charged once per model.
+Inference timing follows the existing evaluator and excludes warmup, metrics,
+and rendering.
+
+Root study artifacts:
+
+- `manifest.json`: fixed axes, protocol references, claim, child paths.
+- `candidate_outcomes.csv`: per-bank/candidate/training-seed outcomes, timings,
+  and standard NFE quality measurements.
+- `selector_regret.csv`: score/transport/random/early-validation/oracle outcomes
+  and regret; random is included when its selected candidate was trained.
+- `predictivity.json`: correlations, completeness, primary/secondary roles, and
+  provisional decision status per dataset.
+
+Each child bank has `bank_scores.json` containing path/alpha/floor audits,
+`candidate_scores.csv`, `bank_diagnostics.png`, generated YAMLs, its manifest,
+`learning_curves.png`, and an evaluation `summary.csv`. Each model run retains its
+checkpoint, `config.yaml`, `training.json`, `learning_curve.json`, and normal
+checkerboard/horse evaluation JSONs and figures. Horse uses the existing ROI and
+background-gap metrics.
+
+## Standalone runner and existing results
+
+`run_wasserstein_bank.py` remains supported and now defaults to checkerboard.
+Explicit candidates on one bank can be run with:
+
+```powershell
+python run_wasserstein_bank.py --dataset checkerboard --candidates 0 1 6 --stage all --device cuda
+python run_wasserstein_bank.py --dataset horse --candidates 0 1 6 --stage all --device cuda
+```
+
+The legacy selector-only workflow is available, but cannot measure predictivity
+over untrained candidates:
+
+```powershell
+python run_wasserstein_bank.py --dataset horse --selectors random transport displacement joint path_joint multiscale variance --stage all --device cuda
+```
+
+Use child manifests with the standalone runner and the root study manifest with
+`run_wasserstein_study.py`; their formats differ. Standalone resume allows stage
+and NFE changes, while the study freezes NFE. Optional mixture2d runs remain in
+`wasserstein_experiments/mixture2d.yaml` and are outside the default study.
+
+The cache is now **v2**, including new audits and shared cost-noise draws. V1 cache
+paths fail validation and need new banks; automatic paths contain the updated
+specification hash. Existing results are not deleted. Do not relabel old scores
+as v2 or edit prepared job configurations to change an active study.
+
+The existing full-cloud Jacobian audit accepts saved Wasserstein run configs:
+
+```powershell
+python audit_jacobian.py "runs/horse/PRINTED_RUN/config.yaml" --dataset horse --scope both --clouds 16 --probes 8
+```
+
+`rollout` starts from fresh Gaussian noise and `coupling` uses the trained bank.
+Jacobian size is a diagnostic, not an exact conditional variance or a substitute
+for the predeclared generation endpoints.

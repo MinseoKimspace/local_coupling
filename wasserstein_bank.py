@@ -23,7 +23,7 @@ from nsot import dataset_spec as original_dataset_spec, file_sha256
 
 
 METHOD = "wasserstein_bank"
-SELECTORS = ("random", "transport", "displacement", "joint", "multiscale", "variance")
+SELECTORS = ("random", "transport", "displacement", "joint", "path_joint", "multiscale", "variance")
 SHAPES = ("disk", "ring", "two_disks", "cross")
 DEFAULT_CANDIDATES = [
     {"kind": "random"}, {"kind": "exact"},
@@ -38,6 +38,7 @@ DEFAULTS = {
     "superset_size": 2048, "cache_seed": 0, "backend": "exact",
     "pool_per_shape": 256, "subset_size": 32, "scales": [8, 32, 128],
     "repetitions": 8, "projections": 32, "velocity_weight": 1.0,
+    "alpha_values": [0.25, 0.5, 1.0, 2.0, 4.0],
     "joint_times": [0.0], "variance_times": [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0],
     "bandwidths": [0.05, 0.1, 0.2], "variance_bandwidth": 0.1,
     "max_cost_mib": 512, "candidates": DEFAULT_CANDIDATES,
@@ -54,7 +55,7 @@ def settings(config):
     if config.get("coupling") != METHOD or config["model"]["point_dim"] != 2:
         raise ValueError("wasserstein_bank currently supports 2D point-set models only")
     raw = config.get("wasserstein_bank", {})
-    unknown = raw.keys() - (DEFAULTS.keys() | {"cache", "cache_sha256", "selector"})
+    unknown = raw.keys() - (DEFAULTS.keys() | {"cache", "cache_sha256", "selector", "candidate_id"})
     if unknown:
         raise ValueError("Unknown wasserstein_bank settings: " + ", ".join(sorted(unknown)))
     opts = {**DEFAULTS, **raw}
@@ -75,7 +76,7 @@ def settings(config):
     for key in ("velocity_weight", "variance_bandwidth", "max_cost_mib"):
         if isinstance(opts[key], bool) or not math.isfinite(opts[key]) or opts[key] <= 0:
             raise ValueError(f"{key} must be positive and finite")
-    for key in ("joint_times", "variance_times", "bandwidths", "scales"):
+    for key in ("joint_times", "variance_times", "bandwidths", "scales", "alpha_values"):
         values = opts[key]
         if not isinstance(values, list) or not values or len(set(values)) != len(values):
             raise ValueError(f"{key} must be a nonempty list of distinct numbers")
@@ -89,6 +90,8 @@ def settings(config):
         raise ValueError("variance_times must contain at least two increasing times")
     if any(h <= 0 for h in opts["bandwidths"]) or opts["variance_bandwidth"] not in opts["bandwidths"]:
         raise ValueError("Positive bandwidths must include variance_bandwidth")
+    if any(alpha <= 0 for alpha in opts["alpha_values"]):
+        raise ValueError("alpha_values must be positive")
     candidates = opts["candidates"]
     if not isinstance(candidates, list) or len(candidates) < 2 or candidates[0] != {"kind": "random"}:
         raise ValueError("Provide >=2 candidates; candidate 0 must be random for scale normalization")
@@ -104,6 +107,10 @@ def settings(config):
                 raise ValueError("Candidate parameters must be finite numbers")
         if kind == "perturbed_exact" and candidate["noise_std"] <= 0:
             raise ValueError("noise_std must be positive")
+    if "candidate_id" in opts:
+        _positive_int(opts["candidate_id"], "candidate_id", 0)
+        if opts["candidate_id"] >= len(candidates):
+            raise ValueError("candidate_id exceeds available candidates")
     dataset = config.get("dataset", "checkerboard")
     spec = dataset_spec(config, dataset)
     pool_size = opts["pool_per_shape"] * len(spec.get("shapes", [dataset]))
@@ -226,6 +233,42 @@ def _correlation(x, y, control=None):
     return float(np.corrcoef(left, right)[0, 1])
 
 
+def integrated_curve(validation_by_time, value_key="mse_per_coordinate"):
+    """Duration-normalized trapezoidal integral on a strictly increasing time grid.
+
+    The result approximates a uniform-in-time expectation on the covered interval;
+    it is not an unweighted mean of samples on a nonuniform time grid.
+    """
+    if len(validation_by_time) < 2:
+        raise ValueError("A time integral requires at least two curve points")
+    times = np.asarray([row["time"] for row in validation_by_time], dtype=np.float64)
+    values = np.asarray([row[value_key] for row in validation_by_time], dtype=np.float64)
+    if not np.isfinite(times).all() or not np.isfinite(values).all() or np.any(np.diff(times) <= 0):
+        raise ValueError("Curve values must be finite and times strictly increasing")
+    return float(np.sum(np.diff(times) * (values[:-1] + values[1:]) / 2) / (times[-1] - times[0]))
+
+
+def fixed_bank_t0_bayes_mse(source, velocities):
+    """Exact t=0 per-coordinate Bayes risk for the current fixed-bank sampler.
+
+    Shape is uniform and independent of iid point-index draws, and all shapes share
+    the same source bank. Source-cloud context therefore cannot reveal shape. This
+    is an endpoint result, not a positive-time or population learnability estimate.
+    Repeated identical source coordinates are pooled rather than treated as IDs.
+    """
+    source = np.asarray(source, dtype=np.float64)
+    velocities = np.asarray(velocities, dtype=np.float64)
+    if source.ndim != 2 or velocities.ndim != 3 or velocities.shape[1:] != source.shape:
+        raise ValueError("Expected source [M,D] and velocities [S,M,D]")
+    if not len(source) or not len(velocities) or not np.isfinite(source).all() or not np.isfinite(velocities).all():
+        raise ValueError("Source and velocities must be nonempty and finite")
+    _, inverse, counts = np.unique(source, axis=0, return_inverse=True, return_counts=True)
+    conditional_mean = np.zeros((len(counts), source.shape[1]), dtype=np.float64)
+    np.add.at(conditional_mean, inverse, velocities.sum(axis=0))
+    conditional_mean /= (len(velocities) * counts[:, None])
+    return float(np.square(velocities - conditional_mean[inverse][None]).mean())
+
+
 def score_banks(source, targets, permutations, opts, seed):
     """Use common scoring indices/subsets/directions for every candidate."""
     rng = np.random.default_rng(seed)
@@ -240,17 +283,27 @@ def score_banks(source, targets, permutations, opts, seed):
         directions[dimension] = projection / np.linalg.norm(projection, axis=0, keepdims=True)
     rows = []
     for candidate_id, mappings in enumerate(permutations):
-        u = np.concatenate([targets[s, mappings[s, indices]] - source[indices] for s in range(n_shapes)]).astype(np.float64)
-        full_u = targets[np.arange(n_shapes)[:, None], mappings] - source[None]
+        full_u = targets[np.arange(n_shapes)[:, None], mappings].astype(np.float64) - source.astype(np.float64)[None]
+        u = full_u[:, indices].reshape(-1, source.shape[-1])
         def consistency(features, size):
             return float(np.mean([wasserstein_squared(features[part], features, opts["backend"],
                                                         directions[features.shape[1]]) for part in subsets[size]]))
         displacement = consistency(u, opts["subset_size"])
+        joint_cache = {}
+        def joint_score(size, t, alpha):
+            key = (size, float(t), float(alpha))
+            if key not in joint_cache:
+                joint_cache[key] = consistency(np.concatenate((x + t * u, alpha * u), 1), size)
+            return joint_cache[key]
         joint_scales = {}
         for size in scales:
             joint_scales[str(size)] = float(np.mean([
-                consistency(np.concatenate((x + t * u, opts["velocity_weight"] * u), 1), size)
+                joint_score(size, t, opts["velocity_weight"])
                 for t in opts["joint_times"]]))
+        alpha_audit = {str(float(alpha)): joint_score(opts["subset_size"], 0.0, alpha)
+                       for alpha in opts["alpha_values"]}
+        path_joint = [{"time": t, "score": joint_score(opts["subset_size"], t, opts["velocity_weight"])}
+                      for t in opts["variance_times"]]
         path = []
         for t in opts["variance_times"]:
             state = x + t * u
@@ -263,21 +316,38 @@ def score_banks(source, targets, permutations, opts, seed):
                              for s in range(n_shapes)]
                 bandwidth_results[str(h)] = {**global_value, "within_shape_mean": float(np.mean(per_shape))}
             path.append({"time": t, "bandwidths": bandwidth_results})
-        values = [p["bandwidths"][str(opts["variance_bandwidth"])]["value"] for p in path]
-        times = opts["variance_times"]
-        integral = float(np.trapz(values, times) / (times[-1] - times[0]))
+        integral = integrated_curve([{"time": p["time"], "value": p["bandwidths"][str(opts["variance_bandwidth"])]["value"]}
+                                     for p in path], "value")
+        mean_displacement = full_u.mean(axis=(0, 1))
+        covariance_trace = float(np.square(full_u - mean_displacement).sum(-1).mean())
         rows.append({"candidate": candidate_id, "specification": opts["candidates"][candidate_id],
-                     "transport": float(np.square(full_u.astype(np.float64)).sum(-1).mean()),
+                     "transport": float(np.square(full_u).sum(-1).mean()),
+                     "mean_displacement": mean_displacement.tolist(),
+                     "displacement_covariance_trace": covariance_trace,
+                     "t0_fixed_bank_bayes_mse_per_coordinate": fixed_bank_t0_bayes_mse(source, full_u),
+                     "t0_floor_informative": bool(n_shapes > 1 or len(np.unique(source, axis=0)) < len(source)),
                      "displacement": displacement, "joint": joint_scales[str(opts["subset_size"])],
+                     "joint_t0_by_alpha": alpha_audit,
+                     "path_joint": integrated_curve(path_joint, "score"), "path_joint_by_time": path_joint,
                      "joint_by_scale": joint_scales, "variance": integral, "variance_path": path})
     # Same random-candidate reference for all candidates; no per-candidate normalization.
     reference = {str(s): max(rows[0]["joint_by_scale"][str(s)], 1e-12) for s in opts["scales"]}
     for row in rows:
         row["multiscale"] = float(np.mean([row["joint_by_scale"][str(s)] / reference[str(s)] for s in opts["scales"]]))
     return {"candidates": rows, "scale_reference_random": reference,
+            "t0_floor_scope": "exact t=0, fixed finite bank, shared source, uniform shape sampling independent of point-index draws; not a positive-time or population floor",
+            "t0_floor_single_shape_note": "zero for every candidate with one shape and distinct source coordinates, including a random finite lookup; not informative for learnability ranking",
+            "path_joint_definition": "duration-normalized trapezoidal integral over variance_times, approximating uniform-time joint subset W2 squared",
+            "alpha_audit_definition": "t=0 joint subset W2 squared with shared pool/subset/projection draws; exact B(alpha)/alpha^2 approaches displacement score at large alpha",
+            "variogram_bandwidth_note": "finite-sample kernel bandwidth sensitivity; a small-bandwidth plateau does not identify irreducible ambiguity, and h or h^2 scaling requires additional dense-sample regularity assumptions",
             "correlations": {key: {"spearman_with_variogram": _correlation([r[key] for r in rows], [r["variance"] for r in rows]),
+                                    "spearman_with_transport": _correlation([r[key] for r in rows], [r["transport"] for r in rows]),
                                     "partial_rank_controlling_transport": _correlation([r[key] for r in rows], [r["variance"] for r in rows], [r["transport"] for r in rows])}
-                             for key in ("displacement", "joint", "multiscale")}}
+                             for key in ("displacement", "joint", "path_joint", "multiscale")},
+            "alpha_rank_correlations": {str(float(alpha)): {
+                "spearman_with_transport": _correlation([r["joint_t0_by_alpha"][str(float(alpha))] for r in rows], [r["transport"] for r in rows]),
+                "spearman_with_joint": _correlation([r["joint_t0_by_alpha"][str(float(alpha))] for r in rows], [r["joint"] for r in rows])}
+                for alpha in opts["alpha_values"]}}
 
 
 def select_candidates(report, seed):
@@ -290,7 +360,7 @@ def select_candidates(report, seed):
 
 def cache_spec(config, dataset):
     opts = settings(config)
-    return {"format_version": 1, "implementation": "complete_wasserstein_bank_2d_v1",
+    return {"format_version": 2, "implementation": "complete_wasserstein_bank_2d_v2",
             "dataset": dataset_spec(config, dataset),
             "settings": {key: opts[key] for key in DEFAULTS}}
 
@@ -344,7 +414,10 @@ def prepare(config, dataset):
         mappings = []
         for index, candidate in enumerate(opts["candidates"]):
             print(f"bank_split={prefix or 'selection_'} candidate={index} {candidate}", flush=True)
-            rng = np.random.default_rng(opts["cache_seed"] + offset + 1000 + index)
+            # Re-create one common noise stream at each amplitude so an ordered
+            # cost-noise sweep changes its magnitude, not its realization.
+            candidate_seed = 1500 if candidate["kind"] == "perturbed_exact" else 1000 + index
+            rng = np.random.default_rng(opts["cache_seed"] + offset + candidate_seed)
             mappings.append(np.stack([candidate_permutation(source, target, candidate, rng) for target in targets]))
         mappings = np.stack(mappings)
         arrays.update({prefix + "source": source, prefix + "targets": targets, prefix + "permutations": mappings})
@@ -357,6 +430,7 @@ def prepare(config, dataset):
                 "holdout_definition": "independent source and target supersets; same shape modes and candidate families; no holdout-based selection",
                 "marginals": "all candidates share unchanged finite empirical endpoints and uniform shape weights; population marginals are approximate",
                 "multiscale_definition": "equal mean of joint subset scores divided by the same split's random-candidate scale reference",
+                "cost_noise_definition": "perturbed_exact amplitudes share the same Gaussian cost-noise draws within each split; original endpoints remain unchanged",
                 "source_sha256": {name: file_sha256(Path(__file__).parent / name) for name in ("wasserstein_bank.py", "data.py", "train_horse.py")}}
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as stream:
@@ -372,8 +446,8 @@ class WassersteinBankSampler:
         self.opts = settings(config)
         arrays, self.metadata, self.cache_sha256 = load_cache(config, dataset)
         self.device, self.dtype = torch.device(device), dtype
-        self.selector = self.opts.get("selector", "joint")
-        self.selected = self.metadata["selected"][self.selector]
+        self.selector = "candidate" if "candidate_id" in self.opts else self.opts.get("selector", "joint")
+        self.selected = self.opts["candidate_id"] if self.selector == "candidate" else self.metadata["selected"][self.selector]
         self.arrays = {key: torch.as_tensor(value, device=device, dtype=(torch.long if "permutations" in key else dtype))
                        for key, value in arrays.items()}
         if self.device.type == "cuda":
@@ -407,6 +481,7 @@ class WassersteinBankSampler:
 
     def details(self):
         return {"cache_sha256": self.cache_sha256, "selector": self.selector,
+                "selection_mode": "explicit_candidate" if self.selector == "candidate" else "score_selector",
                 "selected_candidate": self.selected, "candidate_specification": self.opts["candidates"][self.selected],
                 "precompute_seconds": self.metadata["precompute_seconds"],
                 "cache_setup_seconds": self.setup_seconds,

@@ -192,6 +192,8 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 def evaluation_title(config):
     method = config["coupling"]
     if method == "wasserstein_bank":
-        method += "/" + config["wasserstein_bank"]["selector"]
+        bank = config["wasserstein_bank"]
+        method += "/" + (f"candidate_{bank['candidate_id']:02d}" if "candidate_id" in bank
+                         else bank.get("selector", "joint"))
     return (f"{method} | K={config.get('num_regions', 'na')} | "
             f"N={config['data']['n_points']} | seed={config['seed']}")

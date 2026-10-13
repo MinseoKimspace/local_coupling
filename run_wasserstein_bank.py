@@ -15,7 +15,7 @@ import yaml
 from experiment import read_config
 from model import PointSetTransformer
 from train import train_model
-from wasserstein_bank import METHOD, SELECTORS, cache_spec, file_sha256, prepare, settings
+from wasserstein_bank import METHOD, SELECTORS, cache_spec, file_sha256, integrated_curve, prepare, settings
 
 
 ROOT = Path(__file__).resolve().parent
@@ -32,12 +32,12 @@ def write_reports(directory, metadata):
     with (directory / "bank_scores.json").open("x", encoding="utf-8") as stream:
         json.dump(metadata, stream, indent=2, allow_nan=False)
     with (directory / "candidate_scores.csv").open("x", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=["split", "candidate", "kind", "transport", "displacement", "joint", "multiscale", "variance_proxy"])
+        writer = csv.DictWriter(stream, fieldnames=["split", "candidate", "kind", "transport", "displacement", "joint", "path_joint", "multiscale", "variance_proxy", "t0_fixed_bank_bayes_mse_per_coordinate"])
         writer.writeheader()
         for split, report in metadata["reports"].items():
             for row in report["candidates"]:
                 writer.writerow({"split": split, "candidate": row["candidate"], "kind": row["specification"]["kind"],
-                                 **{key: row[key] for key in ("transport", "displacement", "joint", "multiscale")},
+                                 **{key: row[key] for key in ("transport", "displacement", "joint", "path_joint", "multiscale", "t0_fixed_bank_bayes_mse_per_coordinate")},
                                  "variance_proxy": row["variance"]})
     import matplotlib
     matplotlib.use("Agg")
@@ -57,7 +57,8 @@ def write_reports(directory, metadata):
 
 
 def create_experiment(config_path, *, dataset=None, selectors=None, seeds=None, device=None, steps=None,
-                      superset_size=None, backend=None, output_root="experiment_manifests", smoke=False):
+                      superset_size=None, backend=None, output_root="experiment_manifests", smoke=False,
+                      candidate_ids=None, bank_seed=None, candidates=None):
     with Path(config_path).open(encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
     dataset = dataset or config.get("dataset", "mixture2d")
@@ -71,6 +72,14 @@ def create_experiment(config_path, *, dataset=None, selectors=None, seeds=None, 
         config = existing
     config["dataset"], config["coupling"] = dataset, METHOD
     opts = config["wasserstein_bank"]
+    if candidate_ids is not None and selectors is not None:
+        raise ValueError("Choose explicit candidate_ids or selectors, not both")
+    if bank_seed is not None:
+        opts["cache_seed"] = bank_seed
+    if candidates is not None:
+        opts["candidates"] = copy.deepcopy(candidates)
+    # This runner constructs each job's selection; stale template overrides must not leak.
+    opts.pop("candidate_id", None)
     if superset_size is not None:
         opts["superset_size"] = superset_size
     if backend is not None:
@@ -92,7 +101,19 @@ def create_experiment(config_path, *, dataset=None, selectors=None, seeds=None, 
             raise ValueError("steps must be positive")
         config["training"]["num_steps"] = steps
     opts.setdefault("selector", "joint")
-    settings(config)
+    checked = settings(config)
+    if candidate_ids is not None:
+        if (not candidate_ids or len(set(candidate_ids)) != len(candidate_ids)
+                or any(isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < len(checked["candidates"])
+                       for i in candidate_ids)):
+            raise ValueError("candidate_ids must be distinct valid candidate indices")
+    seeds = [0] if seeds is None else seeds
+    if not seeds or len(set(seeds)) != len(seeds) or any(isinstance(seed, bool) or not isinstance(seed, int)
+                                                       or seed < 0 or seed >= 2**32 - 1 for seed in seeds):
+        raise ValueError("Provide distinct nonnegative training seeds below 2**32-1")
+    selectors = selectors or ["displacement", "joint", "multiscale"]
+    if len(set(selectors)) != len(selectors) or any(selector not in SELECTORS for selector in selectors):
+        raise ValueError("Provide distinct known selectors")
     if opts.get("cache", "auto") == "auto":
         import hashlib
         digest = hashlib.sha256(json.dumps(cache_spec(config, dataset), sort_keys=True).encode()).hexdigest()[:16]
@@ -101,30 +122,33 @@ def create_experiment(config_path, *, dataset=None, selectors=None, seeds=None, 
         opts["cache"] = str(Path(opts["cache"]).resolve())
     cache_path, metadata = prepare(config, dataset)
     opts["cache_sha256"] = file_sha256(cache_path)
-    selectors = selectors or ["displacement", "joint", "multiscale"]
-    seeds = [0] if seeds is None else seeds
-    if len(set(seeds)) != len(seeds) or any(seed < 0 or seed >= 2**63 - 100003 for seed in seeds):
-        raise ValueError("Provide distinct nonnegative training seeds below 2**63-100003")
     directory = Path(output_root) / f"wasserstein_bank_{dataset}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
     directory.mkdir(parents=True, exist_ok=False)
     write_reports(directory, metadata)
     jobs = []
-    for selector in selectors:
-        if selector not in SELECTORS:
-            raise ValueError("Unknown selector")
+    choices = [(f"candidate_{i:02d}", i) for i in candidate_ids] if candidate_ids is not None else [
+        (selector, metadata["selected"][selector]) for selector in selectors]
+    for selector, candidate_id in choices:
         for seed in seeds:
             job_config = copy.deepcopy(config)
             job_config["seed"] = seed
-            job_config["wasserstein_bank"]["selector"] = selector
-            job_config["checkpoint"] = f"{dataset}_wasserstein_{selector}_seed{seed}.pt"
+            if candidate_ids is not None:
+                job_config["wasserstein_bank"]["candidate_id"] = candidate_id
+            else:
+                job_config["wasserstein_bank"]["selector"] = selector
+            job_config["checkpoint"] = f"{dataset}_wasserstein_{selector}_bank{checked['cache_seed']}_seed{seed}.pt"
             path = directory / f"{selector}_seed{seed}.yaml"
             with path.open("x", encoding="utf-8") as stream:
                 yaml.safe_dump(job_config, stream, sort_keys=False)
-            jobs.append({"selector": selector, "seed": seed, "config": str(path.resolve()),
+            jobs.append({"selector": selector, "candidate_id": candidate_id, "seed": seed, "config": str(path.resolve()),
+                         "config_sha256": file_sha256(path),
                          "run_config": None, "evaluations": {}})
     manifest = {"format": "wasserstein_bank_experiment_v1", "dataset": dataset,
                 "cache": str(cache_path.resolve()), "cache_sha256": opts["cache_sha256"],
                 "selected": metadata["selected"], "precompute_seconds": metadata["precompute_seconds"],
+                "bank_seed": checked["cache_seed"], "training_steps": config["training"]["num_steps"],
+                "planned_candidate_ids": list(candidate_ids) if candidate_ids is not None else None,
+                "mode": "candidates" if candidate_ids is not None else "selectors",
                 "jobs": jobs}
     path = directory / "manifest.json"
     save_manifest(path, manifest)
@@ -132,8 +156,14 @@ def create_experiment(config_path, *, dataset=None, selectors=None, seeds=None, 
     return path.resolve(), manifest
 
 
+def verify_job_config(job):
+    if job.get("config_sha256") and file_sha256(Path(job["config"])) != job["config_sha256"]:
+        raise ValueError("Prepared job config changed; start a new experiment rather than mixing settings")
+
+
 def train_jobs(path, manifest):
     for job in manifest["jobs"]:
+        verify_job_config(job)
         if job["run_config"] is not None:
             if not Path(job["run_config"]).is_file():
                 raise FileNotFoundError("Completed job's saved run config is missing")
@@ -164,6 +194,7 @@ def evaluate_jobs(path, manifest, nfe):
     else:
         from eval_wasserstein_bank import main as evaluate
     for job in manifest["jobs"]:
+        verify_job_config(job)
         if job["run_config"] is None:
             raise ValueError("Run --stage train before evaluation")
         for steps in nfe:
@@ -179,7 +210,7 @@ def evaluate_jobs(path, manifest, nfe):
             with Path(result_path).open(encoding="utf-8") as stream:
                 result = json.load(stream)
             rows.append({"selector": job["selector"], "seed": job["seed"], "nfe": int(steps),
-                         "selected_candidate": manifest["selected"][job["selector"]],
+                         "selected_candidate": job.get("candidate_id", manifest["selected"].get(job["selector"])),
                          "precompute_seconds_shared": manifest["precompute_seconds"],
                          **{key: result.get(key) for key in ("training_seconds", "inference_seconds", "chamfer", "leakage",
                                                             "histogram_js", "mmd_cd", "cov_cd", "one_nna_cd", "shape_mass_tv_proxy")}})
@@ -197,15 +228,17 @@ def plot_learning_curves(path, manifest):
     import matplotlib.pyplot as plt
     figure, axes = plt.subplots(1, 2, figsize=(11, 4))
     for job in manifest["jobs"]:
+        if job["run_config"] is None:
+            continue
         curve_path = Path(job["run_config"]).parent / "learning_curve.json"
         with curve_path.open(encoding="utf-8") as stream:
             history = json.load(stream)["history"]
         label = f"{job['selector']} seed={job['seed']}"
-        validation = [np.mean([p["mse_per_coordinate"] for p in row["validation_by_time"]]) for row in history]
+        validation = [integrated_curve(row["validation_by_time"]) for row in history]
         axes[0].plot([r["step"] for r in history], validation, label=label)
         axes[1].plot([r["elapsed_seconds"] for r in history], validation, label=label)
     for axis, xlabel in zip(axes, ("Optimizer updates", "Online seconds including validation")):
-        axis.set(xlabel=xlabel, ylabel="Holdout coupling validation MSE")
+        axis.set(xlabel=xlabel, ylabel="Time-integrated independent-bank MSE")
         axis.legend(fontsize=7)
     figure.tight_layout()
     figure.savefig(path.parent / "learning_curves.png", dpi=160)
@@ -214,11 +247,13 @@ def plot_learning_curves(path, manifest):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config", nargs="?", default=str(ROOT / "wasserstein_experiments/mixture2d.yaml"))
+    parser.add_argument("config", nargs="?", default=str(ROOT / "wasserstein_experiments/checkerboard.yaml"))
     parser.add_argument("--stage", choices=("prepare", "train", "eval", "all"), default="prepare")
     parser.add_argument("--manifest", help="Resume an existing experiment without regenerating configs/banks")
     parser.add_argument("--dataset", choices=("checkerboard", "horse", "mixture2d"))
     parser.add_argument("--selectors", nargs="+", choices=SELECTORS)
+    parser.add_argument("--candidates", nargs="+", type=int, help="Train explicit candidate IDs instead of selector winners")
+    parser.add_argument("--bank-seed", type=int)
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--device")
     parser.add_argument("--steps", type=int)
@@ -230,7 +265,7 @@ def main():
     if args.smoke and any(value is not None for value in (args.manifest, args.device, args.steps, args.superset_size)):
         parser.error("--smoke sets its own CPU/device/step/size settings and starts a new experiment")
     if args.manifest:
-        if any(value is not None for value in (args.dataset, args.selectors, args.seeds, args.device, args.steps, args.superset_size, args.backend)):
+        if any(value is not None for value in (args.dataset, args.selectors, args.candidates, args.bank_seed, args.seeds, args.device, args.steps, args.superset_size, args.backend)):
             parser.error("With --manifest, settings come from saved configs; only --stage and --nfe may change")
         path = Path(args.manifest).resolve()
         with path.open(encoding="utf-8") as stream:
@@ -242,7 +277,8 @@ def main():
     else:
         path, manifest = create_experiment(args.config, dataset=args.dataset, selectors=args.selectors,
                                           seeds=args.seeds, device=args.device, steps=args.steps,
-                                          superset_size=args.superset_size, backend=args.backend, smoke=args.smoke)
+                                          superset_size=args.superset_size, backend=args.backend, smoke=args.smoke,
+                                          candidate_ids=args.candidates, bank_seed=args.bank_seed)
     if args.stage in ("train", "all"):
         train_jobs(path, manifest)
     if args.stage in ("eval", "all"):

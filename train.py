@@ -89,9 +89,13 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
     synchronize(device)
     start = perf_counter()
     history = []
+    validation_seconds = 0.0
+    early_step = max(1, int(training["num_steps"] * 0.05))
     try:
         for step in range(1, training["num_steps"] + 1):
             log_step = step == 1 or step % training["log_every"] == 0
+            if config["coupling"] == "wasserstein_bank":
+                log_step = log_step or step in (early_step, training["num_steps"])
             paired_noise = None
             if pair_sampler is None:
                 target = sample_batch()
@@ -110,26 +114,37 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
                           if config["coupling"] in TG_CACHED_METHODS else "")
                 print(f"step={step} loss={value:.6f}{timing}")
                 if config["coupling"] == "wasserstein_bank":
+                    from wasserstein_bank import integrated_curve
                     synchronize(device)
+                    validation_start = perf_counter()
                     curve = pair_sampler.validation_curve(model, training.get("validation_batch_size", 16),
                                                           config["seed"] + 100003)
+                    synchronize(device)
+                    validation_seconds += perf_counter() - validation_start
                     if not np.isfinite([point["mse_per_coordinate"] for point in curve]).all():
                         raise FloatingPointError("Nonfinite bank validation loss")
                     history.append({"step": step, "training_loss": value,
-                                    "elapsed_seconds": perf_counter() - start, "validation_by_time": curve})
-                    print(f"validation_mse={np.mean([point['mse_per_coordinate'] for point in curve]):.6f}", flush=True)
+                                    "elapsed_seconds": perf_counter() - start, "validation_by_time": curve,
+                                    "integrated_validation_mse": integrated_curve(curve),
+                                    "validation_seconds_cumulative": validation_seconds})
+                    print(f"integrated_validation_mse={integrated_curve(curve):.6f}", flush=True)
     finally:
         if config["coupling"] in TG_CACHED_METHODS and pair_sampler is not None:
             pair_sampler.close()
     synchronize(device)
     seconds = perf_counter() - start
     print(f"training_seconds={seconds:.3f}")
-    run_dir = save_training(model, config, dataset, config_path, seconds, loss.item(),
-                            coupling_metadata=pair_sampler.details() if pair_sampler is not None else None)
+    details = pair_sampler.details() if pair_sampler is not None else None
+    if config["coupling"] == "wasserstein_bank":
+        details.update(validation_seconds=validation_seconds,
+                       training_seconds_excluding_validation=seconds - validation_seconds)
+    run_dir = save_training(model, config, dataset, config_path, seconds, loss.item(), coupling_metadata=details)
     if history:
         with (run_dir / "learning_curve.json").open("x", encoding="utf-8") as file:
             json.dump({"validation_definition": pair_sampler.metadata["holdout_definition"],
-                       "validation_seed": config["seed"] + 100003, "history": history}, file, indent=2, allow_nan=False)
+                       "validation_seed": config["seed"] + 100003,
+                       "early_selector_step": early_step, "early_selector_fraction": 0.05,
+                       "history": history}, file, indent=2, allow_nan=False)
     return run_dir
 
 
