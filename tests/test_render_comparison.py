@@ -14,7 +14,7 @@ import yaml
 
 from experiment import save_training
 from model import PointSetTransformer
-from render_comparison import (DEFAULT_NFES, compare, main, point_density, predict_bank,
+from render_comparison import (DEFAULT_NFES, cd_table_data, compare, main, point_density, predict_bank,
                                preflight, read_manifest)
 from train_horse import HorsePointSetTransformer
 
@@ -292,6 +292,47 @@ class ComparisonTests(unittest.TestCase):
                         {"cloud_index": 64}, {"sigma": -1}, {"gamma": float("nan")}, {"seed": -1}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 compare("does_not_exist.yaml", **options)
+
+    def test_cd_tables_use_saved_raw_values_without_loading_models(self):
+        ids = ["independent", "efm", "minibatch_ot", "nsot", "tg", "ms_w2"]
+        root = Path("eval_results/saved_comparison")
+        report = {"dataset": "horse", "n_points": 256, "clouds": 64, "nfes": DEFAULT_NFES,
+                  "models": [{"id": key, "label": key, "training_config_verified": True} for key in ids],
+                  "results": [{"method_id": key, "nfe": nfe, "metrics": {"chamfer": .001 * j + nfe / 100000}}
+                              for j, key in enumerate(ids) for nfe in DEFAULT_NFES]}
+        root.mkdir(parents=True)
+        (root / "comparison.json").write_text(json.dumps({"datasets": {d: f"{d}/comparison.json" for d in ("horse", "checkerboard")}}))
+        for dataset in ("horse", "checkerboard"):
+            (root / dataset).mkdir()
+            (root / dataset / "comparison.json").write_text(json.dumps({**report, "dataset": dataset}))
+        with patch("render_comparison.load_model", side_effect=AssertionError("No inference for tables")):
+            out = main([str(root), "--cd-table-only", "--dpi", "60"])
+        tables = json.loads((out / "cd_tables.json").read_text())["tables"]
+        self.assertEqual(len(tables), 2)
+        for table in tables:
+            self.assertEqual(table["headers"], ["NFE"] + ids)
+            self.assertEqual(len(table["rows"]), 7)
+            self.assertEqual(table["rows"][0][1], .00001)
+            self.assertEqual(table["rows"][-1][-1], .005 + 128 / 100000)
+            self.assertTrue((out / table["image"]).is_file())
+        # Do not overwrite a previous table export.
+        with patch("render_comparison.load_model", side_effect=AssertionError("No inference for tables")):
+            again = main([str(root / "horse/comparison.json"), "--cd-table-only", "--dpi", "40"])
+        self.assertNotEqual(out, again)
+
+    def test_cd_table_missing_zero_duplicate_and_invalid_values(self):
+        report = {"dataset": "horse", "models": [{"id": "a", "label": "A", "training_config_verified": True}],
+                  "nfes": [8, 1], "results": [{"method_id": "a", "nfe": 1, "metrics": {"chamfer": 0.}}]}
+        headers, rows = cd_table_data(report)
+        self.assertEqual(rows, [[1, 0.], [8, None]])
+        report["results"].append(copy.deepcopy(report["results"][0]))
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            cd_table_data(report)
+        report["results"].pop()
+        for value in (float("nan"), float("inf"), -1., True):
+            report["results"][0]["metrics"]["chamfer"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Invalid CD"):
+                cd_table_data(report)
 
 
 if __name__ == "__main__":

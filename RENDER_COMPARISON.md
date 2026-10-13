@@ -108,6 +108,7 @@ eval_results/model_comparison_<timestamp>_<id>/
     comparison_nfe_001.png     # original eval style, one strip per NFE
     ... nfe_002,004,008,016,032,128 ...
     comparison.json            # hashes, configs, metrics, rendering settings
+    cd_table.png               # NFE rows x model columns, raw cloud-mean CD
     metrics.csv                # pooled metrics, one row per model/NFE
     clouds.npz                 # unchanged sources, targets, all generated endpoints
   horse/
@@ -117,6 +118,28 @@ eval_results/model_comparison_<timestamp>_<id>/
 Images show just the model labels and NFEs, without diagnostic overlays.
 CD/leakage and other metrics remain available in JSON/CSV. Model inference never
 receives target points or target patches.
+
+### CD tables without repeating inference
+
+New comparisons automatically save `horse/cd_table.png` and
+`checkerboard/cd_table.png`, and print their values in the terminal.
+Each table uses NFE rows and model columns, with raw CD values (no x1000 scaling).
+CD is the sum of directional mean squared distances, averaged across clouds;
+lower is better. Missing results appear as N/A, never zero. The JSON retains
+full-precision table values; the image displays six significant digits.
+
+For an already completed comparison, replace `YOUR_RUN` with its actual folder:
+
+```bat
+python render_comparison.py eval_results/YOUR_RUN --cd-table-only
+```
+
+This reads only the saved `comparison.json` files. No model, training bank, GPU
+or repeated inference is needed. It creates a new `cd_tables_<timestamp>_<id>`
+folder inside the selected run containing `horse_cd_table.png`,
+`checkerboard_cd_table.png` and `cd_tables.json` with values/source hashes.
+A single dataset's `comparison.json` or directory also works. NFEs come from
+the stored results, not the CLI's inference defaults. Existing files are untouched.
 
 ## Fairness and interpretation
 

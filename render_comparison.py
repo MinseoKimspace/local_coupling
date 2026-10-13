@@ -8,6 +8,7 @@ import argparse
 import csv
 import glob
 import hashlib
+import json
 from pathlib import Path
 import re
 from time import perf_counter
@@ -330,6 +331,99 @@ def render_dataset(report, arrays, directory, *, view, bins, sigma, gamma, dpi):
             "outside_view_fraction": outside}
 
 
+def cd_table_data(report):
+    """Pivot already-computed cloud-mean CD; never rerun inference or rescale it."""
+    if report.get("dataset") not in DATASETS:
+        raise ValueError("Expected a per-dataset comparison.json")
+    models, nfes = report["models"], report["nfes"]
+    ids = [m["id"] for m in models]
+    if not ids or len(set(ids)) != len(ids) or not nfes or len(set(nfes)) != len(nfes):
+        raise ValueError("Table needs unique model IDs and NFEs")
+    labels = [m["label"] + (" [UNVERIFIED]" if not m.get("training_config_verified", False) else "") for m in models]
+    values = {}
+    for row in report["results"]:
+        key = (row["method_id"], row["nfe"])
+        if key in values:
+            raise ValueError(f"Duplicate model/NFE result: {key}")
+        if key[0] not in ids or key[1] not in nfes:
+            raise ValueError(f"Unexpected model/NFE result: {key}")
+        value = row.get("metrics", {}).get("chamfer")
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                  or not np.isfinite(value) or value < 0):
+            raise ValueError(f"Invalid CD value for {key}: {value}")
+        values[key] = value
+    rows = [[nfe] + [values.get((method, nfe)) for method in ids] for nfe in sorted(nfes)]
+    return ["NFE"] + labels, rows
+
+
+def render_cd_table(report, output_path, dpi=200):
+    headers, rows = cd_table_data(report)
+    display = [[str(row[0])] + ["N/A" if v is None else f"{v:.6g}" for v in row[1:]] for row in rows]
+    figure, axis = plt.subplots(figsize=(max(8, 2.2 * len(headers)), 1.8 + .42 * len(rows)))
+    axis.axis("off")
+    axis.set_title(f"{report['dataset']} — Chamfer distance (lower is better)", fontsize=15, pad=16)
+    table = axis.table(cellText=display, colLabels=headers, cellLoc="center", loc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1., 1.7)
+    for (row, _), cell in table.get_celld().items():
+        cell.set_edgecolor("#d4dbe2")
+        if row == 0:
+            cell.set_facecolor("#23394d")
+            cell.get_text().set_color("white")
+            cell.get_text().set_weight("bold")
+        elif row % 2 == 0:
+            cell.set_facecolor("#f2f5f8")
+    note = ("Raw CD: sum of directional mean squared distances; averaged across clouds. No scaling.\n"
+            f"N={report.get('n_points', '?')}, clouds={report.get('clouds', '?')}; one saved checkpoint per column. "
+            "N/A = missing result.")
+    figure.text(.5, .025, note, ha="center", va="bottom", fontsize=9)
+    figure.tight_layout(rect=(0, .15, 1, 1))
+    figure.savefig(output_path, dpi=dpi)
+    plt.close(figure)
+    print(f"\n{report['dataset']} CD (raw; lower is better)")
+    widths = [max(len(headers[i]), *(len(row[i]) for row in display)) for i in range(len(headers))]
+    for line in [headers] + display:
+        print(" | ".join(value.rjust(width) for value, width in zip(line, widths)))
+    return {"image": Path(output_path).name, "headers": headers, "rows": rows,
+            "metric": "chamfer", "scale": 1, "display_significant_digits": 6}
+
+
+def cd_tables_from_results(path, *, datasets=None, dpi=200):
+    """Create tables in a new folder from a selected completed comparison run."""
+    path = Path(path).resolve()
+    if dpi < 1:
+        raise ValueError("dpi must be positive")
+    selected = set(DATASETS if datasets is None else datasets)
+    if not selected <= set(DATASETS) or not selected:
+        raise ValueError("Expected checkerboard and/or horse")
+    index_path = path / "comparison.json" if path.is_dir() else path
+    with index_path.open(encoding="utf-8") as stream:
+        index = json.load(stream)
+    if index.get("dataset") in DATASETS:
+        sources = [index_path] if index["dataset"] in selected else []
+    else:
+        sources = [index_path.parent / d / "comparison.json" for d in DATASETS
+                   if d in selected and d in index.get("datasets", {})]
+    if not sources:
+        raise ValueError("No selected dataset reports found in this comparison run")
+    reports = []
+    for source in sources:
+        with source.open(encoding="utf-8") as stream:
+            report = json.load(stream)
+        cd_table_data(report)  # Validate before creating any outputs.
+        reports.append((source, report))
+    directory = output_directory(index_path.parent, "cd_tables")
+    provenance = []
+    for source, report in reports:
+        table = render_cd_table(report, directory / f"{report['dataset']}_cd_table.png", dpi)
+        provenance.append({"dataset": report["dataset"], "source": str(source),
+                           "source_sha256": file_sha256(source), **table})
+    save_json(directory / "cd_tables.json", {"tables": provenance})
+    print(f"saved_cd_tables={directory}", flush=True)
+    return directory
+
+
 def compare(manifest, *, datasets=None, nfes=None, clouds=64, cloud_index=0, seed=2026,
             batch_size=8, device="auto", view="eval", bins=192, sigma=1., gamma=.5,
             histogram_bins=64, dpi=200, output="eval_results", check_only=False, allow_legacy=False):
@@ -419,6 +513,7 @@ def compare(manifest, *, datasets=None, nfes=None, clouds=64, cloud_index=0, see
                 writer.writerow({**{k: row[k] for k in ("method_id", "label", "nfe")},
                                  "training_config_verified": verified[row["method_id"]], **row["metrics"]})
         report["rendering"] = render_dataset(report, arrays, dest, view=view, bins=bins, sigma=sigma, gamma=gamma, dpi=dpi)
+        report["cd_table"] = render_cd_table(report, dest / "cd_table.png", dpi)
         save_json(dest / "comparison.json", report)
         top["datasets"][dataset] = f"{dataset}/comparison.json"
         print(f"saved_dataset={dest.resolve()}", flush=True)
@@ -430,7 +525,8 @@ def compare(manifest, *, datasets=None, nfes=None, clouds=64, cloud_index=0, see
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", help="YAML listing explicit saved runs/.../config.yaml paths")
+    parser.add_argument("manifest", help="Comparison YAML, or an existing result folder with --cd-table-only")
+    parser.add_argument("--cd-table-only", action="store_true", help="Read saved comparison.json and create CD tables; no checkpoints or inference")
     parser.add_argument("--datasets", nargs="+", choices=DATASETS)
     parser.add_argument("--nfes", nargs="+", type=int, default=DEFAULT_NFES)
     parser.add_argument("--clouds", type=int, default=64, help="Independent N-point clouds pooled ONLY for display/metrics")
@@ -448,7 +544,13 @@ def main(argv=None):
     parser.add_argument("--output", default="eval_results")
     parser.add_argument("--check-only", action="store_true", help="Validate all configs/checkpoints on CPU without inference/output")
     parser.add_argument("--allow-legacy", action="store_true", help="Explicitly allow UNVERIFIED weights-only checkpoints")
-    return compare(**vars(parser.parse_args(argv)))
+    args = vars(parser.parse_args(argv))
+    table_only = args.pop("cd_table_only")
+    if table_only:
+        if args["check_only"]:
+            parser.error("--cd-table-only and --check-only cannot be combined")
+        return cd_tables_from_results(args["manifest"], datasets=args["datasets"], dpi=args["dpi"])
+    return compare(**args)
 
 
 if __name__ == "__main__":
