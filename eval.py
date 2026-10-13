@@ -43,6 +43,21 @@ def sample_snapshots(
     return snapshots
 
 
+def point_density(points: torch.Tensor) -> np.ndarray:
+    points = points.reshape(-1, 2).numpy()
+    density, _, _ = np.histogram2d(points[:, 0], points[:, 1], bins=192,
+                                  range=[[-1.2, 1.2], [-1.2, 1.2]])
+    density = gaussian_filter(density.T, sigma=1.2)
+    return density / max(density.sum(), 1.0)
+
+
+def density_norm(densities):
+    values = np.concatenate([density.ravel() for density in densities])
+    positive = values[values > 0]
+    vmax = np.percentile(positive, 99.5) if positive.size else 1.0
+    return PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax)
+
+
 def render_density(
     snapshots: list[torch.Tensor],
     times: tuple[float, ...],
@@ -50,24 +65,8 @@ def render_density(
     output_path: str,
 ) -> None:
     limit = 1.2
-    densities = []
-
-    for points in snapshots:
-        points = points.reshape(-1, 2).numpy()
-        density, _, _ = np.histogram2d(
-            points[:, 0],
-            points[:, 1],
-            bins=192,
-            range=[[-limit, limit], [-limit, limit]],
-        )
-        density = gaussian_filter(density.T, sigma=1.2)
-        density /= max(density.sum(), 1.0)
-        densities.append(density)
-
-    values = np.concatenate([density.ravel() for density in densities])
-    positive = values[values > 0]
-    vmax = np.percentile(positive, 99.5) if positive.size else 1.0
-    norm = PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax)
+    densities = [point_density(points) for points in snapshots]
+    norm = density_norm(densities)
     figure, axes = plt.subplots(1, len(times), figsize=(9, 3.4))
     figure.text(
         0.5,

@@ -124,6 +124,7 @@ class ComparisonTests(unittest.TestCase):
         manifest = self.manifest({"checkerboard": entries})
         self.assertIsNone(main([str(manifest), "--check-only"]))
         self.assertFalse(Path("analysis_results").exists())
+        self.assertFalse(Path("eval_results").exists())
         options = dict(clouds=2, batch_size=2, bins=8, histogram_bins=8, dpi=30, view="scatter", device="cpu")
         # Rendering is covered above; avoid generating all 8 images twice here.
         with patch("render_comparison.render_dataset", return_value={}):
@@ -131,6 +132,8 @@ class ComparisonTests(unittest.TestCase):
             reversed_path = self.manifest({"checkerboard": list(reversed(entries))}, "reversed.yaml")
             second = compare(reversed_path, **options)
         reports = [json.loads((d / "checkerboard/comparison.json").read_text()) for d in (first, second)]
+        self.assertEqual(first.parent, Path("eval_results"))
+        self.assertEqual(second.parent, Path("eval_results"))
         self.assertEqual(reports[0]["nfes"], [1, 2, 4, 8, 16, 32, 128])
         self.assertEqual(reports[0]["nfes"], DEFAULT_NFES)
         for key in ("source_sha256", "target_sha256"):
@@ -138,6 +141,47 @@ class ComparisonTests(unittest.TestCase):
         values = [{(r["method_id"], r["nfe"]): (r["prediction_sha256"], r["metrics"]) for r in p["results"]}
                   for p in reports]
         self.assertEqual(*values)
+
+    def test_default_view_reuses_original_evaluators_without_scatter(self):
+        import eval as checker_eval
+        import eval_horse as horse_eval
+        groups = {dataset: [self.fixture(dataset, "independent")]
+                  for dataset in ("checkerboard", "horse")}
+        with patch("eval.point_density", wraps=checker_eval.point_density) as checker_density, \
+                patch("eval_horse.point_density", wraps=horse_eval.point_density) as horse_density, \
+                patch("matplotlib.axes.Axes.scatter", side_effect=AssertionError("No scatter in default view")):
+            directory = compare(self.manifest(groups), nfes=[1, 2], clouds=2, batch_size=2,
+                                histogram_bins=8, dpi=40, device="cpu")
+        self.assertEqual(checker_density.call_count, 2)
+        self.assertEqual(horse_density.call_count, 3)  # target + two predictions
+        for dataset in groups:
+            dest = directory / dataset
+            report = json.loads((dest / "comparison.json").read_text())
+            self.assertEqual(report["rendering"]["style"], "original_eval")
+            self.assertEqual(report["rendering"]["images"],
+                             ["comparison_grid.png", "comparison_nfe_001.png", "comparison_nfe_002.png"])
+            self.assertFalse(list(dest.glob("density_*.png")))
+            self.assertFalse(list(dest.glob("scatter_*.png")))
+            self.assertTrue(all((dest / name).is_file() for name in report["rendering"]["images"]))
+
+    def test_shared_eval_helpers_preserve_original_rendering_math(self):
+        import eval as checker_eval
+        import eval_horse as horse_eval
+        from scipy.ndimage import gaussian_filter
+        points = torch.randn(4, 256, 2)
+        flat = points.numpy().reshape(-1, 2)
+        for module, bins, limit, sigma, normalize in (
+                (checker_eval, 192, 1.2, 1.2, True), (horse_eval, 256, 1.1, 1., False)):
+            expected, _, _ = np.histogram2d(flat[:, 0], flat[:, 1], bins=bins,
+                                           range=[[-limit, limit], [-limit, limit]])
+            expected = gaussian_filter(expected.T, sigma=sigma)
+            if normalize:
+                expected /= max(expected.sum(), 1.)
+            actual = module.point_density(points)
+            np.testing.assert_array_equal(actual, expected)
+            norm = module.density_norm([actual])
+            self.assertEqual(norm.gamma, .5)
+            self.assertEqual(norm.vmax, np.percentile(expected[expected > 0], 99.5))
 
     def test_each_nfe_restarts_at_source_and_reaches_t_one(self):
         class LinearVelocity(torch.nn.Module):
@@ -189,6 +233,21 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate config"):
             read_manifest(self.manifest({"checkerboard": [entry, dict(entry, id="other")]}))
 
+    def test_wildcard_paths_require_exactly_one_actual_config(self):
+        entry = self.fixture("horse", "equivariant_ot_permutation")
+        entry["config"] = "./runs/horse/horse_equivariant_ot_permutation_kna_n8_seed0_*/config.yaml"
+        manifest = self.manifest({"horse": [entry]})
+        resolved = read_manifest(manifest)["horse"][0]["config_path"]
+        self.assertTrue(Path(resolved).is_file())
+        self.assertNotIn("*", resolved)
+        # A second run must never trigger silent newest-run selection.
+        self.fixture("horse", "equivariant_ot_permutation")
+        with self.assertRaisesRegex(ValueError, "ambiguous config pattern"):
+            read_manifest(manifest)
+        entry["config"] = "./runs/horse/missing_*/config.yaml"
+        with self.assertRaisesRegex(FileNotFoundError, "no config matches"):
+            read_manifest(self.manifest({"horse": [entry]}))
+
     def test_preflight_rejects_mismatch_before_inference(self):
         first = self.fixture("checkerboard", "independent")
         wrong_method = dict(first, coupling="multiscale_wasserstein")
@@ -209,6 +268,7 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "YAML differs"):
             compare(self.manifest({"checkerboard": [first]}), check_only=True)
         self.assertFalse(Path("analysis_results").exists())
+        self.assertFalse(Path("eval_results").exists())
 
     def test_legacy_opt_in_and_training_confounds_visible(self):
         first = self.fixture("checkerboard", "independent")

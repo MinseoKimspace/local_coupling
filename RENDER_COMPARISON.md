@@ -4,6 +4,16 @@
 `runs/.../config.yaml`. It does not train, construct a coupling, open a training
 bank, compute Jacobians, or modify a checkpoint. No extra dependency is needed.
 
+The default now uses the ORIGINAL `eval.py` / `eval_horse.py` image rendering:
+same histogram, Gaussian smoothing, viridis, percentile PowerNorm and bilinear
+interpolation; horse keeps its black background. Only the arrangement changes:
+six generated t=1 panels side-by-side, one method per column, one NFE per row.
+No scatter, colorbar, extra metric captions or target column is added by default.
+Checkerboard's intermediate t snapshots are omitted: the comparison is at t=1.
+Its original normalization rule is applied to that displayed endpoint; horse
+retains the original target/generated-pair normalization. This reproduces the
+eval rendering style, not necessarily identical pixels from past random draws.
+
 ## Run from the project root (Windows CMD)
 
 `comparison_runs.yaml` is already populated with the 12 run folders from the
@@ -44,9 +54,10 @@ For a quick one-dataset smoke run before the full comparison:
 python render_comparison.py comparison_runs.yaml --datasets horse --nfes 1 8 --clouds 4 --batch-size 2 --device cuda
 ```
 
-To show another *prespecified* cloud in the scatter panels, use `--cloud-index 3`.
-To render only density or scatter, use `--view density` or `--view scatter`.
-`--sigma 0` disables display smoothing; it never affects saved samples or metrics.
+No `--view` option is needed. `--view eval` explicitly selects the default.
+The previous diagnostic views remain opt-in only (`--view density/scatter/both`).
+`--bins`, `--sigma`, `--gamma` and `--cloud-index` control those legacy diagnostic
+views, not the original evaluator style, whose settings are reused unchanged.
 
 ## Select the correct method explicitly
 
@@ -72,6 +83,12 @@ EFM implementation with rigid rotations. NSOT is this repository's 2D variant.
 One dataset or a smaller subset of methods is allowed. Remove unwanted entries
 from a copied manifest, or use `--datasets horse` / `--datasets checkerboard`.
 Nothing auto-discovers a newest/best checkpoint or skips a missing model.
+An explicitly supplied relative wildcard path is supported ONLY if exactly one
+config file matches. Zero matches fail; multiple matches list candidates and fail.
+The supplied horse EFM entry uses `20261006T*_c4770473` to retain the exact run ID
+without manually transcribing its timestamp. Update BOTH `render_comparison.py`
+and `comparison_runs.yaml` on the lab machine to use this feature. The concrete
+resolved path and checkpoint hash are still saved in the comparison report.
 
 Legacy weights-only checkpoints are rejected by default. If you genuinely need
 them, `--allow-legacy` labels their plots `UNVERIFIED` and retains that flag in
@@ -83,14 +100,12 @@ Never treat a legacy comparison as verified training provenance.
 Each invocation creates a unique directory; no previous result is overwritten:
 
 ```text
-analysis_results/model_comparison_<timestamp>_<id>/
+eval_results/model_comparison_<timestamp>_<id>/
   request.json                 # resolved models; present even if a later step fails
   comparison.json              # status=complete only after all datasets finish
   checkerboard/
-    density_grid.png           # rows=NFE, columns=Target + models
-    scatter_grid.png           # same arrangement, same single source cloud
-    density_nfe_001.png        # one horizontal strip per NFE
-    scatter_nfe_001.png
+    comparison_grid.png        # rows=NFE, columns=6 generated models
+    comparison_nfe_001.png     # original eval style, one strip per NFE
     ... nfe_002,004,008,016,032,128 ...
     comparison.json            # hashes, configs, metrics, rendering settings
     metrics.csv                # pooled metrics, one row per model/NFE
@@ -99,10 +114,9 @@ analysis_results/model_comparison_<timestamp>_<id>/
     ... same files ...
 ```
 
-Both grids show CD and leakage on each generated panel. Density captions use the
-full cloud bank; scatter captions use only the displayed cloud. The target column
-is a fixed independent target sample, not an oracle paired endpoint or a zero-CD
-baseline. Model inference never receives target points or target patches.
+Images show just the model labels and NFEs, without diagnostic overlays.
+CD/leakage and other metrics remain available in JSON/CSV. Model inference never
+receives target points or target patches.
 
 ## Fairness and interpretation
 
@@ -116,9 +130,12 @@ baseline. Model inference never receives target points or target patches.
   dataset. It uses the checkpoint's original N, never resamples a trained model
   at a different N. Architecture, training-budget, training-batch-size and seed
   differences produce warnings; all original configs are retained for auditing.
-- Default density plots pool 64 **separate N-point clouds**, not one model input
-  with `64*N` points. Default scatter cloud index is 0, never quality-selected.
-- Axes are fixed to `[-1.2,1.2]^2`. Bin count, smoothing and one common color norm
+- Default eval-style plots pool 64 **separate N-point clouds**, not one model input
+  with `64*N` points. Horse uses extent 1.1, 256 bins, sigma 1.0; checkerboard
+  uses extent 1.2, 192 bins, sigma 1.2. Norms follow the original evaluators,
+  not a new global cross-model maximum. Color brightness alone is not a metric.
+- The optional LEGACY diagnostic density view fixes axes to `[-1.2,1.2]^2`.
+  Bin count, smoothing and one common color norm
   are shared across **all methods and NFEs**, including the per-NFE strips, for
   each dataset. Probability density divides by ALL points, including those
   outside the view. Outside-view percentages are shown, not silently normalized

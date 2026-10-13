@@ -6,6 +6,7 @@ Every NFE is a fresh Euler solve from the SAME initial cloud to t=1.
 
 import argparse
 import csv
+import glob
 import hashlib
 from pathlib import Path
 import re
@@ -71,9 +72,24 @@ def read_manifest(path, datasets=None):
                 raise ValueError(f"{dataset}/{key}: label must contain 1-60 characters")
             if not isinstance(row["config"], str) or not row["config"].strip():
                 raise ValueError(f"{dataset}/{key}: config must be a saved run config.yaml path")
-            config_path = (path.parent / row["config"]).resolve()
-            if not config_path.is_file():
-                raise FileNotFoundError(f"{dataset}/{key}: missing {config_path}; edit the manifest's config path")
+            value = row["config"]
+            if glob.has_magic(value):
+                if Path(value).is_absolute() or Path(value).drive:
+                    raise ValueError(f"{dataset}/{key}: wildcard paths must be relative to the manifest")
+                pattern = glob.escape(str(path.parent)) + "/" + value
+                matches = sorted({Path(p).resolve() for p in glob.glob(pattern) if Path(p).is_file()})
+                if not matches:
+                    raise FileNotFoundError(f"{dataset}/{key}: no config matches {value}")
+                if len(matches) != 1:
+                    candidates = "\n".join(str(p) for p in matches)
+                    raise ValueError(f"{dataset}/{key}: ambiguous config pattern ({len(matches)} matches). "
+                                     f"Specify one exact relative path; no newest/best run is selected.\n{candidates}")
+                config_path = matches[0]
+                print(f"resolved={dataset}/{key}: {config_path}", flush=True)
+            else:
+                config_path = (path.parent / value).resolve()
+                if not config_path.is_file():
+                    raise FileNotFoundError(f"{dataset}/{key}: missing {config_path}; edit the manifest's config path")
             if config_path in paths:
                 raise ValueError(f"{dataset}: duplicate config path: {config_path}")
             entries.append({"id": key, "label": label, "coupling": canonical_method(row["coupling"]),
@@ -200,7 +216,53 @@ def support(ax, dataset, config, mask):
                   vmax=1, alpha=.14, interpolation="nearest")
 
 
+def render_eval_dataset(report, arrays, directory, dpi):
+    """Original eval image style, generated t=1 panel only, arranged by method."""
+    import eval as checker_eval
+    import eval_horse as horse_eval
+
+    horse = report["dataset"] == "horse"
+    renderer = horse_eval if horse else checker_eval
+    limit, background, foreground = (1.1, "black", "white") if horse else (1.2, "white", "black")
+    target = renderer.point_density(torch.from_numpy(arrays["target"])) if horse else None
+    panels = {}
+    for row in report["results"]:
+        density = renderer.point_density(torch.from_numpy(arrays[row["prediction_key"]]))
+        # Horse eval uses its target/generated pair; checkerboard uses the shown endpoint.
+        norm = renderer.density_norm([target, density] if horse else [density])
+        panels[(row["method_id"], row["nfe"])] = density, norm
+    entries, nfes, images = report["models"], report["nfes"], []
+    for rows, filename in [(nfes, "comparison_grid.png")] + [([n], f"comparison_nfe_{n:03d}.png") for n in nfes]:
+        figure, axes = plt.subplots(len(rows), len(entries), squeeze=False,
+                                    figsize=(3.2 * len(entries), 3.4 * len(rows) + .5), facecolor=background)
+        for i, nfe in enumerate(rows):
+            for j, entry in enumerate(entries):
+                axis = axes[i, j]
+                density, norm = panels[(entry["id"], nfe)]
+                axis.imshow(density, origin="lower", extent=(-limit, limit, -limit, limit),
+                            cmap="viridis", norm=norm, interpolation="bilinear")
+                label = entry["label"] + (" [UNVERIFIED]" if not entry["training_config_verified"] else "")
+                axis.set_title(label, color=foreground, fontsize=14)
+                axis.set_facecolor(background)
+                axis.set_aspect("equal")
+                axis.set_axis_off()
+                if j == 0:
+                    axis.text(-.06, .5, f"NFE {nfe}", transform=axis.transAxes, rotation=90,
+                              ha="right", va="center", color=foreground, fontsize=13)
+        figure.suptitle(f"{report['dataset']} | Generated t=1 | Euler", color=foreground, fontsize=16)
+        figure.tight_layout(h_pad=1.5, w_pad=.8, rect=(.015, 0, 1, .96 if len(rows) > 1 else .88))
+        figure.savefig(directory / filename, dpi=dpi, facecolor=background)
+        plt.close(figure)
+        images.append(filename)
+    return {"images": images, "style": "original_eval", "panels": "generated endpoints only; columns=models, rows=NFE",
+            "renderer": "eval_horse.point_density/density_norm" if horse else "eval.point_density/density_norm",
+            "normalization": "original per-target/generated-pair norm" if horse else "original norm on displayed t=1 endpoint",
+            "interpolation": "bilinear", "plot_extent": [-limit, limit]}
+
+
 def render_dataset(report, arrays, directory, *, view, bins, sigma, gamma, dpi):
+    if view == "eval":
+        return render_eval_dataset(report, arrays, directory, dpi)
     dataset, entries, nfes = report["dataset"], report["models"], report["nfes"]
     extent = report["plot_extent"]
     data = DiagnosticData(entries[0]["config"], dataset, "cpu", torch.float32, report["seed"])
@@ -269,8 +331,8 @@ def render_dataset(report, arrays, directory, *, view, bins, sigma, gamma, dpi):
 
 
 def compare(manifest, *, datasets=None, nfes=None, clouds=64, cloud_index=0, seed=2026,
-            batch_size=8, device="auto", view="both", bins=192, sigma=1., gamma=.5,
-            histogram_bins=64, dpi=150, output="analysis_results", check_only=False, allow_legacy=False):
+            batch_size=8, device="auto", view="eval", bins=192, sigma=1., gamma=.5,
+            histogram_bins=64, dpi=200, output="eval_results", check_only=False, allow_legacy=False):
     nfes = list(DEFAULT_NFES if nfes is None else nfes)
     integer_options = {"clouds": clouds, "batch_size": batch_size, "bins": bins,
                        "histogram_bins": histogram_bins, "dpi": dpi}
@@ -283,8 +345,8 @@ def compare(manifest, *, datasets=None, nfes=None, clouds=64, cloud_index=0, see
         raise ValueError("cloud_index must be in [0, clouds)")
     if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**63:
         raise ValueError("seed must be an integer in [0, 2**63)")
-    if not np.isfinite([sigma, gamma]).all() or sigma < 0 or gamma <= 0 or view not in ("both", "density", "scatter"):
-        raise ValueError("Require finite sigma>=0, gamma>0 and view=both/density/scatter")
+    if not np.isfinite([sigma, gamma]).all() or sigma < 0 or gamma <= 0 or view not in ("eval", "both", "density", "scatter"):
+        raise ValueError("Require finite sigma>=0, gamma>0 and view=eval/both/density/scatter")
     groups, notices = preflight(read_manifest(manifest, datasets), allow_legacy)
     for notice in notices:
         print(f"WARNING: {notice}", flush=True)
@@ -376,13 +438,14 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--batch-size", type=int, default=8, help="Inference microbatch size; does not change N")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
-    parser.add_argument("--view", choices=("both", "density", "scatter"), default="both")
+    parser.add_argument("--view", choices=("eval", "both", "density", "scatter"), default="eval",
+                        help="Default: original eval_results rendering, six generated model panels; other views are legacy diagnostics")
     parser.add_argument("--bins", type=int, default=192, help="Display histogram resolution")
     parser.add_argument("--sigma", type=float, default=1., help="Display smoothing in pixels; 0 disables smoothing")
     parser.add_argument("--gamma", type=float, default=.5, help="Shared density color PowerNorm exponent")
     parser.add_argument("--histogram-bins", type=int, default=64, help="Metric histogram resolution, separate from rendering")
-    parser.add_argument("--dpi", type=int, default=150)
-    parser.add_argument("--output", default="analysis_results")
+    parser.add_argument("--dpi", type=int, default=200)
+    parser.add_argument("--output", default="eval_results")
     parser.add_argument("--check-only", action="store_true", help="Validate all configs/checkpoints on CPU without inference/output")
     parser.add_argument("--allow-legacy", action="store_true", help="Explicitly allow UNVERIFIED weights-only checkpoints")
     return compare(**vars(parser.parse_args(argv)))

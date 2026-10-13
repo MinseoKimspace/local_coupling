@@ -25,6 +25,13 @@ def point_density(points: torch.Tensor) -> np.ndarray:
     return gaussian_filter(density.T, sigma=1.0)
 
 
+def density_norm(densities):
+    values = np.concatenate([density.ravel() for density in densities])
+    positive = values[values > 0]
+    vmax = np.percentile(positive, 99.5) if positive.size else 1.0
+    return PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax)
+
+
 def render_comparison(
     target: torch.Tensor,
     prediction: torch.Tensor,
@@ -32,9 +39,7 @@ def render_comparison(
     output_path: str,
 ) -> None:
     densities = [point_density(target), point_density(prediction)]
-    values = np.concatenate([density.ravel() for density in densities])
-    vmax = np.percentile(values[values > 0], 99.5)
-    norm = PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax)
+    norm = density_norm(densities)
     figure, axes = plt.subplots(1, 2, figsize=(8, 4), facecolor="black")
     figure.suptitle(f"Horse silhouette - {title}", color="white", fontsize=16)
 

@@ -38,7 +38,9 @@ datasets:
     - id: efm
       label: EFM (permutation)
       coupling: equivariant_ot_permutation
-      config: ./runs/horse/horse_equivariant_ot_permutation_kna_n256_seed0_20261006T2320206092442Z_c4770473/config.yaml
+      # Match the screenshot's run ID exactly; do not transcribe the timestamp digits.
+      # Requires the updated renderer and exactly ONE matching config file.
+      config: ./runs/horse/horse_equivariant_ot_permutation_kna_n256_seed0_20261006T*_c4770473/config.yaml
     - id: minibatch_ot
       label: Minibatch OT
       coupling: minibatch_ot
