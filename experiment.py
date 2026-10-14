@@ -201,12 +201,8 @@ def evaluation_title(config):
     if method == "multiscale_wasserstein":
         bank = config["multiscale_wasserstein"]
         partitions = "/".join(map(str, bank["partition_counts"]))
-        sampling = bank.get("target_sampling", {})
-        label = "MS-W2"
-        if sampling.get("mode") == "stratified":
-            bins = sampling.get("bins", 16)
-            label += f" stratified {bins}x{bins}"
-        return (f"{label} | M={bank['superset_size']} | P={partitions}\n"
+        weights = "/".join(f"{value:g}" for value in bank.get("scale_weights", [1] * len(bank["partition_counts"])))
+        return (f"MS-W2 | M={bank['superset_size']} | P={partitions} | W={weights}\n"
                 f"N={config['data']['n_points']} | seed={config['seed']}")
     if method == "nsot":
         bank = config["nsot"]

@@ -10,10 +10,10 @@ Default: one multiscale model per dataset, bank size **M=10,000**, 256 points pe
 
 ## Run on the experiment machine
 
-For the separate same-size IID-vs-regionally-stratified **target bank** ablation
-(unchanged Gaussian source, no injected noise), see [BANK_MASS_CONTROL.md](BANK_MASS_CONTROL.md).
-Its entry point is `python run_bank_mass_control.py --stage all --device cuda`;
-the original experiment commands below keep their original IID behavior.
+For the five-condition patch-count and scale-weight experiment, see
+[MULTISCALE_ABLATION.md](MULTISCALE_ABLATION.md). Its separate entry point is
+`python run_multiscale_ablation.py`; the default command writes configs and a
+manifest without preparing banks or training.
 
 From the project directory, prepare, train and evaluate both datasets:
 

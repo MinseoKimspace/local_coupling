@@ -228,7 +228,7 @@ class MultiscaleWassersteinTests(unittest.TestCase):
         config = self.config()
         path, _ = self.prepare(config)
         source, target, order, metadata, _ = msw.load_cache(config, "checkerboard")
-        for corruption in ("permutation", "valid_permutation", "source", "target", "finite_source", "format", "extra"):
+        for corruption in ("permutation", "valid_permutation", "source", "target", "finite_source", "format", "coordinates", "extra"):
             with self.subTest(corruption=corruption):
                 arrays = {"source": source.copy(), "target": target.copy(), "permutation": order.copy()}
                 changed_metadata = copy.deepcopy(metadata)
@@ -242,6 +242,8 @@ class MultiscaleWassersteinTests(unittest.TestCase):
                     arrays["source"][0, 0] += 1.
                 elif corruption == "format":
                     changed_metadata["format_version"] = -1
+                elif corruption == "coordinates":
+                    changed_metadata["target_coordinates"] = "unsupported sampling"
                 else:
                     arrays["unexpected"] = np.zeros(1)
                 np.savez_compressed(path, **arrays, metadata=np.array(json.dumps(changed_metadata)))

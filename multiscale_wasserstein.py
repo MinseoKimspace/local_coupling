@@ -75,7 +75,7 @@ def settings(config):
     if not isinstance(raw, dict):
         raise ValueError(f"{METHOD} must be a mapping")
     unknown = raw.keys() - {"cache", "cache_sha256", "superset_size", "cache_seed",
-                            "partition_counts", "scale_weights", "max_cost_mib", "target_sampling"}
+                            "partition_counts", "scale_weights", "max_cost_mib"}
     if unknown:
         raise ValueError("Unsupported multiscale settings: " + ", ".join(sorted(unknown)))
     size = _integer(raw.get("superset_size", 10000), "superset_size", maximum=10000)
@@ -91,11 +91,8 @@ def settings(config):
         raise ValueError("Multiscale bank currently supports 2D only")
     _integer(config["data"]["n_points"], "n_points", maximum=size)
     validate_gaussian_source(config)
-    from target_mass_control import sampling_settings
-    target_sampling = sampling_settings(raw.get("target_sampling"))
     return {"cache": path, "superset_size": size, "cache_seed": seed,
-            "partition_counts": counts, "scale_weights": weights, "max_cost_mib": float(memory),
-            "target_sampling": target_sampling}
+            "partition_counts": counts, "scale_weights": weights, "max_cost_mib": float(memory)}
 
 
 def _points(points):
@@ -222,33 +219,22 @@ def multiscale_permutation(source, target, partition_counts, scale_weights,
 
 
 def draw_supersets(config, dataset):
-    """IID default is byte-identical to NSOT; optional control changes target only."""
+    """Draw the original IID endpoints, byte-identical to NSOT."""
     from nsot import draw_supersets as draw, SOLVER
     opts = settings(config)
     baseline = copy.deepcopy(config)
     baseline["coupling"] = "nsot"
     baseline["nsot"] = {"cache": opts["cache"], "superset_size": opts["superset_size"],
                         "cache_seed": opts["cache_seed"], "beta": 0.0, "solver": SOLVER}
-    source, target = draw(baseline, dataset)
-    if opts["target_sampling"]["mode"] == "stratified":
-        from target_mass_control import TargetStrata
-        target = TargetStrata(config, dataset, opts["target_sampling"]["bins"]).sample(
-            opts["superset_size"], opts["cache_seed"])
-    return source, target
+    return draw(baseline, dataset)
 
 
 def cache_spec(config, dataset):
     opts = settings(config)
-    spec = {"format_version": FORMAT_VERSION, "implementation": IMPLEMENTATION,
+    return {"format_version": FORMAT_VERSION, "implementation": IMPLEMENTATION,
             "superset_size": opts["superset_size"], "cache_seed": opts["cache_seed"],
             "partition_counts": opts["partition_counts"], "scale_weights": opts["scale_weights"],
             "dataset_spec": dataset_spec(config, dataset)}
-    # Keep original IID cache metadata compatible; stratified banks require an
-    # explicit distinct specification and cannot be loaded as the IID baseline.
-    if opts["target_sampling"]["mode"] != "iid":
-        from target_mass_control import IMPLEMENTATION as TARGET_IMPLEMENTATION
-        spec["target_sampling"] = {**opts["target_sampling"], "implementation": TARGET_IMPLEMENTATION}
-    return spec
 
 
 def _array_hash(array):
@@ -273,8 +259,8 @@ def load_cache(config, dataset):
     for key, value in expected_spec.items():
         if metadata.get(key) != value:
             raise ValueError(f"Multiscale cache/config mismatch: {key}")
-    if metadata.get("target_sampling") != expected_spec.get("target_sampling"):
-        raise ValueError("Multiscale cache/config mismatch: target_sampling")
+    if metadata.get("target_coordinates") != "unchanged original sampled points; no barycentric projection":
+        raise ValueError("Multiscale cache has unsupported target coordinates")
     size = opts["superset_size"]
     if source.shape != (size, 2) or target.shape != source.shape \
             or source.dtype != np.float32 or target.dtype != np.float32 \
@@ -314,11 +300,6 @@ def prepare(config, dataset):
                 "target_coordinates": "unchanged original sampled points; no barycentric projection",
                 "source_sha256": {name: file_sha256(Path(__file__).parent / name) for name in
                                   ("multiscale_wasserstein.py", "nsot.py", "data.py", "train_horse.py")}}
-    if opts["target_sampling"]["mode"] == "stratified":
-        from target_mass_control import TargetStrata
-        metadata["target_mass_control"] = TargetStrata(config, dataset, opts["target_sampling"]["bins"]).report(target)
-        metadata["target_coordinates"] = "foreground-area-proportional stratified draws; no post-sampling perturbation/projection"
-        metadata["source_sha256"]["target_mass_control.py"] = file_sha256(Path(__file__).with_name("target_mass_control.py"))
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as stream:
         np.savez_compressed(stream, source=source, target=target, permutation=permutation,
