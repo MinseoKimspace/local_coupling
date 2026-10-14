@@ -62,6 +62,8 @@ def _cache_path(config, dataset, method):
                if key not in ("cache", "cache_sha256", "beta")}
     dependencies = (["nsot.py", "data.py", "train_horse.py"] if method == "nsot" else
                     ["multiscale_wasserstein.py", "nsot.py", "data.py", "train_horse.py"])
+    if config[method].get("target_sampling", {}).get("mode") == "stratified":
+        dependencies = [*dependencies, "target_mass_control.py"]
     specification = {"dataset": dataset_spec(config, dataset), "options": options,
                      "implementation_sha256": {name: file_sha256(ROOT / name) for name in dependencies}}
     digest = hashlib.sha256(json.dumps(specification, sort_keys=True).encode()).hexdigest()[:20]
