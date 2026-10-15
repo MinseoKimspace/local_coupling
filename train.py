@@ -77,6 +77,11 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
         pair_sampler = MultiscaleWassersteinSampler(config, dataset, device, next(model.parameters()).dtype)
         config["multiscale_wasserstein"]["cache_sha256"] = pair_sampler.cache_sha256
         print(f"multiscale_cache_sha256={pair_sampler.cache_sha256}", flush=True)
+    elif config["coupling"] == "qat":
+        from qat_coupling import QATPairSampler
+        pair_sampler = QATPairSampler(config, dataset, device, next(model.parameters()).dtype)
+        config["qat"]["cache_sha256"] = pair_sampler.cache_sha256
+        print(f"qat_tree_sha256={pair_sampler.cache_sha256}", flush=True)
     elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, dataset, device, next(model.parameters()).dtype)

@@ -10,6 +10,16 @@ Default: one multiscale model per dataset, bank size **M=10,000**, 256 points pe
 
 ## Run on the experiment machine
 
+For a controlled **MS-W2 / leaf-only `[0,0,1]` / QAT coupling** comparison on both
+2D datasets, see [COUPLING_COMPARISON.md](COUPLING_COMPARISON.md), or run:
+
+```powershell
+python run_multiscale.py --coupling-study --stage all --device cuda --seeds 0
+```
+
+This is separate from the partition-direction study. The original default
+MS-W2 command below is unchanged.
+
 For read-only coupling geometry, Gaussian routing, fitting/context and bank/fresh
 generation checks on an existing checkpoint, see
 [MSW2_COUPLING_DIAGNOSTICS.md](MSW2_COUPLING_DIAGNOSTICS.md).

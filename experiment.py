@@ -30,6 +30,9 @@ def read_config(path):
     elif config["coupling"] == "multiscale_wasserstein":
         from multiscale_wasserstein import settings as bank_settings
         bank_settings(config)
+    elif config["coupling"] == "qat":
+        from qat_coupling import settings as qat_settings
+        qat_settings(config)
     return config
 
 
@@ -192,10 +195,15 @@ def evaluation_title(config):
     method = config["coupling"]
     if method == "multiscale_wasserstein":
         bank = config["multiscale_wasserstein"]
+        weights = bank.get("scale_weights", [1, 1, 1])
+        label = "Leaf-only block OT" if weights[-1] > 0 and not any(weights[:-1]) else "MS-W2"
         partitions = ""
         if "source_partition" in bank or "target_partition" in bank:
             partitions = f" | {bank.get('source_partition', 'axis')} -> {bank.get('target_partition', 'axis')}"
-        return (f"MS-W2{partitions} | M={bank['superset_size']}\n"
+        return (f"{label}{partitions} | M={bank['superset_size']}\n"
+                f"N={config['data']['n_points']} | seed={config['seed']}")
+    if method == "qat":
+        return (f"QAT coupling | M={config['qat']['superset_size']}\n"
                 f"N={config['data']['n_points']} | seed={config['seed']}")
     if method == "nsot":
         bank = config["nsot"]

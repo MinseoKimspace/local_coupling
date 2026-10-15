@@ -26,6 +26,8 @@ METHOD = "multiscale_wasserstein"
 FORMAT_VERSION = 1
 IMPLEMENTATION = "nested_equal_mass_patch_w2_exact_v1"
 PCA_IMPLEMENTATION = "nested_equal_mass_patch_w2_exact_pca_v1"
+ZERO_WEIGHT_IMPLEMENTATION = "nested_equal_mass_patch_w2_exact_skip_zero_v1"
+PCA_ZERO_WEIGHT_IMPLEMENTATION = "nested_equal_mass_patch_w2_exact_pca_skip_zero_v1"
 PARTITION_METHODS = ("axis", "pca")
 PCA_EIGENGAP_TOL = 1e-6
 
@@ -70,13 +72,18 @@ def _scales(count, partition_counts, scale_weights):
     return counts, (weights / total).tolist()
 
 
-def _memory_guard(count, counts, max_cost_mib):
+def _memory_guard(count, counts, max_cost_mib, weights=None):
     if isinstance(max_cost_mib, bool) or not isinstance(max_cost_mib, (int, float)) \
             or not math.isfinite(max_cost_mib) or max_cost_mib <= 0:
         raise ValueError("max_cost_mib must be finite and positive")
     # Bound one dense cost matrix, NOT the total process peak (solver workspaces
     # and several small leaf-cost matrices also consume memory).
-    largest = max((count // counts[0]) ** 2, counts[-1] ** 2) * 8 / 2**20
+    # All partitions are still built, but zero-weight scales allocate no patch
+    # costs. Leaf assignment and final within-leaf exact OT always run.
+    active = counts if weights is None else [n for n, w in zip(counts, weights) if w > 0]
+    elements = [counts[-1] ** 2, (count // counts[-1]) ** 2]
+    elements.extend((count // n) ** 2 for n in active)
+    largest = max(elements) * 8 / 2**20
     if largest > max_cost_mib:
         raise ValueError(f"Largest dense cost matrix {largest:.1f} MiB exceeds max_cost_mib={max_cost_mib}")
     return largest
@@ -98,7 +105,7 @@ def settings(config):
     counts, weights = _scales(size, raw.get("partition_counts", [4, 20, 100]),
                               raw.get("scale_weights", [1, 1, 1]))
     memory = raw.get("max_cost_mib", 512)
-    _memory_guard(size, counts, memory)
+    _memory_guard(size, counts, memory, weights)
     path = raw.get("cache")
     if not isinstance(path, str) or not path.strip() or path == "auto":
         raise ValueError("A concrete multiscale cache path is required")
@@ -218,7 +225,7 @@ def multiscale_permutation(source, target, partition_counts, scale_weights,
         raise ValueError("Source and target must have matching shapes")
     size = len(source)
     counts, weights = _scales(size, partition_counts, scale_weights)
-    largest = _memory_guard(size, counts, max_cost_mib)
+    largest = _memory_guard(size, counts, max_cost_mib, weights)
     start = perf_counter()
     source_diagnostics, target_diagnostics = {}, {}
     source_labels = balanced_partitions(source, counts, strategy=source_partition,
@@ -232,6 +239,17 @@ def multiscale_permutation(source, target, partition_counts, scale_weights,
     leaf_cost = np.zeros((leaves, leaves), dtype=np.float64)
     reports, scale_costs = [], []
     for level, (count, weight) in enumerate(zip(counts, weights)):
+        if weight == 0:
+            # Keep the hierarchy (and therefore the finest partition) exactly
+            # the same. Only omit a cost that contributes zero to the objective.
+            reports.append({"partition_count": count, "points_per_patch": size // count,
+                            "weight": weight, "exact_patch_solves": 0, "cost_seconds": 0.,
+                            "cost_status": "skipped_zero_weight",
+                            "selected_mean_w2_squared": None})
+            scale_costs.append(None)
+            if progress:
+                progress(f"scale={level + 1}/{len(counts)} patches={count} skipped_zero_weight")
+            continue
         level_start = perf_counter()
         source_groups = [source[source_labels[level] == i] for i in range(count)]
         target_groups = [target[target_labels[level] == j] for j in range(count)]
@@ -266,7 +284,10 @@ def multiscale_permutation(source, target, partition_counts, scale_weights,
         permutation[source_ids] = target_ids[local]
     if not np.array_equal(np.sort(permutation), np.arange(size)):
         raise RuntimeError("Internal error: matching is not bijective")
-    for report, (matrix, a, b) in zip(reports, scale_costs):
+    for report, scale_cost in zip(reports, scale_costs):
+        if scale_cost is None:
+            continue
+        matrix, a, b = scale_cost
         report["selected_mean_w2_squared"] = float(matrix[a, b[leaf_permutation]].mean())
     diagnostics = {"partition_seconds": partition_seconds, "scales": reports,
                    "partition_settings": partitions,
@@ -296,14 +317,19 @@ def draw_supersets(config, dataset):
 
 def cache_spec(config, dataset):
     opts = settings(config)
-    spec = {"format_version": FORMAT_VERSION, "implementation": IMPLEMENTATION,
+    # Earlier ablations computed all costs even when their weight was zero.
+    # Their mapping is equivalent, but their preprocessing timings are not.
+    # Fail closed instead of silently reusing those old timing measurements.
+    skips_zero = any(weight == 0 for weight in opts["scale_weights"])
+    implementation = ZERO_WEIGHT_IMPLEMENTATION if skips_zero else IMPLEMENTATION
+    spec = {"format_version": FORMAT_VERSION, "implementation": implementation,
             "superset_size": opts["superset_size"], "cache_seed": opts["cache_seed"],
             "partition_counts": opts["partition_counts"], "scale_weights": opts["scale_weights"],
             "dataset_spec": dataset_spec(config, dataset)}
     # Old axis/axis caches remain valid. PCA caches have a distinct identity and
     # cannot be silently accepted by a baseline config (or vice versa).
     if "pca" in (opts["source_partition"], opts["target_partition"]):
-        spec.update(implementation=PCA_IMPLEMENTATION,
+        spec.update(implementation=PCA_ZERO_WEIGHT_IMPLEMENTATION if skips_zero else PCA_IMPLEMENTATION,
                     partition_settings=partition_settings(opts["source_partition"],
                                                           opts["target_partition"], opts["pca_eigengap_tol"]))
     return spec

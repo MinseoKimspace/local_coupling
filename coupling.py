@@ -11,7 +11,8 @@ import torch.nn.functional as F
 ALIASES = {"global_hungarian": "global_ot", "geometry_aware_hungarian": "geometry_aware_ot"}
 CLOUD_METHODS = {"minibatch_ot", "equivariant_ot_permutation"}
 TG_CACHED_METHODS = {"target_guided_cached"}
-OFFLINE_METHODS = {"nsot", "multiscale_wasserstein"} | TG_CACHED_METHODS
+# QAT caches a target tree, not a finite source bank; its pairs are drawn online.
+OFFLINE_METHODS = {"nsot", "multiscale_wasserstein", "qat"} | TG_CACHED_METHODS
 
 METHODS = {
     "independent": ("none", "none", "none"),
@@ -47,6 +48,15 @@ def balanced_partition_solver(method):
 
 def coupling_info(name: str) -> dict:
     name = canonical_method(name)
+    if name == "qat":
+        return {"method": name, "implementation": "qat_max_variance_mean_singleton_cdf_v1",
+                "paper": "https://arxiv.org/abs/2609.03443",
+                "author_code": False, "target_partition": "max_variance_axis_mean_split_to_singletons",
+                "source_assignment": "conditional_gaussian_quantile_aligned_tree",
+                "local_pairing": "independent_within_leaf; no point OT",
+                "plan_sampling": "uniform_target_index_and_fresh_truncated_gaussian",
+                "inference_source": "fresh_iid_standard_gaussian_no_cache",
+                "scope": "QAT coupling with this project's unchanged 2D backbone, not full paper reproduction"}
     if name == "multiscale_wasserstein":
         return {"method": name, "implementation": "nested_equal_mass_patch_w2_exact_v1",
                 "target_partition": "nested_equal_mass_spatial_kd",
@@ -268,7 +278,10 @@ def coupling_permutation(source, target, *, coupling, num_regions=None, target_c
                          sinkhorn_epsilon=0.1, sinkhorn_iterations=100, generator=None):
     method = canonical_method(coupling)
     if method in OFFLINE_METHODS:
-        sampler = {"nsot": "NSOTPairSampler", "multiscale_wasserstein": "MultiscaleWassersteinSampler"}.get(method, "TGCachedPairSampler")
+        sampler = {"nsot": "NSOTPairSampler", "multiscale_wasserstein": "MultiscaleWassersteinSampler",
+                   "qat": "QATPairSampler"}.get(method, "TGCachedPairSampler")
+        if method == "qat":
+            raise ValueError("qat samples from a cached target tree; use QATPairSampler, not a fresh-cloud permutation")
         raise ValueError(f"{method} samples precomputed pairs; use {sampler}, not a fresh-cloud permutation")
     if method in CLOUD_METHODS:
         raise ValueError(f"{method} reassigns clouds; use coupled_points to obtain both paired tensors")
@@ -319,7 +332,8 @@ def coupled_points(source, target, *, coupling, **options):
     """Pair [B, N, D] tensors, allowing cloud resampling as well as point permutations."""
     method = canonical_method(coupling)
     if method in OFFLINE_METHODS:
-        sampler = {"nsot": "NSOTPairSampler", "multiscale_wasserstein": "MultiscaleWassersteinSampler"}.get(method, "TGCachedPairSampler")
+        sampler = {"nsot": "NSOTPairSampler", "multiscale_wasserstein": "MultiscaleWassersteinSampler",
+                   "qat": "QATPairSampler"}.get(method, "TGCachedPairSampler")
         raise ValueError(f"{method} requires {sampler} and its offline cache")
     if source.ndim != 3 or source.shape != target.shape or min(source.shape) < 1:
         raise ValueError("Source and target must have the same nonempty [B, N, D] shape")
