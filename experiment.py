@@ -200,9 +200,7 @@ def evaluation_title(config):
                 f"N={config['data']['n_points']} | seed={config['seed']}")
     if method == "multiscale_wasserstein":
         bank = config["multiscale_wasserstein"]
-        partitions = "/".join(map(str, bank["partition_counts"]))
-        weights = "/".join(f"{value:g}" for value in bank.get("scale_weights", [1] * len(bank["partition_counts"])))
-        return (f"MS-W2 | M={bank['superset_size']} | P={partitions} | W={weights}\n"
+        return (f"MS-W2 | M={bank['superset_size']}\n"
                 f"N={config['data']['n_points']} | seed={config['seed']}")
     if method == "nsot":
         bank = config["nsot"]

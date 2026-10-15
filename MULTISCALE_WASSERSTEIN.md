@@ -10,10 +10,9 @@ Default: one multiscale model per dataset, bank size **M=10,000**, 256 points pe
 
 ## Run on the experiment machine
 
-For the five-condition patch-count and scale-weight experiment, see
-[MULTISCALE_ABLATION.md](MULTISCALE_ABLATION.md). Its separate entry point is
-`python run_multiscale_ablation.py`; the default command writes configs and a
-manifest without preparing banks or training.
+For read-only coupling geometry, Gaussian routing, fitting/context and bank/fresh
+generation checks on an existing checkpoint, see
+[MSW2_COUPLING_DIAGNOSTICS.md](MSW2_COUPLING_DIAGNOSTICS.md).
 
 From the project directory, prepare, train and evaluate both datasets:
 
