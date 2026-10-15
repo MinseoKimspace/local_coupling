@@ -130,6 +130,18 @@ class CouplingTests(unittest.TestCase):
 
 
 class MetricModelTests(unittest.TestCase):
+    def test_removed_time_training_options_fail_before_training(self):
+        for key, value in (("time_weighting", {"mode": "late"}), ("time_seed", 2)):
+            config = {"training": {key: value}}
+            with self.subTest(key=key), patch.object(train, "save_training") as save, \
+                    self.assertRaisesRegex(ValueError, "Removed experimental training options"):
+                train.train_model(None, config, None, dataset="checkerboard", config_path="unused.yaml")
+            save.assert_not_called()
+
+    def test_removed_overlap_coupling_is_not_registered(self):
+        with self.assertRaisesRegex(ValueError, "Unknown coupling"):
+            coupling.canonical_method("multiscale_overlap")
+
     def test_shared_loss_preserves_independent_train_step(self):
         torch.manual_seed(11)
         model = torch.nn.Linear(2, 2)

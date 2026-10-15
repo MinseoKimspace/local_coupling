@@ -284,7 +284,10 @@ def audit(config_path, dataset=None, *, bank=None, device=None, clouds=32, batch
         data = DiagnosticData(config, dataset, parameter.device, parameter.dtype, seed)
         spatial = SpatialRegions(config, dataset, data.mask, grid_bins=grid_bins, roi_file=roi_file)
         paired = target[permutation]
-        levels = msw.balanced_partitions(source, config[msw.METHOD]["partition_counts"])
+        partition_options = msw.settings(config)
+        levels = msw.balanced_partitions(
+            source, partition_options["partition_counts"], strategy=partition_options["source_partition"],
+            pca_eigengap_tol=partition_options["pca_eigengap_tol"])
         print("diagnostic=1/4 coupling_geometry", flush=True)
         geometry, geometry_rows, geometry_arrays = geometry_audit(source, paired, levels, neighbors=neighbors,
                                                                  times=times, distance_bins=distance_bins)

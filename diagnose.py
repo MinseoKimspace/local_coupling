@@ -103,9 +103,6 @@ def diagnose(config_path, dataset, *, batches=8, batch_size=None, seed=2026, ref
     if config["coupling"] == "multiscale_wasserstein":
         from multiscale_wasserstein import MultiscaleWassersteinSampler
         pair_sampler = MultiscaleWassersteinSampler(config, dataset, device, dtype)
-    elif config["coupling"] == "multiscale_overlap":
-        from multiscale_overlap import MultiscaleOverlapSampler
-        pair_sampler = MultiscaleOverlapSampler(config, dataset, device, dtype)
     elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, dataset, device, dtype)

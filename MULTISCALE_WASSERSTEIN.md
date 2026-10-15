@@ -14,10 +14,6 @@ For read-only coupling geometry, Gaussian routing, fitting/context and bank/fres
 generation checks on an existing checkpoint, see
 [MSW2_COUPLING_DIAGNOSTICS.md](MSW2_COUPLING_DIAGNOSTICS.md).
 
-For the separate A/B/C/D study of overlapping boundary-window reassignment and
-late-time loss weighting, see [MSW2_BOUNDARY_STUDY.md](MSW2_BOUNDARY_STUDY.md).
-That runner does not change the baseline defaults below.
-
 From the project directory, prepare, train and evaluate both datasets:
 
 ```powershell
@@ -167,6 +163,127 @@ producing density/scatter grids and per-NFE strips for horse and checkerboard.
 No retraining or training-bank access is required.
 
 ## Matching construction
+
+### Controlled partition experiment: axis vs PCA
+
+This is a **2D experiment in the current repository**, not the proposed 3D port.
+The baseline remains unchanged unless the new options are explicitly selected.
+The study varies only how patch memberships are constructed:
+
+| Variant | Source partition | Target partition |
+| --- | --- | --- |
+| `axis_axis` | Original widest-coordinate-range splits | Original widest-coordinate-range splits |
+| `axis_pca` | Original splits | Local PCA projection splits |
+| `pca_pca` | Local PCA projection splits | Local PCA projection splits |
+
+Run from the project directory on the lab machine:
+
+```powershell
+python run_multiscale.py --partition-study --stage all --device cuda
+```
+
+This prepares and trains **six models**: three variants on checkerboard and three
+on horse. Defaults remain M=10,000, N=256, levels `[4,20,100]`, relative weights
+`[1,1,1]`, seed 0, 10,000 updates and uniform-time unweighted FM. It uses the
+existing dataset-specific architecture, optimizer, evaluator and native PNG renderer.
+NFE values are 1, 2, 4, 8, 16, 32, 64 and 128. No noise, late-time weighting,
+overlap/refinement, coordinate rotation, new loss or Sinkhorn backend is added.
+
+Prepare only, without training:
+
+```powershell
+python run_multiscale.py --partition-study
+```
+
+The printed `experiment_manifest=...` is under
+`eval_results/partition_study/multiscale_TIMESTAMP_ID/manifest.json`.
+Resume with that **actual** path; do not repeat `--partition-study` on resume:
+
+```powershell
+python run_multiscale.py --manifest "eval_results/partition_study/multiscale_TIMESTAMP_ID/manifest.json" --stage all
+```
+
+Other supported runs:
+
+```powershell
+python run_multiscale.py --partition-study --datasets horse --stage all --device cuda
+python run_multiscale.py --partition-study --seeds 0 1 2 --stage all --device cuda
+python run_multiscale.py --partition-study --smoke --stage all
+```
+
+Smoke is a tiny CPU two-update integration check, **not performance evidence**.
+Three model seeds train 18 models; the three banks per dataset are shared across
+model seeds. `--bank-seed` controls the endpoint bank independently.
+`--partition-study` cannot be combined with `--with-nsot` or individual partition
+overrides. For an individual variant rather than the three-way study:
+
+```powershell
+python run_multiscale.py --source-partition axis --target-partition pca --stage all --device cuda
+```
+
+The corresponding optional YAML fields, inside `multiscale_wasserstein`, are:
+
+```yaml
+source_partition: axis
+target_partition: pca
+pca_eigengap_tol: 0.000001
+```
+
+For an individual YAML, use a distinct cache path for each variant. The runner
+automatically creates separate content-addressed paths. Historical axis/axis
+caches remain loadable; a PCA cache cannot be loaded as an axis baseline or with
+a different PCA tolerance. Nothing overwrites an existing incompatible cache.
+
+**PCA definition.** At every recursive split, compute the centered covariance in
+float64 and sort by the leading principal-component projection. Retain the original
+capacity split formula, original-index tie breaking, and parent-to-child hierarchy.
+For example, a five-way split recursively allocates two groups to the left and
+three to the right; it is not an independent five-cluster fit. Fix eigenvector
+sign by making its largest-absolute component positive. If the leading eigenvalue
+is zero or the relative top eigengap is at most `pca_eigengap_tol`, use the original
+widest-coordinate-axis split. Split counts, fallback counts and the minimum observed
+relative eigengap are recorded separately for source and target. This is a
+deterministic degeneracy rule, not a learnability penalty or a claim of complete
+rotation invariance. PCA also changes range-based direction selection to a
+variance-based direction, not just the allowable angle.
+
+Only temporary sorting projections are centered/projected. **All OT costs and
+training endpoints use the unchanged original coordinates.** Every patch remains
+equal-sized, every fine patch has an actual ancestor at each level, and final
+matching remains exact leaf assignment followed by exact within-leaf assignment.
+
+Before training, the runner checks equality of the actual source and target arrays
+across all study variants. Bank construction does not consume the training RNG.
+For a fixed dataset/model seed, variants use the same initialization seed,
+with-replacement pair-index RNG and uniform-time RNG; target partners differ.
+Evaluation uses the same fresh Gaussian protocol. Numerical reproducibility across
+different GPU/software environments is not guaranteed by common seeds alone.
+
+Study outputs beside its manifest:
+
+- `summary.json`: complete evaluator metrics, provenance and timings.
+- `comparison.csv`: CD, leakage, histogram JS, checkerboard mass error, horse ROI
+  metrics, training/inference times, and exact artifact paths.
+- `bank_comparison.csv`: endpoint hashes, coupling costs, preparation times and PCA
+  split/fallback diagnostics. Repeated model seeds refer to the same bank; use
+  `summary.json` for unique-bank compute totals.
+- `<dataset>_seed<seed>_nfe_<NFE>_comparison.png`: left-to-right `axis_axis`,
+  `axis_pca`, `pca_pca`, assembled from the **original evaluator PNGs**, without
+  rerunning inference or replacing the rendering style. Generated once all three
+  variants for that dataset/seed/NFE exist.
+
+Original per-model JSON/PNG files remain in `eval_results/<dataset>/`; checkpoints
+remain in `runs/<dataset>/`. Completed runs/evaluations are hash-verified and reused.
+An interrupted training run is restarted (the existing trainer does not save
+optimizer-resume checkpoints). Printed paths are resolved on the executing lab
+machine; no developer-machine path is required in the commands or templates.
+
+Judge NFE 1 and high-NFE generation jointly using quality metrics and images.
+Lower transport cost, compact patches or lower fitting MSE alone do not establish
+an improvement. The existing four-way coupling audit also reads the configured
+source partition, so PCA checkpoints are not incorrectly diagnosed with axis leaves.
+
+### Original exact matching steps
 
 1. Draw one standard Gaussian source superset and one target superset with the same isolated sampler and cache seed as the existing 2D NSOT implementation. Keep both arrays unchanged.
 2. Independently build **nested balanced spatial partitions** of the two point sets. Defaults contain 4, 20 and 100 patches. Each patch at a level has equal mass; finest patches contain 100 points for M=10,000.

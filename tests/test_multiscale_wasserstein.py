@@ -91,6 +91,136 @@ class MultiscaleWassersteinTests(unittest.TestCase):
         expected = min(cost[np.arange(4), list(order)].mean() for order in permutations(range(4)))
         self.assertAlmostEqual(msw.patch_wasserstein_squared(source, target), expected, places=12)
 
+    def test_axis_default_reproduces_original_recursive_algorithm(self):
+        def original_split(points, indices, groups):
+            if groups == 1:
+                return [indices]
+            axis = int(np.argmax(np.ptp(points[indices].astype(np.float64), axis=0)))
+            ordered = indices[np.lexsort((indices, points[indices, axis]))]
+            left = groups // 2
+            cut = (len(indices) // groups) * left
+            return original_split(points, ordered[:cut], left) + original_split(points, ordered[cut:], groups-left)
+
+        points = np.random.default_rng(3).integers(-4, 5, size=(200, 2)).astype(np.float32)
+        groups, previous = [np.arange(len(points))], 1
+        for count, actual in zip([4, 20, 100], msw.balanced_partitions(points, [4, 20, 100])):
+            groups = [child for parent in groups for child in original_split(points, parent, count // previous)]
+            expected = np.empty(len(points), dtype=np.int64)
+            for label, members in enumerate(groups):
+                expected[members] = label
+            np.testing.assert_array_equal(actual, expected)
+            previous = count
+
+    def test_pca_is_nested_balanced_deterministic_and_does_not_move_points(self):
+        points = np.random.default_rng(12).normal(size=(200, 2)).astype(np.float32)
+        points[:, 1] += points[:, 0] * 2
+        original = points.copy()
+        diagnostics = {}
+        levels = msw.balanced_partitions(points, [4, 20, 100], strategy="pca", diagnostics=diagnostics)
+        again = msw.balanced_partitions(points, [4, 20, 100], strategy="pca")
+        self.assertEqual(diagnostics["splits"], 99)
+        self.assertGreater(diagnostics["pca_splits"], 0)
+        for count, labels, repeated in zip([4, 20, 100], levels, again):
+            np.testing.assert_array_equal(labels, repeated)
+            np.testing.assert_array_equal(np.bincount(labels), np.full(count, 200 // count))
+        for coarse, fine in zip(levels[:-1], levels[1:]):
+            for child in np.unique(fine):
+                self.assertEqual(len(np.unique(coarse[fine == child])), 1)
+        np.testing.assert_array_equal(points, original)
+        self.assertFalse(np.array_equal(levels[-1], msw.balanced_partitions(points, [4, 20, 100])[-1]))
+
+    def test_pca_sign_is_canonical_and_degenerate_patches_fall_back(self):
+        points = np.random.default_rng(9).normal(size=(100, 2)) @ np.array([[3., 2.], [0., 1.]])
+        expected = msw.balanced_partitions(points, [4, 20, 100], strategy="pca")
+        eigh = np.linalg.eigh
+
+        def opposite_sign(matrix):
+            values, vectors = eigh(matrix)
+            return values, -vectors
+
+        with patch.object(msw.np.linalg, "eigh", side_effect=opposite_sign):
+            flipped = msw.balanced_partitions(points, [4, 20, 100], strategy="pca")
+        for left, right in zip(expected, flipped):
+            np.testing.assert_array_equal(left, right)
+        for points in (np.zeros((20, 2)), np.tile([[1., 0.], [-1., 0.], [0., 1.], [0., -1.]], (5, 1))):
+            diagnostics = {}
+            labels = msw.balanced_partitions(points, [2], strategy="pca", diagnostics=diagnostics)
+            self.assertEqual(diagnostics["axis_fallbacks"], 1)
+            np.testing.assert_array_equal(labels[0], msw.balanced_partitions(points, [2])[0])
+        # Positive but near-degenerate covariance also uses the documented fallback.
+        points[:, 0] *= 1.00000001
+        diagnostics = {}
+        msw.balanced_partitions(points, [2], strategy="pca", diagnostics=diagnostics)
+        self.assertEqual(diagnostics["axis_fallbacks"], 1)
+
+    def test_pca_variants_keep_exact_matching_and_original_coordinates(self):
+        rng = np.random.default_rng(73)
+        source, target = rng.normal(size=(16, 2)), rng.normal(size=(16, 2))
+        original = source.copy(), target.copy()
+        for source_method, target_method in (("axis", "pca"), ("pca", "pca")):
+            sl = msw.balanced_partitions(source, [2, 4], strategy=source_method)
+            tl = msw.balanced_partitions(target, [2, 4], strategy=target_method)
+            costs = np.zeros((4, 4))
+            for labels_s, labels_t in zip(sl, tl):
+                for i in range(4):
+                    a = labels_s[np.flatnonzero(sl[-1] == i)[0]]
+                    for j in range(4):
+                        b = labels_t[np.flatnonzero(tl[-1] == j)[0]]
+                        costs[i, j] += .5 * self.direct_w2(source[labels_s == a], target[labels_t == b])
+            order, info = msw.multiscale_permutation(
+                source, target, [2, 4], [1., 1.], source_partition=source_method, target_partition=target_method)
+            np.testing.assert_array_equal(np.sort(order), np.arange(16))
+            optimum = min(costs[np.arange(4), list(p)].mean() for p in permutations(range(4)))
+            self.assertAlmostEqual(info["multiscale_objective"], optimum)
+            for i in range(4):
+                ids = np.flatnonzero(sl[-1] == i)
+                mapped = np.unique(tl[-1][order[ids]])
+                self.assertEqual(len(mapped), 1)
+                self.assertAlmostEqual(np.square(source[ids] - target[order[ids]]).sum(1).mean(),
+                                       self.direct_w2(source[ids], target[tl[-1] == mapped[0]]))
+        np.testing.assert_array_equal(source, original[0])
+        np.testing.assert_array_equal(target, original[1])
+
+    def test_partition_options_validate_and_cache_mismatches_fail_closed(self):
+        for options in ({"source_partition": "random"}, {"target_partition": None},
+                        {"pca_eigengap_tol": True}, {"pca_eigengap_tol": -1},
+                        {"pca_eigengap_tol": float("nan")}, {"pca_eigengap_tol": 1}):
+            config = self.config()
+            config[msw.METHOD].update(options)
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                msw.settings(config)
+        config = self.config()
+        self.prepare(config)
+        source, target, _, old_metadata, _ = msw.load_cache(config, "checkerboard")
+        # Old axis caches have no partition fields; keep them loadable.
+        old_metadata.pop("partition_settings")
+        old_metadata.pop("partition_diagnostics")
+        with np.load(config[msw.METHOD]["cache"], allow_pickle=False) as archive:
+            order = archive["permutation"]
+        np.savez_compressed(config[msw.METHOD]["cache"], source=source, target=target,
+                            permutation=order, metadata=np.array(json.dumps(old_metadata)))
+        msw.load_cache(config, "checkerboard")
+        for source_method, target_method in (("axis", "pca"), ("pca", "pca")):
+            changed = copy.deepcopy(config)
+            changed[msw.METHOD].update(source_partition=source_method, target_partition=target_method)
+            with self.assertRaisesRegex(ValueError, "mismatch"):
+                msw.load_cache(changed, "checkerboard")
+            changed[msw.METHOD]["cache"] = f"{source_method}_{target_method}.npz"
+            self.prepare(changed)
+            actual_s, actual_t, _, metadata, _ = msw.load_cache(changed, "checkerboard")
+            np.testing.assert_array_equal(actual_s, source)
+            np.testing.assert_array_equal(actual_t, target)
+            self.assertEqual(metadata["implementation"], msw.PCA_IMPLEMENTATION)
+            sampler = msw.MultiscaleWassersteinSampler(changed, "checkerboard", "cpu", torch.float32)
+            self.assertEqual(sampler.details()["target_partition"], "nested_equal_mass_spatial_pca")
+            mismatched = copy.deepcopy(changed)
+            mismatched[msw.METHOD]["pca_eigengap_tol"] = .1
+            with self.assertRaisesRegex(ValueError, "partition_settings"):
+                msw.load_cache(mismatched, "checkerboard")
+            mismatched[msw.METHOD].update(source_partition="axis", target_partition="axis")
+            with self.assertRaisesRegex(ValueError, "implementation"):
+                msw.load_cache(mismatched, "checkerboard")
+
     def test_identity_translation_and_single_scale_global_exact_limit(self):
         rng = np.random.default_rng(3)
         source = rng.normal(size=(16, 2))

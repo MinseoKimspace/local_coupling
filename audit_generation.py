@@ -120,9 +120,6 @@ def fm_summary(model, config, data, batches, batch_size, seed):
     if config["coupling"] == "multiscale_wasserstein":
         from multiscale_wasserstein import MultiscaleWassersteinSampler
         pair_sampler = MultiscaleWassersteinSampler(config, data.dataset, parameter.device, parameter.dtype)
-    elif config["coupling"] == "multiscale_overlap":
-        from multiscale_overlap import MultiscaleOverlapSampler
-        pair_sampler = MultiscaleOverlapSampler(config, data.dataset, parameter.device, parameter.dtype)
     elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, data.dataset, parameter.device, parameter.dtype)

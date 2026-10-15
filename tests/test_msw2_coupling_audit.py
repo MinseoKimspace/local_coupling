@@ -58,9 +58,13 @@ class CouplingAuditIntegrationTests(unittest.TestCase):
             config["data"]["grid_size"] = 4
         return config
 
-    def fixture(self, dataset="checkerboard"):
+    def fixture(self, dataset="checkerboard", *, source_partition=None, target_partition=None):
         torch.manual_seed(7)
         config = self.config(dataset)
+        if source_partition is not None:
+            config[msw.METHOD]["source_partition"] = source_partition
+        if target_partition is not None:
+            config[msw.METHOD]["target_partition"] = target_partition
         bank, metadata = msw.prepare(config, dataset)
         digest = self.sha256(bank)
         cls = HorsePointSetTransformer if dataset == "horse" else PointSetTransformer
@@ -68,6 +72,15 @@ class CouplingAuditIntegrationTests(unittest.TestCase):
         run = save_training(model, config, dataset, "fixture.yaml", 0., 0.,
                             coupling_metadata={**metadata, "cache_sha256": digest})
         return run / "config.yaml", run / config["checkpoint"], bank
+
+    def test_pca_checkpoint_audit_uses_the_actual_source_partition(self):
+        config, _, _ = self.fixture(source_partition="pca", target_partition="pca")
+        with patch.object(msw, "balanced_partitions", wraps=msw.balanced_partitions) as partitions:
+            directory = audit(config, "checkerboard", **self.options())
+        partitions.assert_called_once()
+        self.assertEqual(partitions.call_args.kwargs["strategy"], "pca")
+        report = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["bank_metadata"]["partition_settings"]["source_partition"], "pca")
 
     @staticmethod
     def sha256(path):

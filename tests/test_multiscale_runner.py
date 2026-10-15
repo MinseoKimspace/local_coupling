@@ -23,7 +23,9 @@ class MultiscaleRunnerTests(unittest.TestCase):
         torch.set_num_threads(1)
         self.cache_patch = patch.object(
             runner, "_cache_path", side_effect=lambda config, dataset, method:
-            self.directory / "cache" / method / f"{dataset}_{config[method]['superset_size']}.npz")
+            self.directory / "cache" / method / (
+                f"{dataset}_{config[method]['superset_size']}_"
+                f"{config[method].get('source_partition', 'axis')}_{config[method].get('target_partition', 'axis')}.npz"))
         self.cache_patch.start()
         self.stdout_patch = contextlib.redirect_stdout(io.StringIO())
         self.stdout_patch.__enter__()
@@ -105,6 +107,117 @@ class MultiscaleRunnerTests(unittest.TestCase):
         self.assertIsNone(job["run"])
         self.assertEqual(job["evaluations"], {})
         self.assertTrue(manifests[0].with_name("summary.json").is_file())
+
+    def test_partition_study_creates_three_controlled_variants_per_dataset_and_seed(self):
+        _, manifest = self.create(smoke=False, datasets=["checkerboard", "horse"],
+                                  seeds=[0, 1], partition_study=True)
+        self.assertEqual(len(manifest["jobs"]), 12)
+        self.assertTrue(manifest["partition_study"])
+        for dataset in manifest["datasets"]:
+            for seed in (0, 1):
+                jobs = [j for j in manifest["jobs"] if j["dataset"] == dataset and j["seed"] == seed]
+                configs = [runner.verify_job(job) for job in jobs]
+                self.assertEqual([j["label"] for j in jobs], [v[0] for v in runner.PARTITION_VARIANTS])
+                self.assertEqual(len({c[msw.METHOD]["cache"] for c in configs}), 3)
+                for key in ("model", "data", "training", "evaluation", "seed", "dtype", "device"):
+                    self.assertTrue(all(c[key] == configs[0][key] for c in configs))
+                for config, (_, source, target) in zip(configs, runner.PARTITION_VARIANTS):
+                    self.assertEqual(config[msw.METHOD]["source_partition"], source)
+                    self.assertEqual(config[msw.METHOD]["target_partition"], target)
+                    self.assertEqual(config[msw.METHOD]["partition_counts"], [4, 20, 100])
+                    self.assertEqual(config[msw.METHOD]["scale_weights"], [1., 1., 1.])
+        for options in ({"with_nsot": True}, {"source_partition": "pca"}, {"target_partition": "axis"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.create(partition_study=True, **options)
+
+    def test_partition_study_checks_endpoints_and_writes_bank_report(self):
+        path, manifest = self.create(partition_study=True, seeds=[0, 1])
+        runner.prepare_jobs(path, manifest)
+        self.assertTrue(manifest["endpoint_checks"]["checkerboard"]["same_source"])
+        self.assertTrue(manifest["endpoint_checks"]["checkerboard"]["same_target"])
+        self.assertEqual(len({j["bank"]["path"] for j in manifest["jobs"]}), 3)
+        runner.write_summary(path, manifest)
+        self.assertTrue(path.with_name("bank_comparison.csv").is_file())
+        self.assertTrue(path.with_name("comparison.csv").is_file())
+        with patch.object(runner.np, "array_equal", return_value=False), \
+                self.assertRaisesRegex(ValueError, "endpoints differ"):
+            runner.prepare_jobs(path, manifest)
+
+    def test_partition_study_cli_and_resume_flags(self):
+        original = runner.create_experiment
+        with patch.object(sys, "argv", ["run_multiscale.py", "--partition-study", "--smoke",
+                                         "--datasets", "checkerboard"]), \
+                patch.object(runner, "create_experiment", side_effect=lambda **kw:
+                             original(**kw, output_root=self.directory / "experiments")), \
+                patch.object(runner, "train_jobs", side_effect=AssertionError("unexpected training")):
+            runner.main()
+        path = next((self.directory / "experiments").glob("*/manifest.json"))
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(len(manifest["jobs"]), 3)
+        with patch.object(sys, "argv", ["run_multiscale.py", "--manifest", str(path)]):
+            runner.main()
+        for flags in (["--partition-study"], ["--source-partition", "pca"], ["--target-partition", "pca"]):
+            with patch.object(sys, "argv", ["run_multiscale.py", "--manifest", str(path), *flags]), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                runner.main()
+
+    def test_partition_cache_key_changes_with_strategy_and_pca_tolerance(self):
+        self.cache_patch.stop()
+        try:
+            config = runner._read_yaml(runner.ROOT / "multiscale_experiments/checkerboard.yaml")
+            paths = [runner._cache_path(config, "checkerboard", msw.METHOD)]
+            config[msw.METHOD]["target_partition"] = "pca"
+            paths.append(runner._cache_path(config, "checkerboard", msw.METHOD))
+            config[msw.METHOD]["source_partition"] = "pca"
+            paths.append(runner._cache_path(config, "checkerboard", msw.METHOD))
+            config[msw.METHOD]["pca_eigengap_tol"] = .01
+            paths.append(runner._cache_path(config, "checkerboard", msw.METHOD))
+            self.assertEqual(len(set(paths)), 4)
+        finally:
+            self.cache_patch.start()
+
+    def test_partition_study_real_tiny_train_eval_reports_and_rng_pairing(self):
+        import numpy as np
+        from PIL import Image
+        from experiment import evaluation_title
+
+        path, manifest = self.create(partition_study=True, datasets=["checkerboard", "horse"])
+        runner.prepare_jobs(path, manifest)
+        for dataset in manifest["datasets"]:
+            samplers = [msw.MultiscaleWassersteinSampler(runner.verify_job(j), dataset, "cpu", torch.float32)
+                        for j in manifest["jobs"] if j["dataset"] == dataset]
+            sources = [sampler.sample(2, generator=torch.Generator().manual_seed(9))[0] for sampler in samplers]
+            for source in sources[1:]:
+                torch.testing.assert_close(source, sources[0], rtol=0, atol=0)
+        with patch.object(runner, "ROOT", self.directory):
+            runner.train_jobs(path, manifest)
+            runner.evaluate_jobs(path, manifest)
+        runner.write_summary(path, manifest)
+        for job in manifest["jobs"]:
+            self.assertIsNotNone(job["run"])
+            self.assertEqual(set(job["evaluations"]), {"1", "2"})
+            config = runner.verify_job(job)
+            self.assertIn(config[msw.METHOD]["target_partition"], evaluation_title(config))
+        for dataset in manifest["datasets"]:
+            comparison = path.with_name(f"{dataset}_seed0_nfe_001_comparison.png")
+            self.assertTrue(comparison.is_file())
+            with Image.open(comparison) as combined:
+                width = 0
+                for job in [j for j in manifest["jobs"] if j["dataset"] == dataset]:
+                    with Image.open(job["evaluations"]["1"]["png"]["path"]) as original:
+                        np.testing.assert_array_equal(
+                            np.asarray(combined.crop((width, 0, width + original.width, original.height))),
+                            np.asarray(original.convert("RGB")))
+                        width += original.width
+                self.assertEqual(width, combined.width)
+        with patch.object(runner, "ROOT", self.directory):
+            # Resume must reuse completed jobs/images, rather than perform new inference.
+            with patch("train.main", side_effect=AssertionError("trained again")), \
+                    patch("train_horse.main", side_effect=AssertionError("trained again")), \
+                    patch("eval.main", side_effect=AssertionError("evaluated again")), \
+                    patch("eval_horse.main", side_effect=AssertionError("evaluated again")):
+                runner.train_jobs(path, manifest)
+                runner.evaluate_jobs(path, manifest)
 
     def test_removed_experiment_flags_are_rejected_without_creating_jobs(self):
         for arguments in (["--with-refinement"], ["--add-refinement"],

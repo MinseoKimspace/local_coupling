@@ -25,6 +25,20 @@ from nsot import dataset_spec, file_sha256, source_moments
 METHOD = "multiscale_wasserstein"
 FORMAT_VERSION = 1
 IMPLEMENTATION = "nested_equal_mass_patch_w2_exact_v1"
+PCA_IMPLEMENTATION = "nested_equal_mass_patch_w2_exact_pca_v1"
+PARTITION_METHODS = ("axis", "pca")
+PCA_EIGENGAP_TOL = 1e-6
+
+
+def partition_settings(source="axis", target="axis", eigengap_tol=PCA_EIGENGAP_TOL):
+    for name, value in (("source_partition", source), ("target_partition", target)):
+        if not isinstance(value, str) or value not in PARTITION_METHODS:
+            raise ValueError(f"{name} must be axis or pca")
+    if isinstance(eigengap_tol, bool) or not isinstance(eigengap_tol, (int, float)) \
+            or not math.isfinite(eigengap_tol) or not 0 <= eigengap_tol < 1:
+        raise ValueError("pca_eigengap_tol must be finite and in [0,1)")
+    return {"source_partition": source, "target_partition": target,
+            "pca_eigengap_tol": float(eigengap_tol)}
 
 
 def _integer(value, name, minimum=1, maximum=None):
@@ -75,7 +89,8 @@ def settings(config):
     if not isinstance(raw, dict):
         raise ValueError(f"{METHOD} must be a mapping")
     unknown = raw.keys() - {"cache", "cache_sha256", "superset_size", "cache_seed",
-                            "partition_counts", "scale_weights", "max_cost_mib"}
+                            "partition_counts", "scale_weights", "max_cost_mib",
+                            "source_partition", "target_partition", "pca_eigengap_tol"}
     if unknown:
         raise ValueError("Unsupported multiscale settings: " + ", ".join(sorted(unknown)))
     size = _integer(raw.get("superset_size", 10000), "superset_size", maximum=10000)
@@ -91,8 +106,12 @@ def settings(config):
         raise ValueError("Multiscale bank currently supports 2D only")
     _integer(config["data"]["n_points"], "n_points", maximum=size)
     validate_gaussian_source(config)
+    partitions = partition_settings(raw.get("source_partition", "axis"),
+                                    raw.get("target_partition", "axis"),
+                                    raw.get("pca_eigengap_tol", PCA_EIGENGAP_TOL))
     return {"cache": path, "superset_size": size, "cache_seed": seed,
-            "partition_counts": counts, "scale_weights": weights, "max_cost_mib": float(memory)}
+            "partition_counts": counts, "scale_weights": weights, "max_cost_mib": float(memory),
+            **partitions}
 
 
 def _points(points):
@@ -104,27 +123,66 @@ def _points(points):
     return value
 
 
-def _split_equal(points, indices, groups):
-    """Balanced kd subdivision; lexicographic original-index ties are stable."""
+def _partition_projection(points, indices, strategy, eigengap_tol, diagnostics):
+    """Choose a sorting coordinate only; never transform OT/training endpoints."""
+    patch = points[indices].astype(np.float64)
+    axis = int(np.argmax(np.ptp(patch, axis=0)))
+    if diagnostics is not None:
+        diagnostics["splits"] += 1
+    if strategy == "axis":
+        return points[indices, axis]  # Preserve the original baseline exactly.
+    centered = patch - patch.mean(axis=0)
+    covariance = centered.T @ centered / len(patch)
+    if not np.isfinite(covariance).all():
+        raise ValueError("Nonfinite PCA covariance")
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    largest = float(eigenvalues[-1])
+    gap = float((largest - eigenvalues[-2]) / largest) if largest > 0 else 0.
+    if diagnostics is not None:
+        previous = diagnostics["min_relative_eigengap"]
+        diagnostics["min_relative_eigengap"] = gap if previous is None else min(previous, gap)
+    if largest <= 0 or gap <= eigengap_tol:
+        if diagnostics is not None:
+            diagnostics["axis_fallbacks"] += 1
+        return points[indices, axis]
+    direction = eigenvectors[:, -1].copy()
+    # A sign flip changes recursive 2/3 splits, not just their label order.
+    pivot = int(np.argmax(np.abs(direction)))
+    if direction[pivot] < 0:
+        direction *= -1
+    if diagnostics is not None:
+        diagnostics["pca_splits"] += 1
+    return centered @ direction
+
+
+def _split_equal(points, indices, groups, strategy="axis", eigengap_tol=PCA_EIGENGAP_TOL,
+                 diagnostics=None):
+    """Balanced recursive subdivision; original-index ties are stable."""
     if groups == 1:
         return [indices]
-    axis = int(np.argmax(np.ptp(points[indices].astype(np.float64), axis=0)))
-    order = np.lexsort((indices, points[indices, axis]))
+    projection = _partition_projection(points, indices, strategy, eigengap_tol, diagnostics)
+    order = np.lexsort((indices, projection))
     ordered = indices[order]
     left_groups = groups // 2
     cut = (len(indices) // groups) * left_groups
-    return (_split_equal(points, ordered[:cut], left_groups)
-            + _split_equal(points, ordered[cut:], groups - left_groups))
+    return (_split_equal(points, ordered[:cut], left_groups, strategy, eigengap_tol, diagnostics)
+            + _split_equal(points, ordered[cut:], groups - left_groups, strategy, eigengap_tol, diagnostics))
 
 
-def balanced_partitions(points, partition_counts):
+def balanced_partitions(points, partition_counts, *, strategy="axis",
+                        pca_eigengap_tol=PCA_EIGENGAP_TOL, diagnostics=None):
     points = _points(points)
+    partition_settings(strategy, strategy, pca_eigengap_tol)
+    if diagnostics is not None:
+        diagnostics.update(strategy=strategy, splits=0, pca_splits=0, axis_fallbacks=0,
+                           min_relative_eigengap=None)
     if not isinstance(partition_counts, (list, tuple)) or not partition_counts:
         raise ValueError("partition_counts must be a nonempty list")
     counts, _ = _scales(len(points), partition_counts, [1] * len(partition_counts))
     groups, previous, result = [np.arange(len(points), dtype=np.int64)], 1, []
     for count in counts:
-        groups = [child for parent in groups for child in _split_equal(points, parent, count // previous)]
+        groups = [child for parent in groups for child in _split_equal(
+            points, parent, count // previous, strategy, pca_eigengap_tol, diagnostics)]
         labels = np.empty(len(points), dtype=np.int64)
         for label, indices in enumerate(groups):
             labels[indices] = label
@@ -152,7 +210,9 @@ def patch_wasserstein_squared(a, b):
 
 
 def multiscale_permutation(source, target, partition_counts, scale_weights,
-                          max_cost_mib=512, progress=None):
+                          max_cost_mib=512, progress=None, *, source_partition="axis",
+                          target_partition="axis", pca_eigengap_tol=PCA_EIGENGAP_TOL):
+    partitions = partition_settings(source_partition, target_partition, pca_eigengap_tol)
     source, target = _points(source), _points(target)
     if source.shape != target.shape:
         raise ValueError("Source and target must have matching shapes")
@@ -160,8 +220,11 @@ def multiscale_permutation(source, target, partition_counts, scale_weights,
     counts, weights = _scales(size, partition_counts, scale_weights)
     largest = _memory_guard(size, counts, max_cost_mib)
     start = perf_counter()
-    source_labels = balanced_partitions(source, counts)
-    target_labels = balanced_partitions(target, counts)
+    source_diagnostics, target_diagnostics = {}, {}
+    source_labels = balanced_partitions(source, counts, strategy=source_partition,
+                                       pca_eigengap_tol=pca_eigengap_tol, diagnostics=source_diagnostics)
+    target_labels = balanced_partitions(target, counts, strategy=target_partition,
+                                       pca_eigengap_tol=pca_eigengap_tol, diagnostics=target_diagnostics)
     partition_seconds = perf_counter() - start
     leaves = counts[-1]
     source_leaves = [np.flatnonzero(source_labels[-1] == i) for i in range(leaves)]
@@ -206,6 +269,8 @@ def multiscale_permutation(source, target, partition_counts, scale_weights,
     for report, (matrix, a, b) in zip(reports, scale_costs):
         report["selected_mean_w2_squared"] = float(matrix[a, b[leaf_permutation]].mean())
     diagnostics = {"partition_seconds": partition_seconds, "scales": reports,
+                   "partition_settings": partitions,
+                   "partition_diagnostics": {"source": source_diagnostics, "target": target_diagnostics},
                    "leaf_assignment_seconds": leaf_assignment_seconds,
                    "point_assignment_seconds": perf_counter() - refinement_start,
                    "matching_seconds": perf_counter() - start,
@@ -231,10 +296,17 @@ def draw_supersets(config, dataset):
 
 def cache_spec(config, dataset):
     opts = settings(config)
-    return {"format_version": FORMAT_VERSION, "implementation": IMPLEMENTATION,
+    spec = {"format_version": FORMAT_VERSION, "implementation": IMPLEMENTATION,
             "superset_size": opts["superset_size"], "cache_seed": opts["cache_seed"],
             "partition_counts": opts["partition_counts"], "scale_weights": opts["scale_weights"],
             "dataset_spec": dataset_spec(config, dataset)}
+    # Old axis/axis caches remain valid. PCA caches have a distinct identity and
+    # cannot be silently accepted by a baseline config (or vice versa).
+    if "pca" in (opts["source_partition"], opts["target_partition"]):
+        spec.update(implementation=PCA_IMPLEMENTATION,
+                    partition_settings=partition_settings(opts["source_partition"],
+                                                          opts["target_partition"], opts["pca_eigengap_tol"]))
+    return spec
 
 
 def _array_hash(array):
@@ -288,7 +360,9 @@ def prepare(config, dataset):
     sampling_seconds = perf_counter() - start
     permutation, diagnostics = multiscale_permutation(
         source, target, opts["partition_counts"], opts["scale_weights"], opts["max_cost_mib"],
-        progress=lambda message: print(message, flush=True))
+        progress=lambda message: print(message, flush=True),
+        source_partition=opts["source_partition"], target_partition=opts["target_partition"],
+        pca_eigengap_tol=opts["pca_eigengap_tol"])
     metadata = {**spec, **diagnostics, "sampling_seconds": sampling_seconds,
                 "precompute_seconds": perf_counter() - start,
                 "precompute_timing_scope": "sampling and matching; excludes cache IO/loading and training",
@@ -325,7 +399,11 @@ class MultiscaleWassersteinSampler:
         return self.source[indices], self.target[indices]
 
     def details(self):
+        partitions = self.metadata.get("partition_settings", partition_settings())
+        descriptions = {"axis": "nested_equal_mass_spatial_kd", "pca": "nested_equal_mass_spatial_pca"}
         return {**self.metadata, "cache_sha256": self.cache_sha256,
+                "source_partition": descriptions[partitions["source_partition"]],
+                "target_partition": descriptions[partitions["target_partition"]],
                 "plan_sampling": "iid pairs with replacement from the fixed bijective bank",
                 "inference_source": "fresh iid standard Gaussian; no bank or patch labels",
                 "beta": 0.0}

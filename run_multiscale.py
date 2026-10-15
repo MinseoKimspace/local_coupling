@@ -23,6 +23,9 @@ from nsot import file_sha256
 ROOT = Path(__file__).resolve().parent
 FORMAT = "multiscale_wasserstein_experiment_v1"
 NFES = [1, 2, 4, 8, 16, 32, 64, 128]
+PARTITION_VARIANTS = (("axis_axis", "axis", "axis"),
+                      ("axis_pca", "axis", "pca"),
+                      ("pca_pca", "pca", "pca"))
 
 
 @contextmanager
@@ -69,7 +72,8 @@ def _cache_path(config, dataset, method):
 
 def create_experiment(*, datasets=None, seeds=None, bank_seed=0, device=None, steps=None,
                       superset_size=None, partition_counts=None, scale_weights=None,
-                      with_nsot=False, smoke=False, nfe=None, output_root=None):
+                      with_nsot=False, smoke=False, nfe=None, output_root=None,
+                      partition_study=False, source_partition=None, target_partition=None):
     from multiscale_wasserstein import METHOD, settings
     datasets = ["checkerboard", "horse"] if datasets is None else list(datasets)
     if (not datasets or len(datasets) != len(set(datasets)) or
@@ -78,11 +82,14 @@ def create_experiment(*, datasets=None, seeds=None, bank_seed=0, device=None, st
     seeds = _integers([0] if seeds is None else seeds, "seeds")
     _integers([bank_seed], "bank_seed")
     nfe = _integers(([1, 2] if smoke else NFES) if nfe is None else nfe, "nfe", 1)
+    if partition_study and (with_nsot or source_partition is not None or target_partition is not None):
+        raise ValueError("--partition-study supplies all three variants; do not combine with --with-nsot or partition overrides")
     if smoke and any(v is not None for v in (device, steps, superset_size, partition_counts, scale_weights)):
         raise ValueError("--smoke supplies its own device, steps, bank size and partition settings")
     if steps is not None:
         _integers([steps], "steps", 1)
-    directory = Path(output_root or ROOT / "experiment_manifests")
+    default_root = ROOT / "eval_results" / "partition_study" if partition_study else ROOT / "experiment_manifests"
+    directory = Path(output_root or default_root)
     if not directory.is_absolute():
         directory = ROOT / directory
     directory = directory.resolve() / f"multiscale_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}_{uuid4().hex[:8]}"
@@ -103,6 +110,10 @@ def create_experiment(*, datasets=None, seeds=None, bank_seed=0, device=None, st
             options["partition_counts"] = list(partition_counts)
         if scale_weights is not None:
             options["scale_weights"] = list(scale_weights)
+        if source_partition is not None:
+            options["source_partition"] = source_partition
+        if target_partition is not None:
+            options["target_partition"] = target_partition
         if smoke:
             config["device"] = "cpu"
             config["data"].update(batch_size=2, n_points=16)
@@ -110,9 +121,17 @@ def create_experiment(*, datasets=None, seeds=None, bank_seed=0, device=None, st
             config["training"].update(num_steps=2, log_every=1)
             config["evaluation"].update(batch_size=6, histogram_bins=16)
             options.update(superset_size=64, partition_counts=[2, 4, 8], scale_weights=[1.0, 1.0, 1.0])
-        settings(config)
-        options["cache"] = str(_cache_path(config, dataset, METHOD))
-        proposed.append((dataset, "multiscale", config))
+        if partition_study:
+            for label, source, target in PARTITION_VARIANTS:
+                variant = copy.deepcopy(config)
+                variant[METHOD].update(source_partition=source, target_partition=target)
+                settings(variant)
+                variant[METHOD]["cache"] = str(_cache_path(variant, dataset, METHOD))
+                proposed.append((dataset, label, variant))
+        else:
+            settings(config)
+            options["cache"] = str(_cache_path(config, dataset, METHOD))
+            proposed.append((dataset, "multiscale", config))
         if with_nsot:
             for beta in (0.0, 0.2):
                 baseline = copy.deepcopy(config)
@@ -141,6 +160,7 @@ def create_experiment(*, datasets=None, seeds=None, bank_seed=0, device=None, st
     manifest = {"format": FORMAT, "created_at": datetime.now(timezone.utc).isoformat(),
                 "smoke": smoke, "datasets": datasets, "bank_seed": bank_seed,
                 "training_seeds": seeds, "with_nsot": with_nsot, "evaluation_nfes": nfe,
+                "partition_study": partition_study,
                 "protocol": {"matching": "multiscale patch Wasserstein cost, restricted block permutation",
                              "source": "original standard Gaussian bank; fresh Gaussian inference",
                              "model_training": "unchanged original checkerboard/horse baseline settings unless overridden",
@@ -148,6 +168,13 @@ def create_experiment(*, datasets=None, seeds=None, bank_seed=0, device=None, st
                              "marginals": "exact finite empirical endpoints; not exact population marginals",
                              "timing": "precompute shared once per unique bank; training loop and inference separately"},
                 "endpoint_checks": {}, "jobs": jobs}
+    if partition_study:
+        manifest["protocol"]["partition_comparison"] = {
+            "variants": [label for label, _, _ in PARTITION_VARIANTS],
+            "changed": "source/target partition directions only; PCA uses canonical sign and axis fallback",
+            "fixed": "endpoint coordinates, M, scale counts/weights, exact solvers, model, training, evaluation",
+            "rng": "same model seed, pair-index RNG and uniform-time RNG across variants of each dataset/seed",
+            "interpretation": "single-seed pilot unless repeated; lower coupling cost is not proof of better generation"}
     path = directory / "manifest.json"
     save_manifest(path, manifest)
     print(f"experiment_manifest={path}", flush=True)
@@ -208,6 +235,21 @@ def prepare_jobs(path, manifest):
         job["config_sha256"] = file_sha256(prepared_path)
         job["bank"] = {"path": str(cache), "sha256": digest,
                        "precompute_seconds": metadata["precompute_seconds"], "metadata": metadata}
+        save_manifest(path, manifest)
+    if manifest.get("partition_study"):
+        for dataset in manifest["datasets"]:
+            entries = [j for j in manifest["jobs"] if j["dataset"] == dataset]
+            reference = entries[0]
+            with np.load(reference["bank"]["path"], allow_pickle=False) as bank:
+                source, target = bank["source"], bank["target"]
+            for job in entries[1:]:
+                with np.load(job["bank"]["path"], allow_pickle=False) as bank:
+                    for key, expected in (("source", source), ("target", target)):
+                        if not np.array_equal(expected, bank[key]):
+                            raise ValueError(f"{dataset}/{job['label']}: partition study {key} endpoints differ")
+            manifest["endpoint_checks"][dataset] = {
+                "same_source": True, "same_target": True,
+                "bank_sha256": {job["label"]: job["bank"]["sha256"] for job in entries}}
         save_manifest(path, manifest)
     if manifest["with_nsot"]:
         for dataset in manifest["datasets"]:
@@ -296,10 +338,15 @@ def write_summary(path, manifest):
                                         "png": artifacts["png"]["path"]}
         rows.append(row)
     save_manifest(path.parent / "summary.json", {"format": FORMAT, "smoke": manifest["smoke"],
+                                                  "partition_study": manifest.get("partition_study", False),
+                                                  "protocol": manifest["protocol"],
                                                   "banks": banks, "jobs": rows,
                                                   "endpoint_checks": manifest["endpoint_checks"],
                                                   "unique_precompute_seconds": sum(bank["precompute_seconds"] for bank in banks.values()),
                                                   "timing_note": "Precompute counted once per unique bank. Historical construction times, not current resume wall time. Inference excludes rendering/metrics."})
+    if manifest.get("partition_study"):
+        from multiscale_partition_report import write_report
+        write_report(path.parent, manifest)
 
 
 def main():
@@ -314,6 +361,10 @@ def main():
     parser.add_argument("--superset-size", type=int)
     parser.add_argument("--partition-counts", nargs="+", type=int)
     parser.add_argument("--scale-weights", nargs="+", type=float)
+    parser.add_argument("--partition-study", action="store_true",
+                        help="Compare axis/axis, axis/PCA, PCA/PCA with identical endpoints and training settings")
+    parser.add_argument("--source-partition", choices=("axis", "pca"))
+    parser.add_argument("--target-partition", choices=("axis", "pca"))
     parser.add_argument("--with-nsot", action="store_true", help="Also train matched-endpoint NSOT beta=0 and beta=0.2 controls")
     parser.add_argument("--smoke", action="store_true", help="Tiny CPU two-update pipeline check; not a quality experiment")
     parser.add_argument("--nfe", nargs="+", type=int)
@@ -321,9 +372,10 @@ def main():
     if args.stage == "eval" and not args.manifest:
         parser.error("--stage eval requires --manifest for previously trained jobs")
     if args.manifest:
-        if args.smoke or args.with_nsot or any(v is not None for v in (
+        if args.smoke or args.with_nsot or args.partition_study or any(v is not None for v in (
                 args.datasets, args.seeds, args.bank_seed, args.device, args.steps,
-                args.superset_size, args.partition_counts, args.scale_weights)):
+                args.superset_size, args.partition_counts, args.scale_weights,
+                args.source_partition, args.target_partition)):
             parser.error("With --manifest only --stage/--nfe may change")
         path = Path(args.manifest).resolve()
         with path.open(encoding="utf-8") as stream:
@@ -342,7 +394,9 @@ def main():
             datasets=args.datasets, seeds=args.seeds, bank_seed=args.bank_seed or 0,
             device=args.device, steps=args.steps, superset_size=args.superset_size,
             partition_counts=args.partition_counts, scale_weights=args.scale_weights,
-            with_nsot=args.with_nsot, smoke=args.smoke, nfe=args.nfe)
+            with_nsot=args.with_nsot, smoke=args.smoke, nfe=args.nfe,
+            partition_study=args.partition_study, source_partition=args.source_partition,
+            target_partition=args.target_partition)
     if manifest["smoke"]:
         torch.set_num_threads(1)
         print("SMOKE ONLY: M=64, N=16, CPU, two optimizer updates; not quality evidence", flush=True)
