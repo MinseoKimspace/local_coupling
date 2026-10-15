@@ -11,7 +11,7 @@ import torch.nn.functional as F
 ALIASES = {"global_hungarian": "global_ot", "geometry_aware_hungarian": "geometry_aware_ot"}
 CLOUD_METHODS = {"minibatch_ot", "equivariant_ot_permutation"}
 TG_CACHED_METHODS = {"target_guided_cached"}
-OFFLINE_METHODS = {"nsot", "multiscale_wasserstein", "multiscale_refined"} | TG_CACHED_METHODS
+OFFLINE_METHODS = {"nsot", "multiscale_wasserstein", "multiscale_overlap"} | TG_CACHED_METHODS
 
 METHODS = {
     "independent": ("none", "none", "none"),
@@ -47,16 +47,14 @@ def balanced_partition_solver(method):
 
 def coupling_info(name: str) -> dict:
     name = canonical_method(name)
-    if name == "multiscale_refined":
-        return {"method": name,
-                "implementation": "multiscale_cross_leaf_sparse_assignment_v1",
-                "target_partition": "unchanged_base_nested_equal_mass_spatial_kd",
-                "source_assignment": "base_multiscale_then_point_level_cross_leaf_refinement",
-                "local_pairing": "sparse_global_bijection_on_expanded_block_support",
-                "cost": "coarse_patch_w2_plus_finest_point_squared_distance",
+    if name == "multiscale_overlap":
+        return {"method": name, "implementation": "multiscale_overlapping_boundary_assignment_v1",
+                "initial_coupling": "nested_equal_mass_patch_w2_exact_v1",
+                "source_assignment": "sequential_exact_reassignment_in_overlapping_boundary_windows",
+                "cost": "ancestor_patch_w2_plus_finest_weight_squared_euclidean",
+                "global_optimality": False, "marginals": "unchanged empirical bank endpoints",
                 "plan_sampling": "iid_pairs_with_replacement",
-                "source_coordinates": "unchanged original Gaussian bank; no perturbation",
-                "target_coordinates": "unchanged original target bank; no barycentric projection",
+                "source_coordinates": "unchanged Gaussian draws; no training perturbation",
                 "inference_source": "fresh_iid_standard_gaussian_no_cache"}
     if name == "multiscale_wasserstein":
         return {"method": name, "implementation": "nested_equal_mass_patch_w2_exact_v1",
@@ -280,7 +278,7 @@ def coupling_permutation(source, target, *, coupling, num_regions=None, target_c
     method = canonical_method(coupling)
     if method in OFFLINE_METHODS:
         sampler = {"nsot": "NSOTPairSampler", "multiscale_wasserstein": "MultiscaleWassersteinSampler",
-                   "multiscale_refined": "MultiscaleRefinedSampler"}.get(method, "TGCachedPairSampler")
+                   "multiscale_overlap": "MultiscaleOverlapSampler"}.get(method, "TGCachedPairSampler")
         raise ValueError(f"{method} samples precomputed pairs; use {sampler}, not a fresh-cloud permutation")
     if method in CLOUD_METHODS:
         raise ValueError(f"{method} reassigns clouds; use coupled_points to obtain both paired tensors")
@@ -332,7 +330,7 @@ def coupled_points(source, target, *, coupling, **options):
     method = canonical_method(coupling)
     if method in OFFLINE_METHODS:
         sampler = {"nsot": "NSOTPairSampler", "multiscale_wasserstein": "MultiscaleWassersteinSampler",
-                   "multiscale_refined": "MultiscaleRefinedSampler"}.get(method, "TGCachedPairSampler")
+                   "multiscale_overlap": "MultiscaleOverlapSampler"}.get(method, "TGCachedPairSampler")
         raise ValueError(f"{method} requires {sampler} and its offline cache")
     if source.ndim != 3 or source.shape != target.shape or min(source.shape) < 1:
         raise ValueError("Source and target must have the same nonempty [B, N, D] shape")

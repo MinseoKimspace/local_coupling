@@ -169,9 +169,9 @@ def _cached_pairs(config, dataset, data, clouds):
     elif config["coupling"] == "multiscale_wasserstein":
         from multiscale_wasserstein import MultiscaleWassersteinSampler
         sampler = MultiscaleWassersteinSampler(config, dataset, parameter_device, dtype)
-    elif config["coupling"] == "multiscale_refined":
-        from multiscale_refinement import MultiscaleRefinedSampler
-        sampler = MultiscaleRefinedSampler(config, dataset, parameter_device, dtype)
+    elif config["coupling"] == "multiscale_overlap":
+        from multiscale_overlap import MultiscaleOverlapSampler
+        sampler = MultiscaleOverlapSampler(config, dataset, parameter_device, dtype)
     else:
         raise ValueError("coupling scope requires an offline bank coupling; use rollout for other methods")
     sources, targets = [], []

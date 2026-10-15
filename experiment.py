@@ -17,6 +17,7 @@ import yaml
 from coupling import canonical_method, coupling_info
 from data import validate_gaussian_source
 from sample import integrate_velocity
+from time_weighting import settings as time_weight_settings, validate_training_options
 
 
 def read_config(path):
@@ -24,15 +25,16 @@ def read_config(path):
         config = yaml.safe_load(file)
     config["coupling"] = canonical_method(config["coupling"])
     validate_gaussian_source(config)
+    validate_training_options(config.get("training", {}))
     if config["coupling"] == "nsot":
         from nsot import settings as nsot_settings
         nsot_settings(config)
     elif config["coupling"] == "multiscale_wasserstein":
         from multiscale_wasserstein import settings as bank_settings
         bank_settings(config)
-    elif config["coupling"] == "multiscale_refined":
-        from multiscale_refinement import settings as bank_settings
-        bank_settings(config)
+    elif config["coupling"] == "multiscale_overlap":
+        from multiscale_overlap import settings as overlap_settings
+        overlap_settings(config)
     return config
 
 
@@ -76,6 +78,14 @@ def save_training(model, config, dataset, config_path, seconds, loss, *, couplin
     }
     if coupling_metadata is not None:
         metadata["coupling_details"].update(coupling_metadata)
+    if "time_weighting" in config.get("training", {}):
+        metadata["training_objective"] = {
+            "time_sampling": "uniform on [0,1)",
+            "time_weighting": time_weight_settings(config["training"]["time_weighting"]),
+            "final_loss_definition": "mean over clouds of time-weighted mean squared velocity error",
+            "normalization": "population expectation of the weight, not minibatch weight sum",
+            "comparison_note": "use unweighted fitting diagnostics to compare different time-weighting arms",
+        }
     checkpoint = run_dir / snapshot["checkpoint"]
     torch.save({**metadata, "model_state_dict": model.state_dict()}, checkpoint)
     with (run_dir / "config.yaml").open("x", encoding="utf-8") as file:
@@ -193,14 +203,12 @@ def save_evaluation(config_path, config, checkpoint, metadata, dataset, steps, s
 
 def evaluation_title(config):
     method = config["coupling"]
-    if method == "multiscale_refined":
+    if method in ("multiscale_wasserstein", "multiscale_overlap"):
         bank = config["multiscale_wasserstein"]
-        neighbors = config["multiscale_refined"].get("neighbors", 8)
-        return (f"MS-W2 + cross-leaf k={neighbors} | M={bank['superset_size']}\n"
-                f"N={config['data']['n_points']} | seed={config['seed']}")
-    if method == "multiscale_wasserstein":
-        bank = config["multiscale_wasserstein"]
-        return (f"MS-W2 | M={bank['superset_size']}\n"
+        label = "MS-W2 overlap" if method == "multiscale_overlap" else "MS-W2"
+        if config.get("training", {}).get("time_weighting", {}).get("mode") == "late":
+            label += " + late weight"
+        return (f"{label} | M={bank['superset_size']}\n"
                 f"N={config['data']['n_points']} | seed={config['seed']}")
     if method == "nsot":
         bank = config["nsot"]

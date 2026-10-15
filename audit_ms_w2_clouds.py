@@ -27,7 +27,7 @@ def read_audit(path):
     if audit.get("format_version") != 1 or not audit.get("training_config_verified"):
         raise ValueError("Expected a verified format_version=1 audit_jacobian.py report")
     if audit["config"]["coupling"] != "multiscale_wasserstein":
-        raise ValueError("This diagnostic is MS-W2 only; cross-leaf/refined reports are not accepted")
+        raise ValueError("This diagnostic requires the original multiscale_wasserstein coupling")
     if not audit.get("rollout_steps") or "rollout" not in audit.get("banks", {}):
         raise ValueError("The Jacobian report needs rollout scope (rollout or both)")
     times = sorted(audit["times"])

@@ -9,6 +9,7 @@ from coupling import OFFLINE_METHODS, TG_CACHED_METHODS, coupled_points
 from data import checkerboard_centers, sample_checkerboard, validate_gaussian_source
 from experiment import read_config, save_training, synchronize
 from model import PointSetTransformer
+from time_weighting import settings as time_weight_settings, validate_training_options, weights as time_weights
 
 
 def sample_time(batch_size, *, device, dtype, eps=0.0, generator=None):
@@ -21,13 +22,19 @@ def linear_path(x_data, x_noise, t):
     return (1.0 - t) * x_noise + t * x_data
 
 
-def flow_matching_loss(model, x_data, x_noise, t):
-    return F.mse_loss(model(linear_path(x_data, x_noise, t), t), x_data - x_noise)
+def flow_matching_loss(model, x_data, x_noise, t, *, time_weighting=None):
+    prediction = model(linear_path(x_data, x_noise, t), t)
+    options = time_weight_settings(time_weighting)
+    if options["mode"] == "uniform":
+        return F.mse_loss(prediction, x_data - x_noise)
+    # One time per cloud: reduce coordinates/points before weighting clouds.
+    per_cloud = (prediction - (x_data - x_noise)).square().flatten(1).mean(1)
+    return (per_cloud * time_weights(t, options).reshape(-1)).mean()
 
 
 def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, target_centers=None,
                                sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None,
-                               paired_noise=None):
+                               paired_noise=None, time_weighting=None, time_generator=None):
     if paired_noise is None:
         x_noise = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype)
         x_noise, x_data = coupled_points(
@@ -40,16 +47,18 @@ def coupled_flow_matching_loss(model, x_data, *, coupling, num_regions=None, tar
                 or paired_noise.device != x_data.device or paired_noise.dtype != x_data.dtype:
             raise ValueError("Precomputed noise requires an offline coupling and matching [B,N,D] tensors")
         x_noise = paired_noise
-    t = sample_time(x_data.shape[0], device=x_data.device, dtype=x_data.dtype)
-    return flow_matching_loss(model, x_data, x_noise, t)
+    t = sample_time(x_data.shape[0], device=x_data.device, dtype=x_data.dtype, generator=time_generator)
+    return flow_matching_loss(model, x_data, x_noise, t, time_weighting=time_weighting)
 
 
 def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_centers=None,
-               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None, paired_noise=None):
+               sinkhorn_epsilon=0.1, sinkhorn_iterations=100, coupling_generator=None, paired_noise=None,
+               time_weighting=None, time_generator=None):
     loss = coupled_flow_matching_loss(
         model, x_data, coupling=coupling, num_regions=num_regions, target_centers=target_centers,
         sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iterations=sinkhorn_iterations,
         coupling_generator=coupling_generator, paired_noise=paired_noise,
+        time_weighting=time_weighting, time_generator=time_generator,
     )
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -60,25 +69,28 @@ def train_step(model, optimizer, x_data, *, coupling, num_regions=None, target_c
 def train_model(model, config, sample_batch, *, dataset, config_path, target_centers=None):
     validate_gaussian_source(config)
     training = config["training"]
+    validate_training_options(training)
+    weighting = time_weight_settings(training.get("time_weighting"))
     if training["num_steps"] < 1 or training["log_every"] < 1:
         raise ValueError("num_steps and log_every must be positive")
     device = next(model.parameters()).device
     optimizer = torch.optim.AdamW(model.parameters(), lr=training["learning_rate"],
                                  weight_decay=training["weight_decay"])
     generator = torch.Generator(device=device).manual_seed(config["seed"] + 1)
+    time_generator = (torch.Generator(device=device).manual_seed(training["time_seed"])
+                      if "time_seed" in training else None)
     np.random.seed(config["seed"] + 1)  # Original upstream OT samplers use NumPy.
     pair_sampler = None
-    if config["coupling"] == "multiscale_refined":
-        from multiscale_refinement import MultiscaleRefinedSampler
-        pair_sampler = MultiscaleRefinedSampler(config, dataset, device, next(model.parameters()).dtype)
-        config["multiscale_refined"]["cache_sha256"] = pair_sampler.cache_sha256
-        config["multiscale_wasserstein"]["cache_sha256"] = pair_sampler.metadata["base_cache_sha256"]
-        print(f"multiscale_refined_cache_sha256={pair_sampler.cache_sha256}", flush=True)
-    elif config["coupling"] == "multiscale_wasserstein":
+    if config["coupling"] == "multiscale_wasserstein":
         from multiscale_wasserstein import MultiscaleWassersteinSampler
         pair_sampler = MultiscaleWassersteinSampler(config, dataset, device, next(model.parameters()).dtype)
         config["multiscale_wasserstein"]["cache_sha256"] = pair_sampler.cache_sha256
         print(f"multiscale_cache_sha256={pair_sampler.cache_sha256}", flush=True)
+    elif config["coupling"] == "multiscale_overlap":
+        from multiscale_overlap import MultiscaleOverlapSampler
+        pair_sampler = MultiscaleOverlapSampler(config, dataset, device, next(model.parameters()).dtype)
+        config["multiscale_overlap"]["cache_sha256"] = pair_sampler.cache_sha256
+        print(f"multiscale_overlap_cache_sha256={pair_sampler.cache_sha256}", flush=True)
     elif config["coupling"] == "nsot":
         from nsot import NSOTPairSampler
         pair_sampler = NSOTPairSampler(config, dataset, device, next(model.parameters()).dtype)
@@ -93,6 +105,8 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
     model.train()
     synchronize(device)
     start = perf_counter()
+    if weighting["mode"] != "uniform":
+        print(f"time_weighting={weighting}; reported loss is normalized time-weighted MSE", flush=True)
     try:
         for step in range(1, training["num_steps"] + 1):
             log_step = step == 1 or step % training["log_every"] == 0
@@ -107,6 +121,7 @@ def train_model(model, config, sample_batch, *, dataset, config_path, target_cen
                 sinkhorn_epsilon=config.get("sinkhorn_epsilon", 0.1),
                 sinkhorn_iterations=config.get("sinkhorn_iterations", 100), coupling_generator=generator,
                 paired_noise=paired_noise,
+                time_weighting=weighting, time_generator=time_generator,
             )
             if log_step:
                 value = loss.item()

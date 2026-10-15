@@ -106,6 +106,42 @@ class MultiscaleRunnerTests(unittest.TestCase):
         self.assertEqual(job["evaluations"], {})
         self.assertTrue(manifests[0].with_name("summary.json").is_file())
 
+    def test_removed_experiment_flags_are_rejected_without_creating_jobs(self):
+        for arguments in (["--with-refinement"], ["--add-refinement"],
+                          ["--refinement-neighbors", "8"]):
+            with self.subTest(arguments=arguments), \
+                    patch.object(sys, "argv", ["run_multiscale.py", *arguments]), \
+                    patch.object(runner, "create_experiment") as create, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                try:
+                    runner.main()
+                finally:
+                    create.assert_not_called()
+
+    def test_removed_coupling_is_rejected_and_saved_manifest_is_unchanged(self):
+        from coupling import canonical_method
+        with self.assertRaisesRegex(ValueError, "Unknown coupling"):
+            canonical_method("multiscale_refined")
+        path, manifest = self.create()
+        job = manifest["jobs"][0]
+        config = runner.verify_job(job)
+        config["coupling"] = "multiscale_refined"
+        config_path = Path(job["config"])
+        with config_path.open("w", encoding="utf-8") as stream:
+            yaml.safe_dump(config, stream)
+        job["config_sha256"] = runner.file_sha256(config_path)
+        runner.save_manifest(path, manifest)
+        saved_manifest, saved_config = path.read_bytes(), config_path.read_bytes()
+        with patch.object(sys, "argv", ["run_multiscale.py", "--manifest", str(path), "--nfe", "4"]), \
+                patch.object(runner, "prepare_jobs") as prepare, \
+                self.assertRaisesRegex(ValueError, "method mismatch"):
+            try:
+                runner.main()
+            finally:
+                prepare.assert_not_called()
+        self.assertEqual(path.read_bytes(), saved_manifest)
+        self.assertEqual(config_path.read_bytes(), saved_config)
+
     def test_with_nsot_prepares_shared_cache_and_verifies_identical_endpoints(self):
         path, manifest = self.create(with_nsot=True)
         with patch.object(nsot, "exact_superset_permutation", wraps=nsot.exact_superset_permutation) as exact:

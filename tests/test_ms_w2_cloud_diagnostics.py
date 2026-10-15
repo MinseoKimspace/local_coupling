@@ -95,7 +95,7 @@ class SameCloudTests(unittest.TestCase):
     def test_mismatches_fail_before_quality_join(self):
         run, path = self.fixture(zero_velocity=False)
         old = json.loads(path.read_text())
-        for kind in ("checkpoint", "source", "state", "crossleaf", "missing", "duplicate"):
+        for kind in ("checkpoint", "source", "state", "other_coupling", "missing", "duplicate"):
             value = json.loads(json.dumps(old))
             if kind == "checkpoint":
                 value["checkpoint_sha256"] = "bad"
@@ -103,8 +103,8 @@ class SameCloudTests(unittest.TestCase):
                 value["banks"]["rollout"]["source_sha256"] = "bad"
             elif kind == "state":
                 value["per_cloud"][1]["state_sha256"] = "bad"
-            elif kind == "crossleaf":
-                value["config"]["coupling"] = "multiscale_refined"
+            elif kind == "other_coupling":
+                value["config"]["coupling"] = "independent"
             elif kind == "missing":
                 value["per_cloud"].pop()
             else:

@@ -75,8 +75,7 @@ The manifest's list order is the figure's column order. The example contains:
 If your TG run is streaming `target_guided`, change BOTH the manifest's `coupling`
 and its label to match. Other TG variants must likewise be named explicitly.
 The renderer fails if a declared method disagrees with its checkpoint/config.
-In particular, a cross-leaf `multiscale_refined` run cannot silently occupy the
-baseline MS-W2 slot. NSOT beta/bank settings remain in the saved comparison JSON.
+NSOT beta/bank settings remain in the saved comparison JSON.
 EFM here means this repository's permutation-only adapter, not a full external
 EFM implementation with rigid rotations. NSOT is this repository's 2D variant.
 
